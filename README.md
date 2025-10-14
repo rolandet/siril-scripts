@@ -17,8 +17,8 @@ It provides a Sirilic-like interface but is fully portable, written in Python, a
   * Final stack copied, mirrored, and opened in Siril
 
 - **Automatic Directory Detection**
-  • Uses Siril style directory structure.  
-  • Detects camera name, gain, offset, binning, and exposure length from FITS headers for file naming.  
+  * Uses Siril style directory structure.  
+  * Detects camera name, gain, offset, binning, and exposure length from FITS headers for file naming.  
 
 - **Script Generator for Siril 1.4**  
   * Produces fully commented `.ssf` scripts compatible with Siril 1.4 Beta 3/4.  
