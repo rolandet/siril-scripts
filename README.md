@@ -22,7 +22,7 @@ It provides a Sirilic-like interface but is fully portable, written in Python, a
 
 - **Script Generator for Siril 1.4**  
   • Produces fully commented `.ssf` scripts compatible with Siril 1.4 Beta 3/4.  
-  • Handles master bias/dark/flat creation automatically.  
+  Handles master bias/dark/flat creation automatically.  
   • Adds **mirrorx -bottomup** at the final stage to correct FITS orientation.  
   • Includes optional **setcompress 0** for lossless FITS saving.
   • Drizzle: Scaling, Pixel Fraction, Kernel
