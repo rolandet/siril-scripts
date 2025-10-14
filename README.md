@@ -21,14 +21,14 @@ It provides a Sirilic-like interface but is fully portable, written in Python, a
   • Detects camera name, gain, offset, binning, and exposure length from FITS headers for file naming.  
 
 - **Script Generator for Siril 1.4**  
-  • Produces fully commented `.ssf` scripts compatible with Siril 1.4 Beta 3/4.  
+  * Produces fully commented `.ssf` scripts compatible with Siril 1.4 Beta 3/4.  
   * Handles master bias/dark/flat creation automatically.  
-  • Adds **mirrorx -bottomup** at the final stage to correct FITS orientation.  
-  • Includes optional **setcompress 0** for lossless FITS saving.
-  • Drizzle: Scaling, Pixel Fraction, Kernel
-  • 2-pass registration toggle
-  • Global stacking options (sigma or winorized rejection (sigma high and low), mean)
-  • 32-bit output for final stack
+  * Adds **mirrorx -bottomup** at the final stage to correct FITS orientation.
+  * Includes optional **setcompress 0** for lossless FITS saving.
+  * Drizzle: Scaling, Pixel Fraction, Kernel
+  * 2-pass registration toggle
+  * Global stacking options (sigma or winorized rejection (sigma high and low), mean)
+  * 32-bit output for final stack
 
 - **UI Highlights**
   - Qt-based tabbed interface for **Project**, **Nights**, and **Processing Settings**.  
