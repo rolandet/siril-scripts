@@ -11,10 +11,10 @@ It provides a Sirilic-like interface but is fully portable, written in Python, a
 
 ### Core Capabilities
 - **Multi-Night Project Handling**  
-  • Supports any number of nights of imaging under a single project root.  
-  • Automatically merges registered and stacked data across nights (2048 file limit on Windows).  
-  • Generates *night-specific* and *global* Siril script for calibration, registration, stacking, and post-processing.
-  • Final stack copied, mirrored, and opened in Siril
+  * Supports any number of nights of imaging under a single project root.  
+  * Automatically merges registered and stacked data across nights (2048 file limit on Windows).  
+  * Generates *night-specific* and *global* Siril script for calibration, registration, stacking, and post-processing.
+  * Final stack copied, mirrored, and opened in Siril
 
 - **Automatic Directory Detection**
   • Uses Siril style directory structure.  
