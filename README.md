@@ -1,4 +1,4 @@
-# Multi-Night Stacking — Siril 1.4 Python Application  
+# OSC Multi-Night Stacking — Siril 1.4 Python Application  
 **Version 1.0**
 
 ### Overview
