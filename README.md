@@ -46,13 +46,21 @@ It provides a Sirilic-like interface but is fully portable, written in Python, a
 ## 🧭 Typical Directory Layout
 
 ProjectRoot/
+
 ├─ Session 1/
+
 │ ├─ process/
+
 │ ├─ LIGHTS/
+
 │ ├─ DARKS/
+
 │ ├─ FLATS/
+
 │ └─ BIASES/
+
 ├─ Session 2/
+
 │ 
 
 ## ⚡ Quick-Start — Running from Siril 1.4
