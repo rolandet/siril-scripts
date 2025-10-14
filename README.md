@@ -14,24 +14,31 @@ It provides a Sirilic-like interface but is fully portable, written in Python, a
   • Supports any number of nights of imaging under a single project root.  
   • Automatically merges registered and stacked data across nights (2048 file limit on Windows).  
   • Generates *night-specific* and *global* Siril script for calibration, registration, stacking, and post-processing.
+  • Final stack copied, mirrored, and opened in Siril
 
 - **Automatic Directory Detection**
   • Uses Siril style directory structure.  
-  • Detects camera name, gain, offset, binning, and exposure length from FITS headers.  
+  • Detects camera name, gain, offset, binning, and exposure length from FITS headers for file naming.  
 
 - **Script Generator for Siril 1.4**  
   • Produces fully commented `.ssf` scripts compatible with Siril 1.4 Beta 3/4.  
   • Handles master bias/dark/flat creation automatically.  
   • Adds **mirrorx -bottomup** at the final stage to correct FITS orientation.  
-  • Includes optional **setcompress 0** for lossless FITS saving.  
+  • Includes optional **setcompress 0** for lossless FITS saving.
+  • Drizzle: Scaling, Pixel Fraction, Kernel
+  • 2-pass registration toggle
+  • Global stacking options (sigma or winorized rejection (sigma high and low), mean)
+  • 32-bit output for final stack
 
 - **UI Highlights**
   - Qt-based tabbed interface for **Project**, **Nights**, and **Processing Settings**.  
   - Live detection of unsaved project changes (with save prompt).  
-  - Configurable Siril executable path and project output root.  
+  - Configurable Siril executable path and project output root.
+  - Abort Run button (graceful stop)
 
 - **Validation & Logging**
   - Generates project-specific log files.
+  - Siril console logging via sirilpy
   - Performs validation on missing calibration frames b=and bad paths.
 
 ---
@@ -110,7 +117,7 @@ ProjectRoot/
 | ② | Create or Load project & verify sessions | 2 min |
 | ② | Configure Settings and Images | 5 min |
 | ③ | Generate scripts | < 1 min |
-| ④ | Run Siril script | ~5-10 minutes per session |
+| ④ | Run Siril script | Typicallly 5-? minutes per session depending on the # of subs |
 
 ---
 
