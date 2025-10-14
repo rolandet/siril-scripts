@@ -2,7 +2,7 @@
 **Version 1.0**
 
 ### Overview
-**Multi-Night Stacking** is a standalone **Python + PyQt6 GUI** application that automates the creation of Siril 1.4 scripts for multi-night deep-sky stacking projects using Siril-style directory layouts.  
+**OSC Multi-Night Stacking** is a standalone **Python + PyQt6 GUI** application that automates the creation of Siril 1.4 scripts for multi-night deep-sky stacking projects using Siril-style directory layouts.  
 It provides a Sirilic-like interface but is fully portable, written in Python, and designed for users who capture multiple nights of imaging data and want a one-click way to generate correct Siril processing pipelines.
 
 ---
@@ -11,6 +11,7 @@ It provides a Sirilic-like interface but is fully portable, written in Python, a
 
 ### Core Capabilities
 - **Multi-Night Project Handling**  
+  * Support OSC images.
   * Supports any number of nights of imaging under a single project root.  
   * Automatically merges registered and stacked data across nights (2048 file limit on Windows).  
   * Generates *night-specific* and *global* Siril script for calibration, registration, stacking, and post-processing.
