@@ -66,7 +66,7 @@ ProjectRoot/
 
 ## ⚡ Quick-Start — Running from Siril 1.4
 
-> Use this 9-step guide to run the Multi-Night Stacking Python Application and process all of your sessions in Siril 1.4.
+> Use this 7-step guide to run the Multi-Night Stacking Python Application and process all of your sessions in Siril 1.4.
 
 ### 🧰 Requirements
 - **Siril 1.4 Beta 4** (with Python scripting enabled)  
@@ -101,13 +101,13 @@ ProjectRoot/
      Session_2/process/
      ...
      ```
-8. **Generate Siril Script**
+6. **Generate Siril Script**
    - In the GUI, confirm the **Siril CLI path**  
      *(e.g. `C:\Program Files\Siril\bin\siril-cli.exe`)*  
    - Check or uncheck options.
    - Click **Generate Siril Scripts** — this creates:
 
-9. *Run Siril (CLI)**
+7. *Run Siril (CLI)**
 
 - Click the **Run Siril (CLI)** button in the main window.  
 - The application automatically launches the configured **`siril-cli`** executable and executes **`run_project.ssf`** Siril script.
