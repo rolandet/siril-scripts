@@ -66,35 +66,32 @@ ProjectRoot/
 
 ## ⚡ Quick-Start — Running from Siril 1.4
 
-> Use this 5-step guide to run the Multi-Night Stacking Python Application and process all of your sessions in Siril 1.4.
+> Use this 9-step guide to run the Multi-Night Stacking Python Application and process all of your sessions in Siril 1.4.
 
 ### 🧰 Requirements
-- **Siril 1.4 Beta 3 or 4** (with Python scripting enabled)  
-- **Python 3.10 +** with `PyQt6`, `astropy`, and `sirilpy` installed  
-- N.I.N.A.-style directory layout (Session 1, Session 2, etc.)  
+- **Siril 1.4 Beta 4** (with Python scripting enabled)  
+- **Python 3.10 +** with `PyQt6`, `astropy`, and `sirilpy` installed   
 
 ---
 
 ### 🪄 Steps
 
-1. **Open Siril 1.4**  
+1. **Downlaod osc-multi-night-stacking.py**
+   - Place the script in your Siril Scripts directory.
+   
+2. **Open Siril 1.4**  
    - Start Siril normally.  
    - Ensure Python scripting is enabled (`Preferences → Python`).  
 
-2. **Launch the Application**
-   - In Siril’s command window or a system terminal, run:
-     ```bash
-     python multi-night-stacking.py
-     ```
+3. **Launch the Application**
    - The PyQt6 GUI will open alongside Siril.  
-   - (You can also launch the app directly from Windows Explorer if file associations are set.)
 
-3. **Create or Load a Project**
+4. **Create or Load a Project**
    - Click **New Project** → choose your target root folder.  
    - The app auto-detects all session folders (Session 1, Session 2, …) if they were previously created.  
    - Confirm settings. 
 
-4. **Prepare Working Directory (Symlink?copy Files)**
+5. **Prepare Working Directory (Symlink?copy Files)**
    - Inside each `Session X` folder, create a sub-folder called **`process`** (if not already there).  
    - The application writes its `.ssf` script files into this folder and Siril uses it as the *working directory*.  
    - **Why:** Siril reads and writes intermediate calibrated and registered FITS frames inside this directory.  
@@ -104,13 +101,13 @@ ProjectRoot/
      Session_2/process/
      ...
      ```
-5. **Generate Siril Script**
+8. **Generate Siril Script**
    - In the GUI, confirm the **Siril CLI path**  
      *(e.g. `C:\Program Files\Siril\bin\siril-cli.exe`)*  
    - Check or uncheck options.
    - Click **Generate Siril Scripts** — this creates:
 
-6. *Run Siril (CLI)**
+9. *Run Siril (CLI)**
 
 - Click the **Run Siril (CLI)** button in the main window.  
 - The application automatically launches the configured **`siril-cli`** executable and executes **`run_project.ssf`** Siril script.
