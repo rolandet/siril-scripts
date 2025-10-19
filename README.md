@@ -1,17 +1,29 @@
 # OSC Multi-Night Stacking — Siril 1.4 Python Application  
-**Version 1.0**
+**Version 1.1**
 
 ### Overview
 **OSC Multi-Night Stacking** is a standalone **Python + PyQt6 GUI** application that automates the creation of Siril 1.4 scripts for multi-night deep-sky stacking projects using Siril-style directory layouts.  
 It provides a Sirilic-like interface but is fully portable, written in Python, and designed for users who capture multiple nights of imaging data and want a one-click way to generate correct Siril processing pipelines.
 
+**Note: Siril 1.4 Beta or later is required **
 ---
+## ✨ New Features (v1.1)
+
+New enhancements:
+- Now compresses final register and stack fit files instead of just the intermediate session fit files.
+    * **Limitation: register and setapplyreg commands will not compress fit files if drizzling is enabled due to a limitation with Siril 1.4 where the drizzling functionality
+      does not support compressed fit files.**
+- Added pack Sequences feature - this allows you to pack the fit or fz files into a SER or FITSEQ sequence file.  This allows us to overcome the 2048 open file limit on Windows.
+    * Off by default
+    * Auto, FITSEQ, and SER are the options that can be used.
+    * Pack Sequences only will pack LIGHT frames. LIGHT frame pack threshold is configurable and can be lowered and raised as needed.
+    * Auto uses the FITSEQ sequence file format (recommended for maximum compatibility) where is puts the fit or fz files into into a single file for stacking. 
 
 ## ✨ Features (v1.0)
 
 ### Core Capabilities
 - **Multi-Night Project Handling**  
-  * Support OSC images.
+  * Supports OSC images.
   * Supports any number of nights of imaging under a single project root.  
   * Automatically merges registered and stacked data across nights (2048 file limit on Windows).  
   * Generates *night-specific* and *global* Siril script for calibration, registration, stacking, and post-processing.
@@ -78,13 +90,15 @@ ProjectRoot/
 
 1. **Downlaod osc-multi-night-stacking.py**
    - Place the script in your Siril Scripts directory.
+   - Refer to the [Siril 1.4 doc](https://siril.readthedocs.io/en/latest/preferences/preferences_gui.html#scripts) on how to set a Siril Scripts directoey. 
    
 2. **Open Siril 1.4**  
-   - Start Siril normally.  
-   - Ensure Python scripting is enabled (`Preferences → Python`).  
-
+   - Start Siril normally.
+   - Ensure that the script is visiable in the UI. (Scripts->Python Scripts)
+   - Refer to the [Siril 1.4 Sript doc](https://siril.readthedocs.io/en/latest/preferences/preferences_gui.html#scripts) if it is not.
+     
 3. **Launch the Application**
-   - The PyQt6 GUI will open alongside Siril.  
+   - The PyQt6 GUI will open alongside Siril.   
 
 4. **Create or Load a Project**
    - Click **New Project** → choose your target root folder.  
@@ -111,7 +125,7 @@ ProjectRoot/
 
 - Click the **Run Siril (CLI)** button in the main window.  
 - The application automatically launches the configured **`siril-cli`** executable and executes **`run_project.ssf`** Siril script.
-- Progress and Siril output appear in the log panel or terminal window.  
+- Progress and Siril output appear in the console log panel.  
 - When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`**
 
 ---
