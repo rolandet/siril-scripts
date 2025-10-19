@@ -137,7 +137,7 @@ ProjectRoot/
 | ② | Create or Load project & verify sessions | 2 min |
 | ② | Configure Settings and Images | 5 min |
 | ③ | Generate scripts | < 1 min |
-| ④ | Run Siril script | Typicallly 5-? minutes per session depending on the # of subs |
+| ④ | Run Siril script | Typicallly 5-??? minutes per session depending on the # of subs |
 
 ---
 
