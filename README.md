@@ -96,7 +96,7 @@ ProjectRoot/
 2. **Open Siril 1.4**  
    - Start Siril normally.
    - Ensure that the script is visiable in the UI. (Scripts->Python Scripts)
-   - Refer to the [Siril 1.4 Sript doc](https://siril.readthedocs.io/en/latest/preferences/preferences_gui.html#scripts) if it is not.
+   - Refer to the [Siril 1.4 Script doc](https://siril.readthedocs.io/en/latest/preferences/preferences_gui.html#scripts) if it is not.
      
 3. **Launch the Application**
    - The PyQt6 GUI will open alongside Siril.   
