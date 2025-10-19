@@ -24,8 +24,9 @@ New enhancements:
 ### Core Capabilities
 - **Multi-Night Project Handling**  
   * Supports OSC images.
-  * Supports any number of nights of imaging under a single project root.  
-  * Automatically merges registered and stacked data across nights (2048 file limit on Windows).  
+  * Supports any number of nights of imaging under a single project root.
+  * Ability to Create, Save, and Load Project json files.
+  * Automatically merges registered and stacked data across nights.  
   * Generates *night-specific* and *global* Siril script for calibration, registration, stacking, and post-processing.
   * Final stack copied, mirrored, and opened in Siril
 
