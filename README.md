@@ -107,7 +107,7 @@ ProjectRoot/
    - Add Sessions as needed
    - Add LIGHTS, FLATS, DARKS, BIAS frames to Sessions or Panels as needed
    - The app auto-detects all session folders (Session 1, Session 2, …) if they were previously created.  
-   - Check or uncheck features and options
+   - Check or uncheck features and options as needed
 
 5. **Prepare Working Directory (Symlink?copy Files)**
    - Inside each `Session X` folder.  
@@ -124,7 +124,7 @@ ProjectRoot/
    - Click **Build Siril Script**
    - The application writes its `.ssf` script file into the *working directory*   
 
-7. *Run Siril Script**
+7. **Run Siril Script**
 
 - Click the **Run Siril Script** button in the main window.  
 - The application automatically executes the configured **`run_project.ssf`** Siril script via the Siril Python API and use the **`siril-cli`** as a backup
