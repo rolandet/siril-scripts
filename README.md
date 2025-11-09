@@ -127,7 +127,7 @@ ProjectRoot/
 7. **Run Siril Script**
 
 - Click the **Run Siril Script** button in the main window.  
-- The application automatically executes the configured **`run_project.ssf`** Siril script via the Siril Python API and use the **`siril-cli`** as a backup
+- The application automatically executes the configured **`run_project.ssf`** Siril script via the Siril Python API or uses the **`siril-cli`** as a backup
 - Progress and script output appear in the console log panel in Siril and in a log file in the *working directory*
 - When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`** and loaded into Siril
 ---
