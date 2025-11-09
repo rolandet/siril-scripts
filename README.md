@@ -1,9 +1,9 @@
-# OSC Multi-Night Stacking — Siril 1.4 Python Application  
+# OSC Multi-Night Stacking — Siril 1.4 Python Application Script
 **Version 1.1**
 
 ### Overview
-**OSC Multi-Night Stacking** is a standalone **Python + PyQt6 GUI** application that automates the creation of Siril 1.4 scripts for multi-night deep-sky stacking projects using Siril-style directory layouts.  
-It provides a Sirilic-like interface but is fully portable, written in Python, and designed for users who capture multiple nights of imaging data and want a one-click way to generate correct Siril processing pipelines.
+**OSC Multi-Night Stacking** is a **Python + PyQt6 GUI** Sirel application script that automates the creation of Siril 1.4 scripts for multi-night deep-sky stacking projects using Siril-style directory layouts.  
+It provides a Sirilic-like interface using the new Siril Python API that is fully portable, written in Python, and designed for users who capture multiple nights of imaging data and want a one-click way to generate correct Siril processing pipelines.
 
 **Note: Siril 1.4 Beta 4 or later is required **
 ---
@@ -98,37 +98,38 @@ ProjectRoot/
    - Ensure that the script is visiable in the UI. (Scripts->Python Scripts)
    - Refer to the [Siril 1.4 Script doc](https://siril.readthedocs.io/en/latest/preferences/preferences_gui.html#scripts) if it is not.
      
-3. **Launch the Application**
-   - The PyQt6 GUI will open alongside Siril.   
+3. **Launch the Application Script from the Scripts -> Python Scripts menu in Siril**
+   - The OSC Multi-Night Stacking script GUI will open alongside Siril.   
 
 4. **Create or Load a Project**
-   - Click **New Project** → choose your target root folder.  
+   - Click **New Project** → choose your target root folder
+   - Check or uncheck features and options
+   - Add Sessions as needed
+   - Add LIGHTS, FLATS, DARKS, BIAS frames to Sessions or Panels as needed
    - The app auto-detects all session folders (Session 1, Session 2, …) if they were previously created.  
-   - Confirm settings. 
+   - Check or uncheck features and options
 
 5. **Prepare Working Directory (Symlink?copy Files)**
-   - Inside each `Session X` folder, create a sub-folder called **`process`** (if not already there).  
+   - Inside each `Session X` folder.  
    - The application writes its `.ssf` script files into this folder and Siril uses it as the *working directory*.  
    - **Why:** Siril reads and writes intermediate calibrated and registered FITS frames inside this directory.  
    - Each session will therefore have:
      ```
-     Session_1/process/
-     Session_2/process/
+     Session 1/process/
+     Session 2/process/
      ...
      ```
-6. **Generate Siril Script**
-   - In the GUI, confirm the **Siril CLI path**  
-     *(e.g. `C:\Program Files\Siril\bin\siril-cli.exe`)*  
-   - Check or uncheck options.
-   - Click **Generate Siril Scripts** — this creates:
+6. **Generate Siril Script**  
+   - Confirm features and option settings.
+   - Click **Build Siril Script**
+   - The application writes its `.ssf` script file into the *working directory*   
 
-7. *Run Siril (CLI)**
+7. *Run Siril Script**
 
-- Click the **Run Siril (CLI)** button in the main window.  
-- The application automatically launches the configured **`siril-cli`** executable and executes **`run_project.ssf`** Siril script.
-- Progress and Siril output appear in the console log panel.  
-- When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`**
-
+- Click the **Run Siril Script** button in the main window.  
+- The application automatically executes the configured **`run_project.ssf`** Siril script via the Siril Python API and use the **`siril-cli`** as a backup
+- Progress and script output appear in the console log panel in Siril and in a log file in the *working directory*
+- When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`** and loaded into Siril
 ---
 
 ### 🕒 Typical Workflow Timeline
