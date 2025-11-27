@@ -9,7 +9,7 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
 ---
 ## ✨ Bug Fixes and other enhancements (v1.2)
 
-- Script now will use the Siril Python API by default to run the ssf scrif within Siril and not use siril-cli.
+- Script now will use the Siril Python API by default to run the ssf script and not use siril-cli.
 - Script will now default to the current Siril working directory when the script is started.
 - Added Force siril-cli checkout to allow user to use siril-cli if they really want that. This allows the user to abort the ssf script within the OSC Multi-Night Stacking Python script.
 - Added Quick start Instructions to the Help Menu
