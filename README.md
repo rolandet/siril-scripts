@@ -15,7 +15,7 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
     * Allows for adjustment of border feathering (px)  or overlap (%).
     * Allows for slection of Global reference frame.
     * Drizzle per panel or the whole mosaic.
-    * Allows for adjsuting the canvas scale.
+    * Allows for adjusting the canvas scale.
     * Automatic panel layout creation.
 - Compression of drizzled intermediate fit images in now supported and enabled.
 **Limatations**
