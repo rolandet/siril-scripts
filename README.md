@@ -1,12 +1,19 @@
 # OSC Multi-Night Stacking — Siril 1.4 Python Application Script
-**Version 1.2**
+
+**Version 2.0**
 
 ### Overview
 **OSC Multi-Night Stacking** is a **Python + PyQt6 GUI** Siril application script that automates the creation of Siril 1.4 scripts for multi-night deep-sky stacking projects using Siril-style directory layouts.  
 It provides a Sirilic-like interface using the new Siril Python API that is fully portable, written in Python, and designed for users who capture multiple nights of imaging data and want a one-click way to generate correct Siril processing pipelines.
 
-**Note: Siril 1.4-rc2 or later is required **
+**Note: Siril 1.4 or later is required **
 ---
+## ✨ New Features (v2.0)
+- The main feature that has been added in this version is mosaic pre-processing stacking.
+  <img width="757" height="341" alt="image" src="https://github.com/user-attachments/assets/14c11d7f-e20d-4d3b-a594-bb24cb4a8b55" />
+
+    * 
+
 ## ✨ Bug Fixes and other enhancements (v1.2)
 
 - Script now will use the Siril Python API by default to run the ssf script and not use siril-cli.
