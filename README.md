@@ -13,7 +13,7 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
   <img width="757" height="341" alt="image" src="https://github.com/user-attachments/assets/14c11d7f-e20d-4d3b-a594-bb24cb4a8b55" />
     * Allows mosaic pre-processing and stacking of standard rows x columns grid layout panels that applications such as Nina generate.
     * Allows for adjustment of border feathering (px)  or overlap (%).
-    * Allows for slection of Global reference frame.
+    * Allows for selection of Global reference frame.
     * Drizzle per panel or the whole mosaic.
     * Allows for adjusting the canvas scale.
     * Automatic panel layout creation.
