@@ -11,7 +11,7 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
 ## ✨ New Features (v2.0)
 - The main feature that has been added in this version is mosaic pre-processing stacking.
   <img width="757" height="341" alt="image" src="https://github.com/user-attachments/assets/14c11d7f-e20d-4d3b-a594-bb24cb4a8b55" />
-    * Allows mosaic pre-processing and stacking of standard rows x columns grid layout panels that applciations such as Nina generate.
+    * Allows mosaic pre-processing and stacking of standard rows x columns grid layout panels that applications such as Nina generate.
     * Allows for adjustment of border feathering (px)  or overlap (%).
     * Allows for slection of Global reference frame.
     * Drizzle per panel or the whole mosaic.
