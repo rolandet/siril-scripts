@@ -8,6 +8,14 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
 
 **Note: Siril 1.4 or later is required **
 ---
+## ✨ Update Release (v2.1)
+- This is mostly a bug fix and feature enhancement release. No new features.
+  <img width="766" height="338" alt="image" src="https://github.com/user-attachments/assets/6f965e9e-58c8-40c8-bec7-cdfc4825857a" />
+    * The script was trying to maximize framing on the individual panels when processing mosaics. This was being ignored by Siril becuase is didn't have any resitration data at that point so the maximize framing is now only applied on the final mosaic image registration and stack.
+    * The Drizzle Mosaic (advanced, hugh file) feature (final mosaic) has been removed with the Siril workflow didn't really support this. You can now only Drizzle the panels in this release.
+    * When Compression was enabled not all the intermediate files where being compressed during the final merge, registration, and stack of the individual panels. That is now fixed.
+
+---
 ## ✨ New Features (v2.0)
 - The main feature that has been added in this version is mosaic pre-processing stacking.
   <img width="757" height="341" alt="image" src="https://github.com/user-attachments/assets/14c11d7f-e20d-4d3b-a594-bb24cb4a8b55" />
