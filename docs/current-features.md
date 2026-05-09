@@ -1,0 +1,192 @@
+# Current Features - osc-multi-night-stacking-v2.1.py
+
+Source reviewed: `osc-multi-night-stacking-v2.1.py`
+
+## Summary
+
+`osc-multi-night-stacking-v2.1.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, and experimental mosaic processing.
+
+## Core project model
+
+The project model stores:
+
+- Project name, project JSON path, and working directory.
+- Siril CLI path and force-CLI preference.
+- Window-size persistence preferences.
+- Inferred frame width and height.
+- Global drizzle settings.
+- Global two-pass registration setting.
+- Intermediate FITS compression setting.
+- Optional 32-bit final stack output.
+- Global stacking method and sigma rejection values.
+- Pack-sequence mode and auto-pack threshold.
+- Sessions.
+- Mosaic settings.
+- Whether uncalibrated runs are allowed.
+
+## Session and panel models
+
+Each session stores lights, bias, darks, flats, dark-flats, optional master bias/dark/flat/dark-flat overrides, an optional working subdirectory, and optional mosaic panels.
+
+Each panel stores a panel ID, description, and its own lights, bias, darks, flats, and dark-flats. Panel-level calibration can override session-level calibration where applicable.
+
+## Data preparation
+
+The Prepare Working Directory action:
+
+- Creates the working directory when needed.
+- Builds per-session or per-panel folder structures.
+- Links image files into the working tree.
+- Attempts symlink first, then hardlink, then copy.
+- Writes a timestamped `prepare_*.log`.
+- Reports progress through Siril console integration when available.
+- Can detect frame size from a FITS header and use it for linked mosaic feathering.
+- Does not intentionally clear or change the project dirty state.
+
+## Calibration selection and validation
+
+Calibration frame priority is:
+
+1. Panel override, when processing a mosaic panel.
+2. Session override.
+3. Project/library values when configured.
+4. Siril Master Library variables when `Use Siril Master Library` is enabled.
+5. No calibration frame.
+
+The validator warns for missing darks, missing flats, and raw flats that lack bias or dark-flat support. The user can explicitly allow uncalibrated processing.
+
+## Non-mosaic generated Siril pipeline
+
+For standard multi-session processing, the generated `.ssf` script:
+
+1. Emits `requires 1.4.0` and resets `setfindstar`.
+2. Sets FITS compression with `setcompress`.
+3. Converts raw bias, dark-flat, dark, flat, and light frames.
+4. Builds session masters when raw calibration frames are supplied.
+5. Calibrates OSC lights with `calibrate light -cfa`.
+6. Uses `-cc=dark` when a dark is available.
+7. Uses `-equalize_cfa` when flat calibration is used and drizzle is off.
+8. Uses `-debayer` when drizzle is off.
+9. Skips `-debayer` during calibration when drizzle is on.
+10. Registers calibrated light sequences.
+11. Supports optional two-pass registration.
+12. Supports drizzle through either direct registration or `seqapplyreg`, depending on drizzle and two-pass settings.
+13. Merges multiple sessions into `all_sessions`.
+14. Stacks the registered sequence.
+15. Loads the final stack, runs `mirrorx -bottomup`, and saves `<project_slug>_final.fit`.
+
+## Drizzle behavior
+
+Global drizzle options include:
+
+- Enable/disable drizzle.
+- Scaling.
+- Pixel fraction.
+- Kernel: `square`, `point`, `turbo`, `gaussian`, `lanczos2`, or `lanczos3`.
+
+When drizzle is enabled, light calibration does not debayer. Drizzle is applied during registration or sequence application. Mosaic per-panel drizzle also uses the same drizzle parameters.
+
+## Stacking options
+
+The UI exposes these stacking methods:
+
+- Winsorized Rejection.
+- Sigma Rejection.
+- Mean.
+- Median.
+
+Generated stack methods map through `map_stack_method()`:
+
+- Winsorized rejection: `stack ... rej <low> <high>`.
+- Sigma rejection: `stack ... rej sigma <low> <high>`.
+- Mean: `stack ... mean none`.
+- Median: `stack ... med`.
+
+Final stacks can optionally include `-32b`.
+
+## Pack sequence support
+
+Pack-sequence modes include:
+
+- Off.
+- FITSEQ.
+- SER.
+- Auto when above a threshold.
+
+Auto mode defaults to 2000 frames. Packing applies to light conversion in non-mosaic mode. Mosaic mode intentionally forces packing off because Siril 1.4 cannot plate-solve packed FITSEQ/SER sequences in this workflow.
+
+## Mosaic mode
+
+Mosaic mode is marked experimental. It supports:
+
+- Grid layout rows and columns.
+- Overlap percentage.
+- Global reference selection.
+- Canvas scale.
+- One-pass or two-pass mosaic registration.
+- Panel background extraction.
+- Maximize framing.
+- Normalize on overlaps.
+- Border feathering in pixels.
+- Optional link between overlap percentage and feathering.
+- Drizzle per panel.
+- Auto-manage panels by grid.
+- Panel name schemes: `A1`, `B2`, etc., or `R1C2`.
+- Preview mosaic layout dialog.
+- Copy calibration frames from the first panel to other panels.
+
+## Mosaic generated Siril pipeline
+
+Mosaic processing is split into phases:
+
+1. Per-panel conversion, calibration, optional background extraction, WCS solving, and registration.
+2. Per-panel cross-session merge and stack.
+3. Phase 2 stitching from panel final FITS files into a mosaic sequence.
+4. WCS plate solving of the mosaic sequence.
+5. Optional max-framing sequence application.
+6. Mosaic stacking with optional maximize, feathering, and overlap normalization.
+7. Final `mirrorx -bottomup` and save to `<project_slug>_final.fit`.
+
+Phase 2 deliberately skips drizzle because it uses RGB panel final images rather than mono/CFA sequences.
+
+Drizzle per panel intentionally forces two-pass behavior because drizzle output is generated through `seqapplyreg`.
+
+## Geometry preflight
+
+When `astropy` is available, the script can:
+
+- Read FITS dimensions from converted light files.
+- Detect the modal light-frame geometry.
+- Move mismatched converted light frames into `_mismatch_geometry`.
+- Warn if master dark or flat geometry does not match the modal light geometry.
+
+If `astropy` is not available, geometry preflight is skipped.
+
+## Running Siril
+
+The Run action:
+
+- Requires `run_project.ssf` to exist.
+- Validates calibration coverage again before running.
+- Prefers in-Siril execution through `sirilpy` when available.
+- Can force use of `siril-cli`.
+- Falls back to `siril-cli` if the Python API run fails.
+- Logs CLI output to timestamped `siril_run_*.log`.
+- Streams CLI output back to the Siril console when connected.
+- Tracks run mode in the GUI.
+- Loads the final image into Siril after a successful CLI run when connected.
+
+Abort behavior is intended for CLI runs. On Windows it sends `CTRL_BREAK_EVENT`; on other platforms it sends `SIGINT`. In-Siril API runs should be stopped from Siril itself.
+
+## Known implementation notes to preserve
+
+- Siril `.ssf` output must not include shell commands such as `echo`.
+- Mosaic mode intentionally forces pack sequence mode off.
+- Drizzle per panel intentionally forces two-pass behavior.
+- Phase 2 mosaic drizzle is intentionally skipped.
+- The final image is intentionally mirrored with `mirrorx -bottomup` before saving.
+- The script currently uses a single-file application structure.
+- Build and run operations intentionally preserve dirty-state behavior where noted in code.
+- Current mosaic canvas scaling saves `mosaic_final_scaled.fit`, but final promotion still loads `mosaic_final.fit`; treat this as existing behavior unless changing it explicitly.
+- The About dialog text appears to contain a typo: `winorized` instead of `winsorized`.
+- There is duplicated initial window sizing/centering code in `MainWindow.__init__`; this is harmless but could be cleaned later.
