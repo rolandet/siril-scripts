@@ -41,6 +41,7 @@ Use this checklist before considering code changes complete. For documentation-o
 - [ ] Siril Master Library variables: `$defbias`, `$defdark`, `$defflat`.
 - [ ] `register` flags: `-layer=0`, `-2pass`, `-drizzle`, `-scale`, `-pixfrac`, `-kernel`, `-disto=file`.
 - [ ] `seqapplyreg`, including drizzle args and `-framing=max`.
+- [ ] `seqsubsky pp_light 1` when background extraction is enabled.
 - [ ] `merge`.
 - [ ] `stack` methods and flags: `rej`, `sigma`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
 - [ ] Mosaic commands: `seqsubsky`, `parse`, `platesolve -force -disto=...`, `seqplatesolve -force -nocache`, `resample`.
@@ -56,6 +57,8 @@ Use this checklist before considering code changes complete. For documentation-o
 - [ ] Mosaic mode still disables pack sequences.
 - [ ] Drizzle per panel still forces two-pass behavior.
 - [ ] Phase 2 mosaic drizzle remains skipped unless the workflow changes from RGB panel finals to mono/CFA sequences.
+- [ ] Non-mosaic background extraction, when enabled, runs after calibration and before registration.
+- [ ] Background-extracted non-mosaic workflows use `bkg_pp_light` downstream.
 - [ ] Compression behavior is intentional, including `.fit` versus `.fit.fz` loads.
 - [ ] Normalization behavior is intentional.
 - [ ] Stacking output names are predictable.

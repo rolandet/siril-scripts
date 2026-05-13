@@ -5,7 +5,7 @@
 # PARTICULAR PURPOSE. See the GNU General Public License for more details.
 # See <https://www.gnu.org/licenses/>.
 """
-Multi-Night Stacking for Siril 1.4 (PyQt6) — with Siril console integration (sirilpy) - version 2.1
+Multi-Night Stacking for Siril 1.4 (PyQt6) — with Siril console integration (sirilpy) - version 2.2
 
 What's inside:
 - JSON projects (persist drizzle options + 2-pass flag); new project starts with one session.
@@ -341,6 +341,7 @@ class Project:
     drizzle_scaling: float = 1.0      # 0.1 – 3.0
     drizzle_pixfrac: float = 1.0      # 0.0 – 1.0
     drizzle_kernel: str = "square"    # point|turbo|square|gaussian|lanczos2|lanczos3
+    background_extraction_enabled: bool = False
 
     # 2-pass registration (default False)
     two_pass: bool = False
@@ -400,6 +401,7 @@ class Project:
             "drizzle_scaling": self.drizzle_scaling,
             "drizzle_pixfrac": self.drizzle_pixfrac,
             "drizzle_kernel": self.drizzle_kernel,
+            "background_extraction_enabled": bool(self.background_extraction_enabled),
 
             "two_pass": self.two_pass,
             "compress_intermediates": self.compress_intermediates,
@@ -456,6 +458,7 @@ class Project:
         p.drizzle_scaling = float(d.get("drizzle_scaling", 1.0))
         p.drizzle_pixfrac = float(d.get("drizzle_pixfrac", 1.0))
         p.drizzle_kernel = d.get("drizzle_kernel", "square")
+        p.background_extraction_enabled = bool(d.get("background_extraction_enabled", False))
 
         p.two_pass = bool(d.get("two_pass", True))
         p.compress_intermediates = bool(d.get("compress_intermediates", False))
@@ -821,6 +824,7 @@ class SirilCommandBuilder:
             L.append(f"# Drizzle: ON (Scaling={p.drizzle_scaling:g}, PixFrac={p.drizzle_pixfrac:g}, Kernel={p.drizzle_kernel})")
         else:
             L.append("# Drizzle: OFF")
+        L.append(f"# Background Extraction: {'ON' if p.background_extraction_enabled else 'OFF'}")
         L.append(f"# 2-pass registration: {'ON' if p.two_pass else 'OFF'}")
         L.append(f"# Global stack method: {p.stack_method} (low={p.reject_sigma_low:g}, high={p.reject_sigma_high:g})")
         L.append("")
@@ -1028,7 +1032,14 @@ class SirilCommandBuilder:
             L.append(" ".join(parts))
             L.append("")
 
-            pp_seqs.append((process_dir.as_posix(), "pp_light"))
+            seq_name = "pp_light"
+            if getattr(p, "background_extraction_enabled", False):
+                L.append("# Background extraction enabled")
+                L.append("seqsubsky pp_light 1")
+                L.append("")
+                seq_name = "bkg_pp_light"
+
+            pp_seqs.append((process_dir.as_posix(), seq_name))
             any_session = True
 
         # ---------- Global register/stack ----------
@@ -1052,7 +1063,8 @@ class SirilCommandBuilder:
         if len(pp_seqs) == 1:
             # Single session
             sess = p.sessions[0]
-            reg_target = "pp_light"
+            reg_target = pp_seqs[0][1]
+            stack_target = f"r_{reg_target}"
 
             if p.drizzle_enabled and not p.two_pass:
                 # Drizzle fast-path (no seqapplyreg) – add -flat as weight if available
@@ -1064,7 +1076,7 @@ class SirilCommandBuilder:
 
                 L.append(f"register {reg_target}{reg_flags}{drizzle_args}{flat_opt}")
                 L.append(self._stack_cmd(
-                    "r_pp_light", norm="addscale", out="final_stacked",
+                    stack_target, norm="addscale", out="final_stacked",
                     rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
                 ))
             else:
@@ -1073,14 +1085,14 @@ class SirilCommandBuilder:
                 if p.drizzle_enabled:
                     L.append(f"seqapplyreg {reg_target}{drizzle_args}")
                     L.append(self._stack_cmd(
-                        "r_pp_light", norm="addscale", out="final_stacked",
+                        stack_target, norm="addscale", out="final_stacked",
                         rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
                     ))
                 else:
                     if p.two_pass:
                         L.append(f"seqapplyreg {reg_target}")
                     L.append(self._stack_cmd(
-                        "r_pp_light", norm="addscale", out="final_stacked",
+                        stack_target, norm="addscale", out="final_stacked",
                         rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
                     ))
         else:
@@ -2444,6 +2456,10 @@ class ProjectWidget(QtWidgets.QWidget):
 
         self.cb_two_pass  = QtWidgets.QCheckBox("Use 2-pass registration")
         self.cb_two_pass.setToolTip("Computes transforms in pass #1, applies in pass #2.\nEnable for challenging datasets or drizzle if desired.")
+        self.cb_background_extraction = QtWidgets.QCheckBox("Background Extraction")
+        self.cb_background_extraction.setToolTip(
+            "Runs seqsubsky on the calibrated sequence before alignment."
+        )
 
         # Stacking controls (global)
         # Stacking controls (global)
@@ -2571,7 +2587,7 @@ class ProjectWidget(QtWidgets.QWidget):
 
 
         # DRIZZLE (boxed)
-        drizzle_box  = QtWidgets.QGroupBox("Drizzle")
+        drizzle_box  = QtWidgets.QGroupBox("Drizzle and Background Extraction")
         drizzle_form = QtWidgets.QFormLayout(drizzle_box)
         drizzle_form.addRow("", self.cb_drizzle)
         drow = QtWidgets.QHBoxLayout()
@@ -2582,7 +2598,12 @@ class ProjectWidget(QtWidgets.QWidget):
         drow.addWidget(self.lbl_kernel);   drow.addWidget(self.cb_kernel)
         drow.addStretch(1)
         drizzle_form.addRow("", drow)
-        drizzle_form.addRow("", self.cb_two_pass)
+        reg_bg_row = QtWidgets.QHBoxLayout()
+        reg_bg_row.addWidget(self.cb_two_pass)
+        reg_bg_row.addSpacing(18)
+        reg_bg_row.addWidget(self.cb_background_extraction)
+        reg_bg_row.addStretch(1)
+        drizzle_form.addRow("", reg_bg_row)
 
         # STACKING (boxed)
         stack_box  = QtWidgets.QGroupBox("Stacking")
@@ -2848,6 +2869,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.spin_pixfrac.valueChanged.connect(self.mark_dirty)
         self.cb_kernel.currentIndexChanged.connect(self.mark_dirty)
         self.cb_two_pass.toggled.connect(self.mark_dirty)
+        self.cb_background_extraction.toggled.connect(self.mark_dirty)
 
         self.cb_stack_method.currentIndexChanged.connect(self._toggle_sigma_by_method)
         self.cb_stack_method.currentIndexChanged.connect(self.mark_dirty)
@@ -3658,6 +3680,7 @@ class ProjectWidget(QtWidgets.QWidget):
             kernels = ["square", "point", "turbo", "gaussian", "lanczos2", "lanczos3"]
             self.cb_kernel.setCurrentIndex(max(0, kernels.index(p.drizzle_kernel) if p.drizzle_kernel in kernels else 0))
             self.cb_two_pass.setChecked(p.two_pass)
+            self.cb_background_extraction.setChecked(bool(getattr(p, "background_extraction_enabled", False)))
 
             sm_idx = self.cb_stack_method.findText(p.stack_method or "Winsorized Rejection")
             if sm_idx < 0:
@@ -3743,6 +3766,7 @@ class ProjectWidget(QtWidgets.QWidget):
         p.drizzle_scaling = float(self.spin_scaling.value())
         p.drizzle_pixfrac = float(self.spin_pixfrac.value())
         p.drizzle_kernel  = self.cb_kernel.currentText()
+        p.background_extraction_enabled = self.cb_background_extraction.isChecked()
         p.two_pass        = self.cb_two_pass.isChecked()
 
         # Store exactly what the user picked in the combobox
@@ -4911,7 +4935,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self._suppress_resize_dirty = True
-        self.setWindowTitle("OSC Multi-Night Stacking (Siril 1.4) Version 2.1")
+        self.setWindowTitle("OSC Multi-Night Stacking (Siril 1.4) Version 2.2")
 
         self.proj_widget = ProjectWidget()
         self.setCentralWidget(self.proj_widget)
@@ -4951,7 +4975,7 @@ class MainWindow(QtWidgets.QMainWindow):
         help_menu.addAction(about_action)
         about_action.triggered.connect(lambda: QtWidgets.QMessageBox.information(
             self, "About",
-            "OSC Multi-Night Stacking for Siril 1.4 (PyQt6) Version 2.1\n"
+            "OSC Multi-Night Stacking for Siril 1.4 (PyQt6) Version 2.2\n"
             "• Drizzle: Scaling, Pixel Fraction, Kernel\n"
             "• 2-pass registration toggle\n"
             "• Global stacking options (sigma or winsorized rejection (sigma high and low), mean)\n"

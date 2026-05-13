@@ -23,7 +23,7 @@ Before adding or changing generated Siril commands, verify the command exists in
 - Sequence application: `seqapplyreg`, drizzle args, `-framing=max`.
 - Stacking: `stack`, `rej`, `rej sigma`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
 - Sequence and image operations: `merge`, `load`, `save`, `mirrorx -bottomup`, `resample`.
-- Mosaic WCS/background commands: `seqsubsky pp_light 1`, `parse $RA:ra$_$DEC:dec$`, `platesolve -force -disto=platesolve_data.wcs`, `seqplatesolve mosaic -force -nocache`.
+- Background and mosaic WCS commands: `seqsubsky pp_light 1`, `parse $RA:ra$_$DEC:dec$`, `platesolve -force -disto=platesolve_data.wcs`, `seqplatesolve mosaic -force -nocache`.
 
 ## Known historical errors
 
@@ -54,6 +54,7 @@ Resolution: do not rely on guessed command parameters. Validate against Siril 1.
 - Mosaic mode intentionally disables pack sequences because Siril 1.4 cannot plate-solve packed FITSEQ/SER sequences in this workflow.
 - Drizzle per panel intentionally forces two-pass registration and uses `seqapplyreg` for drizzle output.
 - Phase 2 mosaic drizzle is intentionally skipped because panel finals are RGB, not mono/CFA.
+- Non-mosaic background extraction uses `seqsubsky pp_light 1` after calibration and before alignment, then registers the resulting `bkg_pp_light` sequence.
 - When drizzle is enabled, OSC light calibration skips `-debayer`.
 - When drizzle is off, OSC light calibration includes `-debayer`.
 - Flat calibration does not use CFA/equalize flags.

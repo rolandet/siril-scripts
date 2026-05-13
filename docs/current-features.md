@@ -15,6 +15,7 @@ The project model stores:
 - Window-size persistence preferences.
 - Inferred frame width and height.
 - Global drizzle settings.
+- Global background extraction setting.
 - Global two-pass registration setting.
 - Intermediate FITS compression setting.
 - Optional 32-bit final stack output.
@@ -68,12 +69,14 @@ For standard multi-session processing, the generated `.ssf` script:
 7. Uses `-equalize_cfa` when flat calibration is used and drizzle is off.
 8. Uses `-debayer` when drizzle is off.
 9. Skips `-debayer` during calibration when drizzle is on.
-10. Registers calibrated light sequences.
-11. Supports optional two-pass registration.
-12. Supports drizzle through either direct registration or `seqapplyreg`, depending on drizzle and two-pass settings.
-13. Merges multiple sessions into `all_sessions`.
-14. Stacks the registered sequence.
-15. Loads the final stack, runs `mirrorx -bottomup`, and saves `<project_slug>_final.fit`.
+10. Optionally runs `seqsubsky pp_light 1` on each calibrated session sequence before alignment.
+11. Uses the `bkg_pp_light` sequence after background extraction.
+12. Registers calibrated or background-subtracted light sequences.
+13. Supports optional two-pass registration.
+14. Supports drizzle through either direct registration or `seqapplyreg`, depending on drizzle and two-pass settings.
+15. Merges multiple sessions into `all_sessions`.
+16. Stacks the registered sequence.
+17. Loads the final stack, runs `mirrorx -bottomup`, and saves `<project_slug>_final.fit`.
 
 ## Drizzle behavior
 
@@ -85,6 +88,18 @@ Global drizzle options include:
 - Kernel: `square`, `point`, `turbo`, `gaussian`, `lanczos2`, or `lanczos3`.
 
 When drizzle is enabled, light calibration does not debayer. Drizzle is applied during registration or sequence application. Mosaic per-panel drizzle also uses the same drizzle parameters.
+
+## Background extraction behavior
+
+The non-mosaic UI includes a `Background Extraction` checkbox under `Drizzle and Background Extraction`.
+
+When enabled, generated `.ssf` scripts run:
+
+```text
+seqsubsky pp_light 1
+```
+
+This runs after light calibration and before registration/alignment. The resulting sequence uses Siril's `bkg_` prefix, so downstream registration uses `bkg_pp_light`.
 
 ## Stacking options
 
@@ -181,6 +196,7 @@ Abort behavior is intended for CLI runs. On Windows it sends `CTRL_BREAK_EVENT`;
 ## Known implementation notes to preserve
 
 - Siril `.ssf` output must not include shell commands such as `echo`.
+- Non-mosaic background extraction intentionally starts with the basic `seqsubsky pp_light 1` command form.
 - Mosaic mode intentionally forces pack sequence mode off.
 - Drizzle per panel intentionally forces two-pass behavior.
 - Phase 2 mosaic drizzle is intentionally skipped.

@@ -30,6 +30,7 @@ This is especially important for:
 - Multi-night light-frame grouping.
 - Registration and two-pass behavior.
 - Drizzle behavior.
+- Background extraction placement after calibration and before alignment.
 - Mosaic pack-sequence disabling.
 - Mosaic per-panel drizzle forcing two-pass behavior.
 - Phase 2 mosaic drizzle being skipped.
