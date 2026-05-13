@@ -8,6 +8,10 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
 
 **Note: Siril 1.4 or later is required **
 ---
+## ✨ Update Release (v2.2)
+- Added the ability to apply background extraction to individual subs using the seqsubsky sequencename command for non-mosaic stacking. The mosaic feature already had this capability.
+
+---
 ## ✨ Update Release (v2.1)
 - This is mostly a bug fix and feature enhancement release. No new features.
   <img width="766" height="338" alt="image" src="https://github.com/user-attachments/assets/6f965e9e-58c8-40c8-bec7-cdfc4825857a" />
