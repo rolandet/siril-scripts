@@ -6,6 +6,8 @@ Source reviewed: `osc-multi-night-stacking-v2.1.py`
 
 `osc-multi-night-stacking-v2.1.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, and experimental mosaic processing.
 
+The v3.0 branch file `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` extends the same single-file application with optional Ha/OIII and SII/OIII narrowband extraction. When enabled, it generates the narrowband final instead of the normal OSC RGB final.
+
 ## Core project model
 
 The project model stores:
@@ -23,6 +25,7 @@ The project model stores:
 - Pack-sequence mode and auto-pack threshold.
 - Sessions.
 - Mosaic settings.
+- Narrowband extraction settings in the v3.0 branch: enabled flag, mono-output preference, output palette, fixed `ha` resampling, fixed merged-OIII policy, and disabled NB drizzle policy.
 - Whether uncalibrated runs are allowed.
 
 ## Session and panel models
@@ -31,12 +34,15 @@ Each session stores lights, bias, darks, flats, dark-flats, optional master bias
 
 Each panel stores a panel ID, description, and its own lights, bias, darks, flats, and dark-flats. Panel-level calibration can override session-level calibration where applicable.
 
+In the v3.0 branch, sessions and panels also store filter-specific `Ha/OIII` and `SII/OIII` frame sets. Each narrowband frame set has its own lights, bias, darks, flats, dark-flats, and optional master bias/dark/flat/dark-flat overrides; session/panel master overrides and the Siril Master Library remain available as fallbacks.
+
 ## Data preparation
 
 The Prepare Working Directory action:
 
 - Creates the working directory when needed.
 - Builds per-session or per-panel folder structures.
+- In v3.0 narrowband mode, links filter-specific frames under `ha_oiii` and `sii_oiii` subfolders to avoid sequence-name collisions during extraction.
 - Links image files into the working tree.
 - Attempts symlink first, then hardlink, then copy.
 - Writes a timestamped `prepare_*.log`.
@@ -91,7 +97,7 @@ When drizzle is enabled, light calibration does not debayer. Drizzle is applied 
 
 ## Background extraction behavior
 
-The non-mosaic UI includes a `Background Extraction` checkbox under `Drizzle and Background Extraction`.
+The non-mosaic UI includes a `Background Extraction` checkbox in the `Registration and Stacking` box.
 
 When enabled, generated `.ssf` scripts run:
 
@@ -100,6 +106,33 @@ seqsubsky pp_light 1
 ```
 
 This runs after light calibration and before registration/alignment. The resulting sequence uses Siril's `bkg_` prefix, so downstream registration uses `bkg_pp_light`.
+
+In v3.0 narrowband mode, the same background extraction controls are reused after `seqextract_HaOIII`: extracted `Ha_...` and `OIII_...` sequences are background-subtracted before registration when the relevant checkbox is enabled.
+
+## Narrowband extraction behavior in v3.0
+
+When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`, generated scripts:
+
+- Calibrate narrowband lights as CFA and do not emit `-debayer`.
+- Run `seqextract_HaOIII pp_light -resample=ha` for Ha/OIII and SII/OIII filter groups.
+- Map Ha/OIII red extraction to Ha, SII/OIII red extraction to SII, and merge OIII extractions from both filters.
+- Allow asymmetric filter coverage across sessions. Sessions with only one narrowband filter group contribute only that group's channels; for example, four SII/OIII sessions and two Ha/OIII sessions produce SII from four sessions, Ha from two sessions, and OIII from all contributing groups.
+- Prefer filter-group master overrides over shared session/panel overrides, raw filter-group calibration frames, and Master Library variables.
+- Disable drizzle for the narrowband path while preserving the user's drizzle settings for normal OSC processing.
+- Register and stack mono Ha, SII, and OIII channels.
+- Compose using the selected palette: `SHO with HOO fallback`, forced `SHO`, or forced `HOO`.
+- Save the final composed image through the existing `mirrorx -bottomup` final-output step.
+
+For mosaic narrowband projects, extraction happens before panel stacking. The script builds per-channel panel stacks, stitches Ha/SII/OIII channel mosaics independently, then composes the final narrowband RGB image.
+
+The `OSC` tab has two roles:
+
+- When narrowband extraction is disabled, it is the normal OSC workflow, including one traditional dual-band or broadband OSC dataset processed without Ha/SII/OIII channel extraction.
+- When narrowband extraction is enabled, it can optionally be treated as broadband/no-filter/UV-IR-cut RGB data. This option is off by default; when enabled and OSC lights are present, v3.0 writes `<project_slug>_broadband_rgb.fit` in addition to the plain narrowband `<project_slug>_final.fit`.
+
+If `Create LRGB output from OSC luminance` is selected, the generated script aligns the broadband stack to the composed SHO/HOO image, splits the aligned broadband RGB image in Lab mode, uses the Lab L image as luminance, and writes an additional `<project_slug>_SHO_LRGB.fit` or `<project_slug>_HOO_LRGB.fit`. This does not replace the plain narrowband final.
+
+The `Save Ha, SII, and OIII mono stacks` option controls whether named mono channel outputs such as `NB_Ha_mono.fit` are kept as user-facing products. Internal channel stack files are still created when the option is off because RGB composition needs aligned channel images.
 
 ## Stacking options
 
