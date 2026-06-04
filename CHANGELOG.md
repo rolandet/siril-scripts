@@ -11,7 +11,7 @@ All notable user-facing changes to this project should be documented here.
 - Added v3.0 narrowband extraction support in `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` for Ha/OIII and SII/OIII dual-band OSC data, including mono Ha/SII/OIII stacks and SHO output with HOO fallback.
 - Added Session and Panel editor filter tabs for `OSC`, `Ha/OIII`, and `SII/OIII` data entry.
 - Added tooltips for the v3.0 processing tabs and filter-group tabs.
-- Added v3.0 narrowband-mode broadband support: the `OSC` tab can now produce a companion `<project>_broadband_rgb.fit`, and an optional LRGB compose step can write `<project>_SHO_LRGB.fit` or `<project>_HOO_LRGB.fit`.
+- Added v3.0 narrowband-mode broadband support: the `OSC` tab can now produce a companion `<project>_broadband_rgb.fit`, and an optional LRGB compose step can write `<project>_<palette>_LRGB.fit`.
 
 ### Changed
 
@@ -27,10 +27,15 @@ All notable user-facing changes to this project should be documented here.
 - Clarified the v3.0 `OSC` tab behavior: with narrowband extraction disabled it remains the traditional OSC workflow; with extraction enabled it is treated as optional broadband/no-filter/UV-IR-cut data for RGB and luminance companion outputs.
 - Defaulted the v3.0 OSC broadband and LRGB luminance options to off so broadband integration is explicit opt-in.
 - Made `Save Ha, SII, and OIII mono stacks` toggleable; when off, only internal channel work files are kept for composition.
-- Expanded the v3.0 narrowband output dropdown to support `SHO with HOO fallback`, forced `SHO`, and forced `HOO`.
+- Expanded the v3.0 narrowband output dropdown to support `SHO with HOO fallback`, forced `SHO`, forced `HSO`, and forced `HOO`.
+- Defaulted v3.0 narrowband RGB composition to normalize aligned Ha/SII/OIII channel levels before `rgbcomp`, with a checkbox to disable normalization when raw channel ratios are desired.
+- Narrowband final FITS filenames now include the resolved palette label, such as `<project>_SHO_final.fit`, `<project>_HOO_final.fit`, or `<project>_HSO_final.fit`.
 
 ### Fixed
 
+- Prevented deleting the final session in v3.0 projects and the final mosaic panel in a session, so frame-list edits always have a real session or panel to update.
+- Moved v3.0 narrowband aggregate sequence scratch files into `Session 1/nb_sequences` instead of writing them into the project root.
+
 ### Notes
 
-- This entry documents a documentation-only update. No Python code behavior was changed.
+- The v3.0 session and panel safeguards are UI-only and do not change generated Siril command syntax.

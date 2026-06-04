@@ -16,7 +16,7 @@ What's inside:
     * Drizzle OFF: include -debayer in calibrate; register (-layer=0 [+ -2pass]); stack r_*.
 - Global stack options (rej / wrej / mean + sigma low/high), sigma controls hide for Mean.
 - SSF: requires 1.4.0, setcompress 0, setfindstar reset (start & end), final close.
-- Final save to <project_slug>_final.fit and auto-open in Siril.
+- Final save to <project_slug>_final.fit, or <project_slug>_<palette>_final.fit in narrowband mode, and auto-open in Siril.
 - Remove Session (config+name+data) and Remove Data (All Sessions) (data only).
 - Guarded session switching to prevent file list cross-contamination.
 - NEW: Abort Run (graceful stop of siril-cli).
@@ -73,7 +73,7 @@ QUICK_START_MD = r"""
    - Click the **Run Siril Script** button in the main window.  
    - The application automatically executes the configured **`run_project.ssf`** Siril script via the Siril Python API or uses the **`siril-cli`** as a backup
    - Progress and script output appear in the console log panel in Siril and in a log file in the *working directory*
-   - When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`** and loaded into Siril
+   - When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`** and loaded into Siril; narrowband mode adds the palette, for example **`[ProjectName]_SHO_final.fit`**
 """
 
 class QuickStartDialog(QtWidgets.QDialog):
@@ -268,6 +268,7 @@ NB_GROUP_LABELS = {"ha_oiii": "Ha/OIII", "sii_oiii": "SII/OIII"}
 NB_PALETTE_OPTIONS = [
     ("SHO with HOO fallback", "SHO_WITH_HOO_FALLBACK"),
     ("SHO", "SHO"),
+    ("HSO", "HSO"),
     ("HOO", "HOO"),
 ]
 FRAME_TAB_TOOLTIPS = {
@@ -486,6 +487,7 @@ class Project:
     nb_extraction_enabled: bool = False
     nb_save_mono_outputs: bool = True
     nb_output_palette: str = "SHO_WITH_HOO_FALLBACK"
+    nb_normalize_channels: bool = True
     nb_resample_mode: str = "ha"
     nb_oiii_merge_policy: str = "merge_all"
     nb_drizzle_policy: str = "disabled"
@@ -546,6 +548,7 @@ class Project:
             "nb_extraction_enabled": bool(self.nb_extraction_enabled),
             "nb_save_mono_outputs": bool(self.nb_save_mono_outputs),
             "nb_output_palette": self.nb_output_palette,
+            "nb_normalize_channels": bool(self.nb_normalize_channels),
             "nb_resample_mode": self.nb_resample_mode,
             "nb_oiii_merge_policy": self.nb_oiii_merge_policy,
             "nb_drizzle_policy": self.nb_drizzle_policy,
@@ -615,6 +618,7 @@ class Project:
         p.nb_extraction_enabled = bool(d.get("nb_extraction_enabled", False))
         p.nb_save_mono_outputs = bool(d.get("nb_save_mono_outputs", True))
         p.nb_output_palette = d.get("nb_output_palette", "SHO_WITH_HOO_FALLBACK")
+        p.nb_normalize_channels = bool(d.get("nb_normalize_channels", True))
         p.nb_resample_mode = d.get("nb_resample_mode", "ha")
         p.nb_oiii_merge_policy = d.get("nb_oiii_merge_policy", "merge_all")
         p.nb_drizzle_policy = d.get("nb_drizzle_policy", "disabled")
@@ -890,6 +894,15 @@ class _ProcReader(QtCore.QThread):
 
 class SirilCommandBuilder:
     def __init__(self, project: Project): self.project = project
+
+    def _nb_sequence_work_dir(self, work: Path) -> Path:
+        sessions = getattr(self.project, "sessions", []) or []
+        if sessions:
+            first = sessions[0]
+            session_dir = getattr(first, "work_subdir", None) or getattr(first, "name", None) or "Session 1"
+        else:
+            session_dir = "Session 1"
+        return (work / session_dir / "nb_sequences").resolve()
 
     def _bias_arg(self, sess: Session) -> Optional[str]:
         if sess.master_bias: return siril_arg(sess.master_bias)
@@ -1193,6 +1206,7 @@ class SirilCommandBuilder:
         set_comp,
         already_registered: bool = False,
         mirror_final: bool = True,
+        sequence_work: Optional[Path] = None,
     ) -> Optional[str]:
         if not seqs:
             return None
@@ -1201,6 +1215,7 @@ class SirilCommandBuilder:
         set_comp(0)
         final_path = (work / final_name).as_posix()
         stack_seq_name = ""
+        scratch_dir = (sequence_work or work).resolve()
 
         if len(seqs) == 1:
             folder, seq_name = seqs[0]
@@ -1216,7 +1231,7 @@ class SirilCommandBuilder:
             L.append(self._stack_cmd(stack_seq_name, norm="addscale", out=out_name,
                                      rgb_equal=True, output_norm=True, use_32b=p.stack_32bit))
         else:
-            L.append(f'cd "{work.as_posix()}"')
+            L.append(f'cd "{scratch_dir.as_posix()}"')
             merge_inputs = " ".join([f'"{folder}/{seq_name}"' for folder, seq_name in seqs])
             merged_name = f"{out_name}_all"
             L.append(f"merge {merge_inputs} {merged_name}")
@@ -1244,6 +1259,7 @@ class SirilCommandBuilder:
         finals: list[str],
         final_name: str,
         set_comp,
+        sequence_work: Optional[Path] = None,
     ) -> Optional[str]:
         finals = [f for f in finals if f]
         if not finals:
@@ -1262,7 +1278,7 @@ class SirilCommandBuilder:
             L.append("")
             return final_path
 
-        mosaic_dir = Path(finals[0]).parent
+        mosaic_dir = (sequence_work or Path(finals[0]).parent).resolve()
         prefix = "nb_broadband_mosaic"
         L.append("# ---- Build broadband OSC mosaic companion ----")
         L.append(f'cd "{mosaic_dir.as_posix()}"')
@@ -1412,10 +1428,13 @@ class SirilCommandBuilder:
         out_name: str,
         set_comp,
         save_public: bool = True,
+        sequence_work: Optional[Path] = None,
     ) -> str:
         p = self.project
         set_comp(0)
         effective_out = out_name if save_public else f"{out_name}_work"
+        scratch_dir = (sequence_work or work).resolve()
+        final_dir = work if save_public else scratch_dir
         if len(seqs) == 1:
             folder, seq_name = seqs[0]
             L.append(f'cd "{folder}"')
@@ -1426,7 +1445,7 @@ class SirilCommandBuilder:
             L.append(self._stack_cmd(f"r_{seq_name}", norm="addscale", out=effective_out,
                                      rgb_equal=False, output_norm=True, use_32b=p.stack_32bit))
             L.append(f"load {effective_out}.fit")
-            final_path = (work / f"{effective_out}.fit").as_posix()
+            final_path = (final_dir / f"{effective_out}.fit").as_posix()
             L.append(f'save "{final_path}"')
             if save_public:
                 L.append(f"# Mono {channel} output: {final_path}")
@@ -1435,7 +1454,7 @@ class SirilCommandBuilder:
             L.append("")
             return final_path
 
-        L.append(f'cd "{work.as_posix()}"')
+        L.append(f'cd "{scratch_dir.as_posix()}"')
         merge_inputs = " ".join([f'"{folder}/{seq_name}"' for folder, seq_name in seqs])
         merged_name = f"{effective_out}_all"
         L.append(f"merge {merge_inputs} {merged_name}")
@@ -1445,7 +1464,10 @@ class SirilCommandBuilder:
             L.append(f"seqapplyreg {merged_name}")
         L.append(self._stack_cmd(f"r_{merged_name}", norm="addscale", out=effective_out,
                                  rgb_equal=False, output_norm=True, use_32b=p.stack_32bit))
-        final_path = (work / f"{effective_out}.fit").as_posix()
+        final_path = (final_dir / f"{effective_out}.fit").as_posix()
+        if save_public:
+            L.append(f"load {effective_out}.fit")
+            L.append(f'save "{final_path}"')
         if save_public:
             L.append(f"# Mono {channel} output: {final_path}")
         else:
@@ -1462,12 +1484,15 @@ class SirilCommandBuilder:
         finals: list[str],
         set_comp,
         save_public: bool = True,
+        sequence_work: Optional[Path] = None,
     ) -> Optional[str]:
         finals = [f for f in finals if f]
         if not finals:
             return None
         out_name = f"NB_{channel}_mono" if save_public else f"NB_{channel}_mono_work"
-        final_path = (work / f"{out_name}.fit").as_posix()
+        scratch_dir = (sequence_work or work).resolve()
+        final_dir = work if save_public else scratch_dir
+        final_path = (final_dir / f"{out_name}.fit").as_posix()
         set_comp(0)
         if len(finals) == 1:
             L.append(f'cd "{Path(finals[0]).parent.as_posix()}"')
@@ -1481,7 +1506,7 @@ class SirilCommandBuilder:
             return final_path
 
         p = self.project
-        mosaic_dir = Path(finals[0]).parent
+        mosaic_dir = scratch_dir
         prefix = f"nb_{channel.lower()}_mosaic"
         L.append(f'cd "{mosaic_dir.as_posix()}"')
         for i, fpath in enumerate(finals, start=1):
@@ -1518,21 +1543,51 @@ class SirilCommandBuilder:
         L.append("")
         return final_path
 
-    def _nb_compose_final(self, L: list[str], *, work: Path, channel_files: dict[str, str], set_comp) -> tuple[str, str]:
+    def _nb_compose_inputs(self, L: list[str], *, ref_index: int) -> list[str]:
+        inputs = [f"r_nb_comp_{i:05d}" for i in range(1, 4)]
+        if not bool(getattr(self.project, "nb_normalize_channels", True)):
+            return inputs
+
+        ref_name = inputs[ref_index - 1]
+        normed: list[str] = []
+        L.append("# Normalize final NB channel levels before RGB composition.")
+        L.append(f"# NB normalization reference: {ref_name}.fit")
+        for i, name in enumerate(inputs, start=1):
+            if i == ref_index:
+                normed.append(name)
+                continue
+            out_name = f"nb_comp_norm_{i:05d}"
+            expr = (
+                f"${name}$*mad(${ref_name}$)/mad(${name}$)"
+                f"-mad(${ref_name}$)/mad(${name}$)*median(${name}$)"
+                f"+median(${ref_name}$)"
+            )
+            L.append(f'pm "{expr}"')
+            L.append(f'save "{out_name}.fit"')
+            normed.append(out_name)
+        return normed
+
+    def _nb_compose_final(self, L: list[str], *, work: Path, channel_files: dict[str, str], set_comp, sequence_work: Optional[Path] = None) -> tuple[str, str]:
         if "Ha" not in channel_files or "OIII" not in channel_files:
             raise ValueError("Narrowband extraction requires Ha/OIII data to produce Ha and OIII channels.")
 
         set_comp(0)
+        scratch_dir = (sequence_work or work).resolve()
         has_sii = bool(channel_files.get("SII"))
         palette = str(getattr(self.project, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK").upper()
-        if palette == "SHO" and not has_sii:
-            raise ValueError("SHO output requires SII/OIII data. Select HOO or SHO with HOO fallback when SII is unavailable.")
+        if palette in ("SHO", "HSO") and not has_sii:
+            raise ValueError(f"{palette} output requires SII/OIII data. Select HOO or SHO with HOO fallback when SII is unavailable.")
 
         if palette == "HOO":
             ordered = [channel_files["Ha"], channel_files["OIII"], channel_files["OIII"]]
             ref_index = 1
             out_name = "hoo_composed"
             palette_label = "HOO"
+        elif palette == "HSO":
+            ordered = [channel_files["Ha"], channel_files["SII"], channel_files["OIII"]]
+            ref_index = 1
+            out_name = "hso_composed"
+            palette_label = "HSO"
         elif has_sii:
             ordered = [channel_files["SII"], channel_files["Ha"], channel_files["OIII"]]
             ref_index = 2
@@ -1545,17 +1600,18 @@ class SirilCommandBuilder:
             palette_label = "HOO"
 
         L.append("# ---- Align final NB channels and compose RGB ----")
-        L.append(f'cd "{work.as_posix()}"')
+        L.append(f'cd "{scratch_dir.as_posix()}"')
         for i, fpath in enumerate(ordered, start=1):
             L.append(f'load "{Path(fpath).as_posix()}"')
             L.append(f'save "nb_comp_{i:05d}.fit"')
         L.append(f"setref nb_comp {ref_index}")
         L.append("register nb_comp -layer=0 -2pass")
         L.append("seqapplyreg nb_comp")
-        L.append(f"rgbcomp r_nb_comp_00001 r_nb_comp_00002 r_nb_comp_00003 -out={out_name}")
+        comp_inputs = self._nb_compose_inputs(L, ref_index=ref_index)
+        L.append(f"rgbcomp {comp_inputs[0]} {comp_inputs[1]} {comp_inputs[2]} -out={out_name}")
         L.append(f"load {out_name}.fit")
         L.append("mirrorx -bottomup")
-        final_abs = (work / f"{safe_slug(self.project.name)}_final.fit").as_posix()
+        final_abs = (work / f"{safe_slug(self.project.name)}_{palette_label}_final.fit").as_posix()
         L.append(f'save "{final_abs}"')
         L.append(f"# Final narrowband output: {final_abs}")
         L.append("")
@@ -1570,14 +1626,16 @@ class SirilCommandBuilder:
         broadband_path: str,
         palette_label: str,
         set_comp,
+        sequence_work: Optional[Path] = None,
     ) -> str:
         p = self.project
         set_comp(0)
+        scratch_dir = (sequence_work or work).resolve()
         out_name = f"{palette_label.lower()}_lrgb"
         final_path = (work / f"{safe_slug(p.name)}_{palette_label}_LRGB.fit").as_posix()
 
         L.append("# ---- Compose OSC broadband luminance with NB RGB ----")
-        L.append(f'cd "{work.as_posix()}"')
+        L.append(f'cd "{scratch_dir.as_posix()}"')
         L.append(f'load "{Path(nb_final_path).as_posix()}"')
         L.append('save "nb_lrgb_align_00001.fit"')
         L.append(f'load "{Path(broadband_path).as_posix()}"')
@@ -1599,6 +1657,8 @@ class SirilCommandBuilder:
         if not p.working_dir:
             raise ValueError("Working directory is not set.")
         work = Path(p.working_dir).resolve()
+        sequence_work = self._nb_sequence_work_dir(work)
+        sequence_work.mkdir(parents=True, exist_ok=True)
         L: list[str] = []
         L.append("#!Siril script generated by multi-night-stacking.py (NB Extraction)")
         L.append("requires 1.4.0")
@@ -1608,6 +1668,7 @@ class SirilCommandBuilder:
         L.append("# Narrowband extraction enabled: normal OSC final is skipped.")
         L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
         L.append("# OIII merge policy: merge all OIII extracted from Ha/OIII and SII/OIII filters.")
+        L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
         L.append("")
 
         comp_state = [-1]
@@ -1667,6 +1728,7 @@ class SirilCommandBuilder:
                     out_name=f"NB_{channel}_mono",
                     set_comp=set_comp,
                     save_public=save_mono,
+                    sequence_work=sequence_work,
                 )
 
         broadband_path = None
@@ -1679,12 +1741,13 @@ class SirilCommandBuilder:
                 out_name="NB_broadband_rgb_stack",
                 final_name=f"{safe_slug(p.name)}_broadband_rgb.fit",
                 set_comp=set_comp,
+                sequence_work=sequence_work,
             )
         elif bool(getattr(p, "nb_use_osc_broadband", False)):
             L.append("# OSC broadband option is enabled, but no OSC-tab lights were found.")
             L.append("")
 
-        nb_final_path, palette_label = self._nb_compose_final(L, work=work, channel_files=channel_files, set_comp=set_comp)
+        nb_final_path, palette_label = self._nb_compose_final(L, work=work, channel_files=channel_files, set_comp=set_comp, sequence_work=sequence_work)
         if bool(getattr(p, "nb_luminance_combine", False)):
             if broadband_path:
                 self._nb_emit_lrgb_composition(
@@ -1694,6 +1757,7 @@ class SirilCommandBuilder:
                     broadband_path=broadband_path,
                     palette_label=palette_label,
                     set_comp=set_comp,
+                    sequence_work=sequence_work,
                 )
             else:
                 L.append("# LRGB combine requested, but no broadband RGB stack was produced.")
@@ -1706,6 +1770,8 @@ class SirilCommandBuilder:
         if not p.working_dir:
             raise ValueError("Working directory is not set.")
         work = Path(p.working_dir).resolve()
+        sequence_work = self._nb_sequence_work_dir(work)
+        sequence_work.mkdir(parents=True, exist_ok=True)
         L: list[str] = []
         L.append("#!Siril script generated by multi-night-stacking.py (Mosaic NB Extraction)")
         L.append("requires 1.4.0")
@@ -1714,6 +1780,7 @@ class SirilCommandBuilder:
         L.append(f'cd "{work.as_posix()}"')
         L.append("# Narrowband extraction enabled: normal OSC mosaic final is skipped.")
         L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
+        L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
         L.append("")
 
         comp_state = [-1]
@@ -1787,6 +1854,7 @@ class SirilCommandBuilder:
                     out_name=out_name,
                     set_comp=set_comp,
                     save_public=False,
+                    sequence_work=sequence_work,
                 ))
 
         L.append("# ---- Build channel mosaics ----")
@@ -1799,6 +1867,7 @@ class SirilCommandBuilder:
                 finals=panel_finals[channel],
                 set_comp=set_comp,
                 save_public=save_mono,
+                sequence_work=sequence_work,
             )
             if path:
                 channel_files[channel] = path
@@ -1817,6 +1886,7 @@ class SirilCommandBuilder:
                     set_comp=set_comp,
                     already_registered=True,
                     mirror_final=False,
+                    sequence_work=sequence_work,
                 )
                 if path:
                     broadband_panel_finals.append(path)
@@ -1826,12 +1896,13 @@ class SirilCommandBuilder:
                 finals=broadband_panel_finals,
                 final_name=f"{safe_slug(p.name)}_broadband_rgb.fit",
                 set_comp=set_comp,
+                sequence_work=sequence_work,
             )
         elif bool(getattr(p, "nb_use_osc_broadband", False)):
             L.append("# OSC broadband option is enabled, but no OSC-tab panel lights were found.")
             L.append("")
 
-        nb_final_path, palette_label = self._nb_compose_final(L, work=work, channel_files=channel_files, set_comp=set_comp)
+        nb_final_path, palette_label = self._nb_compose_final(L, work=work, channel_files=channel_files, set_comp=set_comp, sequence_work=sequence_work)
         if bool(getattr(p, "nb_luminance_combine", False)):
             if broadband_path:
                 self._nb_emit_lrgb_composition(
@@ -1841,6 +1912,7 @@ class SirilCommandBuilder:
                     broadband_path=broadband_path,
                     palette_label=palette_label,
                     set_comp=set_comp,
+                    sequence_work=sequence_work,
                 )
             else:
                 L.append("# LRGB combine requested, but no broadband RGB stack was produced.")
@@ -3764,6 +3836,12 @@ class ProjectWidget(QtWidgets.QWidget):
             "NB_Ha_mono.fit, NB_SII_mono.fit when available, and NB_OIII_mono.fit.\n"
             "When disabled, internal channel stacks are still created because RGB composition needs them."
         )
+        self.chk_nb_normalize_channels = QtWidgets.QCheckBox("Normalize NB channels before composition")
+        self.chk_nb_normalize_channels.setChecked(True)
+        self.chk_nb_normalize_channels.setToolTip(
+            "When enabled, matched SII/Ha/OIII channel levels are normalized before RGB composition.\n"
+            "This helps SHO/HSO/HOO auto-stretches avoid strong color casts from unequal channel backgrounds."
+        )
         self.chk_nb_use_osc_broadband = QtWidgets.QCheckBox("Use OSC tab as broadband RGB / luminance source")
         self.chk_nb_use_osc_broadband.setChecked(False)
         self.chk_nb_use_osc_broadband.setToolTip(
@@ -3773,14 +3851,15 @@ class ProjectWidget(QtWidgets.QWidget):
         )
         self.chk_nb_luminance_combine = QtWidgets.QCheckBox("Create LRGB output from OSC luminance")
         self.chk_nb_luminance_combine.setToolTip(
-            "Requires the OSC broadband option above. Aligns the broadband OSC stack to the SHO/HOO image,\n"
-            "extracts Lab luminance, and creates an additional <project>_SHO_LRGB.fit or <project>_HOO_LRGB.fit."
+            "Requires the OSC broadband option above. Aligns the broadband OSC stack to the SHO/HSO/HOO image,\n"
+            "extracts Lab luminance, and creates an additional <project>_<palette>_LRGB.fit."
         )
         self.cmb_nb_palette = QtWidgets.QComboBox()
         self.cmb_nb_palette.addItems([label for label, _token in NB_PALETTE_OPTIONS])
         self.cmb_nb_palette.setToolTip(
             "Select the narrowband RGB composition.\n"
             "SHO maps SII to red, Ha to green, and OIII to blue.\n"
+            "HSO maps Ha to red, SII to green, and OIII to blue.\n"
             "HOO maps Ha to red and OIII to green/blue.\n"
             "The fallback option uses SHO when SII is available and HOO when it is not."
         )
@@ -4047,6 +4126,7 @@ class ProjectWidget(QtWidgets.QWidget):
         nb_form.addRow("", self.chk_nb_enabled)
         nb_form.addRow("Output", self.cmb_nb_palette)
         nb_form.addRow("", self.chk_nb_save_mono)
+        nb_form.addRow("", self.chk_nb_normalize_channels)
         nb_form.addRow("", self.chk_nb_use_osc_broadband)
         nb_form.addRow("", self.chk_nb_luminance_combine)
         nb_form.addRow("", self.lbl_nb_fixed)
@@ -4207,6 +4287,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.chk_nb_use_osc_broadband.toggled.connect(self.mark_dirty)
         self.chk_nb_luminance_combine.toggled.connect(self.mark_dirty)
         self.chk_nb_save_mono.toggled.connect(self.mark_dirty)
+        self.chk_nb_normalize_channels.toggled.connect(self.mark_dirty)
 
         self.btn_add_sess.clicked.connect(self.add_session)
         self.btn_remove_sess.clicked.connect(self.remove_session)
@@ -4418,6 +4499,7 @@ class ProjectWidget(QtWidgets.QWidget):
 
     def _on_nb_toggled(self, enabled: bool):
         self.chk_nb_save_mono.setEnabled(enabled)
+        self.chk_nb_normalize_channels.setEnabled(enabled)
         self.cmb_nb_palette.setEnabled(enabled)
         self.chk_nb_use_osc_broadband.setEnabled(enabled)
         self.lbl_nb_fixed.setEnabled(enabled)
@@ -4558,26 +4640,33 @@ class ProjectWidget(QtWidgets.QWidget):
         if not self.chk_mosaic_enabled.isChecked():
             return
 
+        s = self._current_session()
+        if s is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Add Panel",
+                "Add or select a session before adding mosaic panels.",
+            )
+            self._refresh_panels_ui_for_session(None)
+            return
+
         # NEW: generate ID using the current grid + naming scheme
-        count = self.lst_panels.count()
+        count = len(getattr(s, "panels", []) or [])
         cols = max(1, int(self.sp_mosaic_cols.value() or 1))
         r = count // cols   # 0-based row
         c = count % cols    # 0-based col
         new_id = self._panel_name_for(r, c)
 
-        self.lst_panels.addItem(new_id)
-
         # Create the panel on the model for the current session
-        s = self._current_session()
-        if s is not None:
-            s.panels.append(Panel(panel_id=new_id))
-            new_index = self.lst_panels.count() - 1
-            self.lst_panels.setCurrentRow(new_index)
-            self._loading_panel = True
-            try:
-                self.panel_editor.from_panel(s.panels[new_index])  # loads a fresh, empty Panel
-            finally:
-                self._loading_panel = False
+        s.panels.append(Panel(panel_id=new_id))
+        self.lst_panels.addItem(new_id)
+        new_index = self.lst_panels.count() - 1
+        self.lst_panels.setCurrentRow(new_index)
+        self._loading_panel = True
+        try:
+            self.panel_editor.from_panel(s.panels[new_index])  # loads a fresh, empty Panel
+        finally:
+            self._loading_panel = False
 
         # Focus Panel tab for editing
         try:
@@ -4590,9 +4679,11 @@ class ProjectWidget(QtWidgets.QWidget):
         if s is not None:
             mosaic_on = self.chk_mosaic_enabled.isChecked()
             has_panels = bool(s.panels)
+            self.btn_remove_panel.setEnabled(mosaic_on and len(s.panels) > 1)
 
             # Panel tab frame lists: enabled when Mosaic is ON and there is at least one panel
             self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
+            self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
 
             # Update the "Copy Calibration Frames" button state
             if has_panels:
@@ -4620,15 +4711,35 @@ class ProjectWidget(QtWidgets.QWidget):
         if not self.chk_mosaic_enabled.isChecked():
             return
 
+        s = self._current_session()
+        if s is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Remove Panel",
+                "Select a session before removing mosaic panels.",
+            )
+            self._refresh_panels_ui_for_session(None)
+            return
+
+        panels = getattr(s, "panels", []) or []
+        if len(panels) <= 1:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Remove Panel",
+                "A mosaic session must contain at least one panel.\n\n"
+                "Add another panel before removing this one, or turn off Mosaic Mode if you do not need panels.",
+            )
+            self._refresh_panels_ui_for_session(s)
+            return
+
         row = self.lst_panels.currentRow()
-        if row < 0:
+        if not (0 <= row < len(panels)):
             return
 
         # Remove from UI and model
-        self.lst_panels.takeItem(row)
-        s = self._current_session()
-        if s and 0 <= row < len(s.panels):
-            s.panels.pop(row)
+        if row < self.lst_panels.count():
+            self.lst_panels.takeItem(row)
+        s.panels.pop(row)
 
         # Update the editor selection / clear editor if no panels left
         self._loading_panel = True
@@ -4648,6 +4759,8 @@ class ProjectWidget(QtWidgets.QWidget):
 
         # Panel frame lists: enabled only when Mosaic is ON and there is at least one panel
         self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
+        self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
+        self.btn_remove_panel.setEnabled(mosaic_on and bool(s and len(s.panels) > 1))
 
         # Update the "Copy Calibration Frames" button state
         if has_panels:
@@ -5010,6 +5123,7 @@ class ProjectWidget(QtWidgets.QWidget):
             self.cb_force_cli.setChecked(bool(getattr(p, "force_cli", False)))
             self.chk_nb_enabled.setChecked(bool(getattr(p, "nb_extraction_enabled", False)))
             self.chk_nb_save_mono.setChecked(bool(getattr(p, "nb_save_mono_outputs", True)))
+            self.chk_nb_normalize_channels.setChecked(bool(getattr(p, "nb_normalize_channels", True)))
             palette = str(getattr(p, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK")
             palette_tokens = [token for _label, token in NB_PALETTE_OPTIONS]
             self.cmb_nb_palette.setCurrentIndex(palette_tokens.index(palette) if palette in palette_tokens else 0)
@@ -5126,6 +5240,7 @@ class ProjectWidget(QtWidgets.QWidget):
         p.force_cli      = self.cb_force_cli.isChecked()
         p.nb_extraction_enabled = self.chk_nb_enabled.isChecked()
         p.nb_save_mono_outputs = self.chk_nb_save_mono.isChecked()
+        p.nb_normalize_channels = self.chk_nb_normalize_channels.isChecked()
         palette_index = self.cmb_nb_palette.currentIndex()
         if 0 <= palette_index < len(NB_PALETTE_OPTIONS):
             p.nb_output_palette = NB_PALETTE_OPTIONS[palette_index][1]
@@ -5243,6 +5358,15 @@ class ProjectWidget(QtWidgets.QWidget):
     def remove_session(self):
         row = self.sessions_list.currentRow()
         if row < 0:
+            return
+
+        if len(self.project.sessions) <= 1:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Remove Session",
+                "A project must contain at least one session.\n\n"
+                "Clear this session's frame lists or rename it instead.",
+            )
             return
 
         sess = self.project.sessions[row]
@@ -5689,6 +5813,15 @@ class ProjectWidget(QtWidgets.QWidget):
                 )
                 return False
 
+            palette = str(getattr(p, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK").upper()
+            if not has_sii_oiii and palette in ("SHO", "HSO"):
+                self._info(
+                    f"{palette} output requires SII/OIII lights.\n\n"
+                    "Add SII/OIII lights in the Session or Panel filter tabs, or select HOO / SHO with HOO fallback.",
+                    "Narrowband Extraction",
+                )
+                return False
+
             if not has_sii_oiii:
                 self._info(
                     "No SII/OIII lights were found. The generated narrowband script will use HOO fallback "
@@ -6118,7 +6251,21 @@ class ProjectWidget(QtWidgets.QWidget):
             if rc == 0:
                 try:
                     proj_slug = safe_slug(self.project.name)
-                    final_path = Path(self.project.working_dir) / f"{proj_slug}_final.fit"
+                    work_dir = Path(self.project.working_dir)
+                    final_candidates = []
+                    if bool(getattr(self.project, "nb_extraction_enabled", False)):
+                        palette = str(getattr(self.project, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK").upper()
+                        if palette == "HOO":
+                            labels = ["HOO"]
+                        elif palette == "HSO":
+                            labels = ["HSO"]
+                        elif palette == "SHO":
+                            labels = ["SHO"]
+                        else:
+                            labels = ["SHO", "HOO"]
+                        final_candidates.extend(work_dir / f"{proj_slug}_{label}_final.fit" for label in labels)
+                    final_candidates.append(work_dir / f"{proj_slug}_final.fit")
+                    final_path = next((path for path in final_candidates if path.exists()), final_candidates[0])
                     if final_path.exists() and getattr(self.siril, "iface", None):
                         self.siril.iface.cmd(f'load "{final_path.as_posix()}"')
                         self.siril.log(f"[viewer] Loaded final image: {final_path}")
@@ -6210,12 +6357,17 @@ class ProjectWidget(QtWidgets.QWidget):
 
         self.lst_panels.clear()
         mosaic_on = self.chk_mosaic_enabled.isChecked()
+        has_session = sess is not None
+        self.lst_panels.setEnabled(mosaic_on and has_session)
+        self.btn_add_panel.setEnabled(mosaic_on and has_session)
+        self.btn_remove_panel.setEnabled(False)
 
         if not sess:
             # No session selected
-            # - Session frame lists obey Mosaic: disabled when Mosaic is ON
-            self.session_editor.set_frame_groups_enabled(not mosaic_on)
+            # - Session frame lists are disabled because there is no backing model object
+            self.session_editor.set_frame_groups_enabled(False)
             # - Panel frame lists disabled, no copy button
+            self.panel_editor.set_metadata_enabled(False)
             self.panel_editor.set_frame_groups_enabled(False)
             self.panel_editor.set_copy_source_panel(None, enabled=False)
             return
@@ -6253,7 +6405,9 @@ class ProjectWidget(QtWidgets.QWidget):
         # Panel tab frame lists:
         #   enabled only when Mosaic is ON AND there is at least one panel.
         #   Otherwise greyed out.
+        self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
         self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
+        self.btn_remove_panel.setEnabled(mosaic_on and has_session and len(sess.panels) > 1)
 
     def load_selected_panel(self, row: int):
         s = self._current_session()
@@ -6447,7 +6601,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "• Drizzle: Scaling, Pixel Fraction, Kernel\n"
             "• 2-pass registration toggle\n"
             "• Global stacking options (sigma or winsorized rejection (sigma high and low), mean)\n"
-            "• Ha/OIII and SII/OIII narrowband extraction with SHO/HOO output\n"
+            "• Ha/OIII and SII/OIII narrowband extraction with SHO/HSO/HOO output\n"
             "• 32-bit output for final stack and intermediate file compression toggles\n"
             "• Siril console logging via sirilpy\n"
             "• Abort Run button (graceful stop)\n"

@@ -25,7 +25,7 @@ The project model stores:
 - Pack-sequence mode and auto-pack threshold.
 - Sessions.
 - Mosaic settings.
-- Narrowband extraction settings in the v3.0 branch: enabled flag, mono-output preference, output palette, fixed `ha` resampling, fixed merged-OIII policy, and disabled NB drizzle policy.
+- Narrowband extraction settings in the v3.0 branch: enabled flag, mono-output preference, channel-normalization preference, output palette, fixed `ha` resampling, fixed merged-OIII policy, and disabled NB drizzle policy.
 - Whether uncalibrated runs are allowed.
 
 ## Session and panel models
@@ -120,17 +120,19 @@ When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-ext
 - Prefer filter-group master overrides over shared session/panel overrides, raw filter-group calibration frames, and Master Library variables.
 - Disable drizzle for the narrowband path while preserving the user's drizzle settings for normal OSC processing.
 - Register and stack mono Ha, SII, and OIII channels.
-- Compose using the selected palette: `SHO with HOO fallback`, forced `SHO`, or forced `HOO`.
-- Save the final composed image through the existing `mirrorx -bottomup` final-output step.
+- Normalize the aligned mono channels before RGB composition by default so SHO/HSO/HOO output starts with less severe channel imbalance; this can be disabled from the narrowband tab.
+- Compose using the selected palette: `SHO with HOO fallback`, forced `SHO`, forced `HSO`, or forced `HOO`.
+- Save the final composed image through the existing `mirrorx -bottomup` final-output step as `<project_slug>_<palette>_final.fit`, for example `<project_slug>_SHO_final.fit`.
+- Store aggregate narrowband sequence scratch files under the first session's `nb_sequences` folder instead of the project root.
 
 For mosaic narrowband projects, extraction happens before panel stacking. The script builds per-channel panel stacks, stitches Ha/SII/OIII channel mosaics independently, then composes the final narrowband RGB image.
 
 The `OSC` tab has two roles:
 
 - When narrowband extraction is disabled, it is the normal OSC workflow, including one traditional dual-band or broadband OSC dataset processed without Ha/SII/OIII channel extraction.
-- When narrowband extraction is enabled, it can optionally be treated as broadband/no-filter/UV-IR-cut RGB data. This option is off by default; when enabled and OSC lights are present, v3.0 writes `<project_slug>_broadband_rgb.fit` in addition to the plain narrowband `<project_slug>_final.fit`.
+- When narrowband extraction is enabled, it can optionally be treated as broadband/no-filter/UV-IR-cut RGB data. This option is off by default; when enabled and OSC lights are present, v3.0 writes `<project_slug>_broadband_rgb.fit` in addition to the palette-named narrowband `<project_slug>_<palette>_final.fit`.
 
-If `Create LRGB output from OSC luminance` is selected, the generated script aligns the broadband stack to the composed SHO/HOO image, splits the aligned broadband RGB image in Lab mode, uses the Lab L image as luminance, and writes an additional `<project_slug>_SHO_LRGB.fit` or `<project_slug>_HOO_LRGB.fit`. This does not replace the plain narrowband final.
+If `Create LRGB output from OSC luminance` is selected, the generated script aligns the broadband stack to the composed SHO/HSO/HOO image, splits the aligned broadband RGB image in Lab mode, uses the Lab L image as luminance, and writes an additional `<project_slug>_<palette>_LRGB.fit`. This does not replace the plain narrowband final.
 
 The `Save Ha, SII, and OIII mono stacks` option controls whether named mono channel outputs such as `NB_Ha_mono.fit` are kept as user-facing products. Internal channel stack files are still created when the option is off because RGB composition needs aligned channel images.
 

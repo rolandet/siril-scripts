@@ -24,7 +24,7 @@ Before adding or changing generated Siril commands, verify the command exists in
 - Stacking: `stack`, `rej`, `rej sigma`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
 - Sequence and image operations: `merge`, `load`, `save`, `mirrorx -bottomup`, `resample`, `split ... -lab`.
 - Background and mosaic WCS commands: `seqsubsky pp_light 1`, `parse $RA:ra$_$DEC:dec$`, `platesolve -force -disto=platesolve_data.wcs`, `seqplatesolve mosaic -force -nocache`.
-- v3.0 narrowband operations: `seqextract_HaOIII pp_light -resample=ha`, `setref <sequence> <image_number>`, `rgbcomp red green blue -out=<name>`, and `rgbcomp -lum=image rgb_image -out=<name>`.
+- v3.0 narrowband operations: `seqextract_HaOIII pp_light -resample=ha`, `setref <sequence> <image_number>`, `pm "expression"`, `rgbcomp red green blue -out=<name>`, and `rgbcomp -lum=image rgb_image -out=<name>`.
 
 ## Known historical errors
 
@@ -63,6 +63,7 @@ Resolution: do not rely on guessed command parameters. Validate against Siril 1.
 - Siril's `seqextract_HaOIII` creates `Ha_` and `OIII_` output sequences. The v3.0 SII/OIII workflow uses the same command and treats the red-channel `Ha_` output as SII.
 - v3.0 narrowband calibration can use filter-specific master overrides and raw bias, dark, flat, and dark-flat frames from the Ha/OIII or SII/OIII tabs; shared session/panel master overrides and Master Library variables remain fallbacks.
 - `setref` takes the sequence name and a one-based image number, not a filename.
+- v3.0 normalizes final aligned NB channel levels before RGB composition by default with Siril Pixel Math using the median/MAD normalization form documented in Siril's RGB composition guidance. This emits `pm "..."` commands against the aligned `r_nb_comp_...` files, then saves `nb_comp_norm_...` files for `rgbcomp`.
 - Siril 1.4.3 documents `rgbcomp -lum=image { rgb_image | red green blue } [-out=result_filename]`; v3.0 uses this form for optional OSC-broadband luminance composition.
 - Siril 1.4.3 documents `split file1 file2 file3 [-hsl | -hsv | -lab]`; v3.0 uses `split ... -lab` to derive a luminance image from the aligned broadband RGB stack for LRGB output.
 - Flat calibration does not use CFA/equalize flags.
