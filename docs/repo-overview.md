@@ -2,15 +2,15 @@
 
 This repository contains Siril scripts and helper tooling for OSC astrophotography preprocessing and stacking, with emphasis on multi-night workflows on Windows.
 
-## Current main script
+## Current active development script
 
-The current main application script is:
+The current active development application script is:
 
 ```text
-osc-multi-night-stacking-v2.1.py
+osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py
 ```
 
-Older or adjacent script files may exist in the repository for history or comparison. Do not assume they are the active target unless the user explicitly says so.
+`osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
 ## README ownership
 
@@ -56,7 +56,7 @@ docs/testing-checklist.md
 docs/known-issues.md
 ```
 
-Then inspect `osc-multi-night-stacking-v2.1.py`.
+Then inspect `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`.
 
 ## Important cautions
 

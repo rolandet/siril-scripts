@@ -8,11 +8,13 @@ The user works primarily on Windows and commonly processes data from NINA-style 
 
 ## Script naming
 
-The current main script for active review is:
+The current active development script is:
 
 ```text
-osc-multi-night-stacking-v2.1.py
+osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py
 ```
+
+`osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. They should be left unchanged unless the user explicitly asks to modify a locked version.
 
 Older historical filenames may include:
 

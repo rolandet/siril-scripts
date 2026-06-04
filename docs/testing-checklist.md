@@ -12,7 +12,7 @@ Use this checklist before considering code changes complete. For documentation-o
 
 ## Python checks for code changes
 
-- [ ] Run Python syntax checks, for example `python -m py_compile osc-multi-night-stacking-v2.1.py`.
+- [ ] Run Python syntax checks, for example `python -m py_compile osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`.
 - [ ] Run available unit tests, if any.
 - [ ] Confirm no hard-coded local-only paths were introduced.
 - [ ] Confirm Windows path handling still works.

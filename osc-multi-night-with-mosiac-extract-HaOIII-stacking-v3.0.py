@@ -4679,7 +4679,7 @@ class ProjectWidget(QtWidgets.QWidget):
         if s is not None:
             mosaic_on = self.chk_mosaic_enabled.isChecked()
             has_panels = bool(s.panels)
-            self.btn_remove_panel.setEnabled(mosaic_on and len(s.panels) > 1)
+            self.btn_remove_panel.setEnabled(mosaic_on and bool(s.panels))
 
             # Panel tab frame lists: enabled when Mosaic is ON and there is at least one panel
             self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
@@ -4722,18 +4722,13 @@ class ProjectWidget(QtWidgets.QWidget):
             return
 
         panels = getattr(s, "panels", []) or []
-        if len(panels) <= 1:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Remove Panel",
-                "A mosaic session must contain at least one panel.\n\n"
-                "Add another panel before removing this one, or turn off Mosaic Mode if you do not need panels.",
-            )
+        if not panels:
             self._refresh_panels_ui_for_session(s)
             return
-
         row = self.lst_panels.currentRow()
-        if not (0 <= row < len(panels)):
+        if row < 0:
+            row = 0
+        if row >= len(panels):
             return
 
         # Remove from UI and model
@@ -4760,7 +4755,7 @@ class ProjectWidget(QtWidgets.QWidget):
         # Panel frame lists: enabled only when Mosaic is ON and there is at least one panel
         self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
         self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
-        self.btn_remove_panel.setEnabled(mosaic_on and bool(s and len(s.panels) > 1))
+        self.btn_remove_panel.setEnabled(mosaic_on and bool(s and s.panels))
 
         # Update the "Copy Calibration Frames" button state
         if has_panels:
@@ -5322,6 +5317,101 @@ class ProjectWidget(QtWidgets.QWidget):
         if f:
             self.ed_siril.setText(f)
 
+    def _renumber_sessions_after_removal(self, deleted_session_name: str):
+        """
+        Keep remaining sessions named Session 1..N after a deletion.
+
+        When a session used the default working folder (no custom Working Subdir),
+        rename that folder too so prepared data stays attached to the renumbered
+        session. If a folder cannot be moved safely, preserve the old folder name
+        as Working Subdir for that session.
+        """
+        p = self.project
+        name_map: dict[str, str] = {}
+        moves: list[tuple[Session, str, Path, Path]] = []
+        work = Path(p.working_dir).resolve() if getattr(p, "working_dir", None) else None
+
+        def within_work(path: Path) -> bool:
+            if work is None:
+                return False
+            try:
+                path.resolve().relative_to(work)
+                return True
+            except ValueError:
+                return False
+
+        for idx, sess in enumerate(getattr(p, "sessions", []) or [], start=1):
+            old_name = getattr(sess, "name", "") or f"Session {idx}"
+            new_name = f"Session {idx}"
+            if old_name == new_name:
+                continue
+            name_map[old_name] = new_name
+            if work and not getattr(sess, "work_subdir", None):
+                old_root = (work / old_name).resolve()
+                new_root = (work / new_name).resolve()
+                if old_root != new_root:
+                    moves.append((sess, old_name, old_root, new_root))
+            sess.name = new_name
+
+        if getattr(p, "panels", None):
+            remapped = []
+            for link in p.panels:
+                if not isinstance(link, dict):
+                    remapped.append(link)
+                    continue
+                sess_name = link.get("session")
+                if sess_name == deleted_session_name:
+                    continue
+                if sess_name in name_map:
+                    link = dict(link)
+                    link["session"] = name_map[sess_name]
+                remapped.append(link)
+            p.panels = remapped
+
+        ref = getattr(p, "mosaic_global_reference", None)
+        if ref:
+            sess_name, sep, item = ref.partition("/")
+            if sep:
+                sess_name = sess_name.strip()
+                item = item.strip()
+                if sess_name == deleted_session_name:
+                    p.mosaic_global_reference = None
+                elif sess_name in name_map:
+                    p.mosaic_global_reference = f"{name_map[sess_name]} / {item}"
+
+        warnings = []
+        for sess, old_name, old_root, new_root in moves:
+            if not old_root.exists():
+                continue
+            try:
+                if not within_work(old_root) or not within_work(new_root):
+                    sess.work_subdir = old_name
+                    warnings.append(f"{old_root} -> {new_root}: outside working directory")
+                    continue
+                if new_root.exists():
+                    sess.work_subdir = old_name
+                    warnings.append(f"{old_root} -> {new_root}: target already exists")
+                    continue
+                old_root.rename(new_root)
+            except Exception as e:
+                sess.work_subdir = old_name
+                warnings.append(f"{old_root} -> {new_root}: {e}")
+
+        for idx, sess in enumerate(getattr(p, "sessions", []) or []):
+            item = self.sessions_list.item(idx)
+            if item:
+                item.setText(sess.name)
+
+        if warnings:
+            shown = "\n".join(warnings[:8])
+            more = "" if len(warnings) <= 8 else f"\n...and {len(warnings) - 8} more"
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Renumber Sessions",
+                "Some session folders could not be renamed. Their old folder names were kept as Working Subdir.\n\n"
+                f"{shown}{more}",
+            )
+
     # ---------------- sessions ----------------
     def add_session(self):
         new_sess = Session(name=f"Session {len(self.project.sessions)+1}")
@@ -5395,16 +5485,10 @@ class ProjectWidget(QtWidgets.QWidget):
                     f"Failed to delete:\n{sess_root}\n\n{e}",
                 )
 
-        # Drop any project-level mosaic panel links that point at this session
-        if getattr(self.project, "panels", None):
-            self.project.panels = [
-                d for d in self.project.panels
-                if d.get("session") != sess.name
-            ]
-
         # Remove the session from the model + list widget
         self.project.sessions.pop(row)
         self.sessions_list.takeItem(row)
+        self._renumber_sessions_after_removal(sess.name)
 
         if self.project.sessions:
             # Select the first remaining session and refresh its editors
@@ -6407,7 +6491,7 @@ class ProjectWidget(QtWidgets.QWidget):
         #   Otherwise greyed out.
         self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
         self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
-        self.btn_remove_panel.setEnabled(mosaic_on and has_session and len(sess.panels) > 1)
+        self.btn_remove_panel.setEnabled(mosaic_on and has_session and has_panels)
 
     def load_selected_panel(self, row: int):
         s = self._current_session()

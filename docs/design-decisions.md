@@ -6,7 +6,9 @@
 
 ## Current active script
 
-The current main script for active work is `osc-multi-night-stacking-v2.1.py`. Do not rename files or switch to another script unless the user explicitly asks.
+The current active development script is `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`. Do not rename files or switch to another script unless the user explicitly asks.
+
+`osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
 ## Single-file application
 

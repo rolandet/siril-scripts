@@ -14,7 +14,7 @@ Before adding or changing generated Siril commands, verify the command exists in
 
 ## Current generated command families
 
-`osc-multi-night-stacking-v2.1.py` currently emits or may emit these important commands:
+`osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` currently emits or may emit these important commands:
 
 - Script setup: `requires 1.4.0`, `cd`, `setfindstar reset`, `setfindstar`, `setcompress`, `setext fit`.
 - Conversion: `convert <sequence> -out=...`, optionally with `-fitseq` or `-ser` in non-mosaic mode.

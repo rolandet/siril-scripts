@@ -1,12 +1,12 @@
-# Current Features - osc-multi-night-stacking-v2.1.py
+# Current Features - osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py
 
-Source reviewed: `osc-multi-night-stacking-v2.1.py`
+Source reviewed: `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`
+
+`osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
 ## Summary
 
-`osc-multi-night-stacking-v2.1.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, and experimental mosaic processing.
-
-The v3.0 branch file `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` extends the same single-file application with optional Ha/OIII and SII/OIII narrowband extraction. When enabled, it generates the narrowband final instead of the normal OSC RGB final.
+`osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, experimental mosaic processing, and optional Ha/OIII and SII/OIII narrowband extraction. When narrowband extraction is enabled, it generates the narrowband final instead of the normal OSC RGB final.
 
 ## Core project model
 
