@@ -925,13 +925,12 @@ class SirilCommandBuilder:
 
     def _stack_cmd(self, seq_name: str, *, norm="addscale", out="stacked",
                 rgb_equal=False, output_norm=True, nonorm=False, use_32b=False) -> str:
-        ui  = (self.project.stack_method or "rej").lower()
         lo  = float(self.project.reject_sigma_low or 3.0)
         hi  = float(self.project.reject_sigma_high or 3.0)
 
         # Reuse the same mapping used everywhere else
         parts, _ = map_stack_method(
-            {"rej":"Rejection","wrej":"Winsorized Rejection","mean":"Mean","median":"Median"}.get(ui, "Rejection"),
+            self.project.stack_method or "Winsorized Rejection",
             lo, hi
         )
 
@@ -1608,7 +1607,11 @@ class SirilCommandBuilder:
         L.append("register nb_comp -layer=0 -2pass")
         L.append("seqapplyreg nb_comp")
         comp_inputs = self._nb_compose_inputs(L, ref_index=ref_index)
-        L.append(f"rgbcomp {comp_inputs[0]} {comp_inputs[1]} {comp_inputs[2]} -out={out_name}")
+        rgbcomp_options = f"-out={out_name}"
+        if len(set(ordered)) < len(ordered):
+            # HOO reuses OIII for both G and B; avoid double-counting FITS exposure metadata.
+            rgbcomp_options += " -nosum"
+        L.append(f"rgbcomp {comp_inputs[0]} {comp_inputs[1]} {comp_inputs[2]} {rgbcomp_options}")
         L.append(f"load {out_name}.fit")
         L.append("mirrorx -bottomup")
         final_abs = (work / f"{safe_slug(self.project.name)}_{palette_label}_final.fit").as_posix()
@@ -5450,15 +5453,6 @@ class ProjectWidget(QtWidgets.QWidget):
         if row < 0:
             return
 
-        if len(self.project.sessions) <= 1:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Remove Session",
-                "A project must contain at least one session.\n\n"
-                "Clear this session's frame lists or rename it instead.",
-            )
-            return
-
         sess = self.project.sessions[row]
         work = self.project.working_dir
         sess_root = Path(work) / (sess.work_subdir or sess.name) if work else None
@@ -5503,14 +5497,26 @@ class ProjectWidget(QtWidgets.QWidget):
             # Refresh panels list / editor for the new current session
             self._refresh_panels_ui_for_session(self._current_session())
         else:
-            # No sessions left: clear panels UI and reset the session editor fields
-            self._refresh_panels_ui_for_session(None)
+            # Projects need one editable session, but let the normal delete/data
+            # cleanup finish first so Session 1 behaves like every other session.
+            new_sess = Session(name="Session 1")
+            self.project.sessions.append(new_sess)
+            self.sessions_list.addItem(new_sess.name)
+            self.sessions_list.setCurrentRow(0)
+
             self._loading_session = True
             try:
-                # from_session(None) will clear all frame lists and overrides
-                self.session_editor.from_session(None)  # type: ignore[arg-type]
+                self.session_editor.from_session(new_sess)
             finally:
                 self._loading_session = False
+
+            self._refresh_panels_ui_for_session(new_sess)
+            QtWidgets.QMessageBox.information(
+                self,
+                "Session Recreated",
+                "A project must contain at least one session.\n\n"
+                "An empty Session 1 has been recreated.",
+            )
 
         self.mark_dirty()
         self._refresh_global_ref_choices(self.project.mosaic_global_reference)

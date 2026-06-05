@@ -31,11 +31,13 @@ All notable user-facing changes to this project should be documented here.
 - Defaulted v3.0 narrowband RGB composition to normalize aligned Ha/SII/OIII channel levels before `rgbcomp`, with a checkbox to disable normalization when raw channel ratios are desired.
 - Narrowband final FITS filenames now include the resolved palette label, such as `<project>_SHO_final.fit`, `<project>_HOO_final.fit`, or `<project>_HSO_final.fit`.
 - In v3.0, removing a session now renumbers remaining sessions to `Session 1..N`, remaps mosaic session references, and renames default session working folders when possible.
+- In v3.0, removing the final remaining session now runs the normal deletion flow, then recreates an empty `Session 1` with a clear dialog.
 - v3.0 mosaic sessions can again remove the final panel, leaving the session with no panels until a new one is added.
 
 ### Fixed
 
-- Prevented deleting the final session in v3.0 projects, so frame-list edits always have a real session to update.
+- Fixed v3.0 narrowband helper stacking so the `Sigma Rejection` UI selection emits Siril sigma rejection commands instead of falling back to winsorized rejection.
+- Fixed v3.0 HOO narrowband composition metadata by adding `rgbcomp -nosum` when OIII is reused for both green and blue, avoiding double-counted FITS exposure/stack keywords.
 - Moved v3.0 narrowband aggregate sequence scratch files into `Session 1/nb_sequences` instead of writing them into the project root.
 
 ### Notes

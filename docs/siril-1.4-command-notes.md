@@ -64,6 +64,7 @@ Resolution: do not rely on guessed command parameters. Validate against Siril 1.
 - v3.0 narrowband calibration can use filter-specific master overrides and raw bias, dark, flat, and dark-flat frames from the Ha/OIII or SII/OIII tabs; shared session/panel master overrides and Master Library variables remain fallbacks.
 - `setref` takes the sequence name and a one-based image number, not a filename.
 - v3.0 normalizes final aligned NB channel levels before RGB composition by default with Siril Pixel Math using the median/MAD normalization form documented in Siril's RGB composition guidance. This emits `pm "..."` commands against the aligned `r_nb_comp_...` files, then saves `nb_comp_norm_...` files for `rgbcomp`.
+- v3.0 HOO composition reuses OIII as both green and blue, so the generated `rgbcomp` command includes `-nosum` to avoid double-counting OIII in FITS exposure and stack-count metadata.
 - Siril 1.4.3 documents `rgbcomp -lum=image { rgb_image | red green blue } [-out=result_filename]`; v3.0 uses this form for optional OSC-broadband luminance composition.
 - Siril 1.4.3 documents `split file1 file2 file3 [-hsl | -hsv | -lab]`; v3.0 uses `split ... -lab` to derive a luminance image from the aligned broadband RGB stack for LRGB output.
 - Flat calibration does not use CFA/equalize flags.
