@@ -25,7 +25,7 @@ The project model stores:
 - Pack-sequence mode and auto-pack threshold.
 - Sessions.
 - Mosaic settings.
-- Narrowband extraction settings in the v3.0 branch: enabled flag, mono-output preference, channel-normalization preference, output palette, fixed `ha` resampling, fixed merged-OIII policy, and disabled NB drizzle policy.
+- Narrowband extraction settings in the v3.0 branch: enabled flag, mono-output preference, NB channel-balancing mode, output palette, fixed `ha` resampling, fixed merged-OIII policy, and disabled NB drizzle policy.
 - Whether uncalibrated runs are allowed.
 
 ## Session and panel models
@@ -120,7 +120,7 @@ When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-ext
 - Prefer filter-group master overrides over shared session/panel overrides, raw filter-group calibration frames, and Master Library variables.
 - Disable drizzle for the narrowband path while preserving the user's drizzle settings for normal OSC processing.
 - Register and stack mono Ha, SII, and OIII channels.
-- Normalize the aligned mono channels before RGB composition by default so SHO/HSO/HOO output starts with less severe channel imbalance; this can be disabled from the narrowband tab.
+- Balance the aligned mono channels before RGB composition with the `NB Channel Balancing` mode. The default `Median/MAD Match` aligns channel medians and MAD contrast, `Background Match Only` aligns channel medians while preserving channel contrast, and `None` preserves raw aligned channel levels.
 - Compose using the selected palette: `SHO with HOO fallback`, forced `SHO`, forced `HSO`, or forced `HOO`.
 - Save the final composed image through the existing `mirrorx -bottomup` final-output step as `<project_slug>_<palette>_final.fit`, for example `<project_slug>_SHO_final.fit`.
 - Store aggregate narrowband sequence scratch files under the first session's `nb_sequences` folder instead of the project root.

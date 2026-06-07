@@ -271,6 +271,21 @@ NB_PALETTE_OPTIONS = [
     ("HSO", "HSO"),
     ("HOO", "HOO"),
 ]
+NB_CHANNEL_BALANCE_OPTIONS = [
+    ("Median/MAD Match", "MEDIAN_MAD"),
+    ("Background Match Only", "BACKGROUND"),
+    ("None", "NONE"),
+]
+
+
+def normalize_nb_channel_balance_mode(value, legacy_normalize=True) -> str:
+    token = str(value or "").upper()
+    valid_tokens = {mode_token for _label, mode_token in NB_CHANNEL_BALANCE_OPTIONS}
+    if token in valid_tokens:
+        return token
+    return "MEDIAN_MAD" if bool(legacy_normalize) else "NONE"
+
+
 FRAME_TAB_TOOLTIPS = {
     "osc": (
         "Use for normal OSC broadband data, no-filter data, UV/IR-cut data, or a "
@@ -487,6 +502,7 @@ class Project:
     nb_extraction_enabled: bool = False
     nb_save_mono_outputs: bool = True
     nb_output_palette: str = "SHO_WITH_HOO_FALLBACK"
+    nb_channel_balance_mode: str = "MEDIAN_MAD"
     nb_normalize_channels: bool = True
     nb_resample_mode: str = "ha"
     nb_oiii_merge_policy: str = "merge_all"
@@ -497,6 +513,10 @@ class Project:
     allow_uncalibrated: bool = False  # NEW: allow building/running with no cals (warn)
 
     def to_dict(self) -> Dict:
+        nb_channel_balance_mode = normalize_nb_channel_balance_mode(
+            getattr(self, "nb_channel_balance_mode", None),
+            getattr(self, "nb_normalize_channels", True),
+        )
         return {
             "name": self.name,
             "project_file": self.project_file,
@@ -548,7 +568,8 @@ class Project:
             "nb_extraction_enabled": bool(self.nb_extraction_enabled),
             "nb_save_mono_outputs": bool(self.nb_save_mono_outputs),
             "nb_output_palette": self.nb_output_palette,
-            "nb_normalize_channels": bool(self.nb_normalize_channels),
+            "nb_channel_balance_mode": nb_channel_balance_mode,
+            "nb_normalize_channels": nb_channel_balance_mode != "NONE",
             "nb_resample_mode": self.nb_resample_mode,
             "nb_oiii_merge_policy": self.nb_oiii_merge_policy,
             "nb_drizzle_policy": self.nb_drizzle_policy,
@@ -618,7 +639,11 @@ class Project:
         p.nb_extraction_enabled = bool(d.get("nb_extraction_enabled", False))
         p.nb_save_mono_outputs = bool(d.get("nb_save_mono_outputs", True))
         p.nb_output_palette = d.get("nb_output_palette", "SHO_WITH_HOO_FALLBACK")
-        p.nb_normalize_channels = bool(d.get("nb_normalize_channels", True))
+        p.nb_channel_balance_mode = normalize_nb_channel_balance_mode(
+            d.get("nb_channel_balance_mode"),
+            d.get("nb_normalize_channels", True),
+        )
+        p.nb_normalize_channels = p.nb_channel_balance_mode != "NONE"
         p.nb_resample_mode = d.get("nb_resample_mode", "ha")
         p.nb_oiii_merge_policy = d.get("nb_oiii_merge_policy", "merge_all")
         p.nb_drizzle_policy = d.get("nb_drizzle_policy", "disabled")
@@ -1544,27 +1569,38 @@ class SirilCommandBuilder:
 
     def _nb_compose_inputs(self, L: list[str], *, ref_index: int) -> list[str]:
         inputs = [f"r_nb_comp_{i:05d}" for i in range(1, 4)]
-        if not bool(getattr(self.project, "nb_normalize_channels", True)):
+        balance_mode = normalize_nb_channel_balance_mode(
+            getattr(self.project, "nb_channel_balance_mode", None),
+            getattr(self.project, "nb_normalize_channels", True),
+        )
+        if balance_mode == "NONE":
             return inputs
 
         ref_name = inputs[ref_index - 1]
-        normed: list[str] = []
-        L.append("# Normalize final NB channel levels before RGB composition.")
-        L.append(f"# NB normalization reference: {ref_name}.fit")
+        balanced: list[str] = []
+        if balance_mode == "BACKGROUND":
+            L.append("# Background-match final NB channel levels before RGB composition.")
+        else:
+            L.append("# Median/MAD-match final NB channel levels before RGB composition.")
+        L.append(f"# NB channel balance reference: {ref_name}.fit")
         for i, name in enumerate(inputs, start=1):
             if i == ref_index:
-                normed.append(name)
+                balanced.append(name)
                 continue
-            out_name = f"nb_comp_norm_{i:05d}"
-            expr = (
-                f"${name}$*mad(${ref_name}$)/mad(${name}$)"
-                f"-mad(${ref_name}$)/mad(${name}$)*median(${name}$)"
-                f"+median(${ref_name}$)"
-            )
+            if balance_mode == "BACKGROUND":
+                out_name = f"nb_comp_bg_{i:05d}"
+                expr = f"${name}$-median(${name}$)+median(${ref_name}$)"
+            else:
+                out_name = f"nb_comp_norm_{i:05d}"
+                expr = (
+                    f"${name}$*mad(${ref_name}$)/mad(${name}$)"
+                    f"-mad(${ref_name}$)/mad(${name}$)*median(${name}$)"
+                    f"+median(${ref_name}$)"
+                )
             L.append(f'pm "{expr}"')
             L.append(f'save "{out_name}.fit"')
-            normed.append(out_name)
-        return normed
+            balanced.append(out_name)
+        return balanced
 
     def _nb_compose_final(self, L: list[str], *, work: Path, channel_files: dict[str, str], set_comp, sequence_work: Optional[Path] = None) -> tuple[str, str]:
         if "Ha" not in channel_files or "OIII" not in channel_files:
@@ -3839,11 +3875,11 @@ class ProjectWidget(QtWidgets.QWidget):
             "NB_Ha_mono.fit, NB_SII_mono.fit when available, and NB_OIII_mono.fit.\n"
             "When disabled, internal channel stacks are still created because RGB composition needs them."
         )
-        self.chk_nb_normalize_channels = QtWidgets.QCheckBox("Normalize NB channels before composition")
-        self.chk_nb_normalize_channels.setChecked(True)
-        self.chk_nb_normalize_channels.setToolTip(
-            "When enabled, matched SII/Ha/OIII channel levels are normalized before RGB composition.\n"
-            "This helps SHO/HSO/HOO auto-stretches avoid strong color casts from unequal channel backgrounds."
+        self.cmb_nb_channel_balance = QtWidgets.QComboBox()
+        self.cmb_nb_channel_balance.addItems([label for label, _token in NB_CHANNEL_BALANCE_OPTIONS])
+        self.cmb_nb_channel_balance.setToolTip(
+            "Controls how aligned SII/Ha/OIII channel levels are balanced before RGB composition.\n"
+            "Median/MAD Match aligns background and contrast. Background Match Only aligns medians while preserving channel contrast. None preserves raw channel levels."
         )
         self.chk_nb_use_osc_broadband = QtWidgets.QCheckBox("Use OSC tab as broadband RGB / luminance source")
         self.chk_nb_use_osc_broadband.setChecked(False)
@@ -4128,8 +4164,8 @@ class ProjectWidget(QtWidgets.QWidget):
         nb_form = QtWidgets.QFormLayout(nb_box)
         nb_form.addRow("", self.chk_nb_enabled)
         nb_form.addRow("Output", self.cmb_nb_palette)
+        nb_form.addRow("NB Channel Balancing", self.cmb_nb_channel_balance)
         nb_form.addRow("", self.chk_nb_save_mono)
-        nb_form.addRow("", self.chk_nb_normalize_channels)
         nb_form.addRow("", self.chk_nb_use_osc_broadband)
         nb_form.addRow("", self.chk_nb_luminance_combine)
         nb_form.addRow("", self.lbl_nb_fixed)
@@ -4286,11 +4322,11 @@ class ProjectWidget(QtWidgets.QWidget):
         self.chk_nb_enabled.toggled.connect(self._on_nb_toggled)
         self.chk_nb_enabled.toggled.connect(self.mark_dirty)
         self.cmb_nb_palette.currentIndexChanged.connect(self.mark_dirty)
+        self.cmb_nb_channel_balance.currentIndexChanged.connect(self.mark_dirty)
         self.chk_nb_use_osc_broadband.toggled.connect(self._on_nb_broadband_toggled)
         self.chk_nb_use_osc_broadband.toggled.connect(self.mark_dirty)
         self.chk_nb_luminance_combine.toggled.connect(self.mark_dirty)
         self.chk_nb_save_mono.toggled.connect(self.mark_dirty)
-        self.chk_nb_normalize_channels.toggled.connect(self.mark_dirty)
 
         self.btn_add_sess.clicked.connect(self.add_session)
         self.btn_remove_sess.clicked.connect(self.remove_session)
@@ -4502,7 +4538,7 @@ class ProjectWidget(QtWidgets.QWidget):
 
     def _on_nb_toggled(self, enabled: bool):
         self.chk_nb_save_mono.setEnabled(enabled)
-        self.chk_nb_normalize_channels.setEnabled(enabled)
+        self.cmb_nb_channel_balance.setEnabled(enabled)
         self.cmb_nb_palette.setEnabled(enabled)
         self.chk_nb_use_osc_broadband.setEnabled(enabled)
         self.lbl_nb_fixed.setEnabled(enabled)
@@ -5121,7 +5157,14 @@ class ProjectWidget(QtWidgets.QWidget):
             self.cb_force_cli.setChecked(bool(getattr(p, "force_cli", False)))
             self.chk_nb_enabled.setChecked(bool(getattr(p, "nb_extraction_enabled", False)))
             self.chk_nb_save_mono.setChecked(bool(getattr(p, "nb_save_mono_outputs", True)))
-            self.chk_nb_normalize_channels.setChecked(bool(getattr(p, "nb_normalize_channels", True)))
+            balance_mode = normalize_nb_channel_balance_mode(
+                getattr(p, "nb_channel_balance_mode", None),
+                getattr(p, "nb_normalize_channels", True),
+            )
+            balance_tokens = [token for _label, token in NB_CHANNEL_BALANCE_OPTIONS]
+            self.cmb_nb_channel_balance.setCurrentIndex(
+                balance_tokens.index(balance_mode) if balance_mode in balance_tokens else 0
+            )
             palette = str(getattr(p, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK")
             palette_tokens = [token for _label, token in NB_PALETTE_OPTIONS]
             self.cmb_nb_palette.setCurrentIndex(palette_tokens.index(palette) if palette in palette_tokens else 0)
@@ -5238,7 +5281,12 @@ class ProjectWidget(QtWidgets.QWidget):
         p.force_cli      = self.cb_force_cli.isChecked()
         p.nb_extraction_enabled = self.chk_nb_enabled.isChecked()
         p.nb_save_mono_outputs = self.chk_nb_save_mono.isChecked()
-        p.nb_normalize_channels = self.chk_nb_normalize_channels.isChecked()
+        balance_index = self.cmb_nb_channel_balance.currentIndex()
+        if 0 <= balance_index < len(NB_CHANNEL_BALANCE_OPTIONS):
+            p.nb_channel_balance_mode = NB_CHANNEL_BALANCE_OPTIONS[balance_index][1]
+        else:
+            p.nb_channel_balance_mode = "MEDIAN_MAD"
+        p.nb_normalize_channels = p.nb_channel_balance_mode != "NONE"
         palette_index = self.cmb_nb_palette.currentIndex()
         if 0 <= palette_index < len(NB_PALETTE_OPTIONS):
             p.nb_output_palette = NB_PALETTE_OPTIONS[palette_index][1]
