@@ -39,6 +39,7 @@ All notable user-facing changes to this project should be documented here.
 
 - Fixed v3.0 narrowband helper stacking so the `Sigma Rejection` UI selection emits Siril sigma rejection commands instead of falling back to winsorized rejection.
 - Fixed v3.0 HOO narrowband composition metadata by adding `rgbcomp -nosum` when OIII is reused for both green and blue, avoiding double-counted FITS exposure/stack keywords.
+- Fixed v3.0 NB Channel Balancing Pixel Math intermediates so `Median/MAD Match` and `Background Match Only` save their temporary balanced channel files as 32-bit FITS instead of allowing Siril to quantize them to 16-bit.
 - Moved v3.0 narrowband aggregate sequence scratch files into `Session 1/nb_sequences` instead of writing them into the project root.
 
 ### Notes

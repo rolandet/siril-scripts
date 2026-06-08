@@ -1583,6 +1583,7 @@ class SirilCommandBuilder:
         else:
             L.append("# Median/MAD-match final NB channel levels before RGB composition.")
         L.append(f"# NB channel balance reference: {ref_name}.fit")
+        L.append("set32bits")
         for i, name in enumerate(inputs, start=1):
             if i == ref_index:
                 balanced.append(name)
