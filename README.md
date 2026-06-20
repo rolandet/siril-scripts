@@ -1,12 +1,29 @@
 # OSC Multi-Night Stacking — Siril 1.4 Python Application Script
 
-**Version 2.0**
+**Version 3.0**
 
 ### Overview
 **OSC Multi-Night Stacking** is a **Python + PyQt6 GUI** Siril application script that automates the creation of Siril 1.4 scripts for multi-night deep-sky stacking projects using Siril-style directory layouts.  
 It provides a Sirilic-like interface using the new Siril Python API that is fully portable, written in Python, and designed for users who capture multiple nights of imaging data and want a one-click way to generate correct Siril processing pipelines.
 
 **Note: Siril 1.4 or later is required **
+
+---
+## Update Release (v3.0)
+- Added Ha/SII and OIII Extraction for OSC dual-band narrowband data.
+- Added `OSC`, `Ha/OIII`, and `SII/OIII` data tabs for each Session and Mosaic Panel.
+- Added mono master outputs for `NB_Ha_mono.fit`, `NB_SII_mono.fit`, and `NB_OIII_mono.fit`.
+- Added narrowband RGB palette output options:
+    * `SHO with HOO fallback`
+    * `SHO`
+    * `HSO`
+    * `HOO`
+- Added `NB Channel Balancing` with `Median/MAD Match`, `Background Match Only`, and `None`.
+- Added optional OSC broadband companion output and optional LRGB composition from OSC luminance.
+- Narrowband extraction disables drizzle in the extraction path, keeps filter groups in separate working folders, and writes aggregate narrowband sequence scratch files under `Session 1/nb_sequences`.
+- HOO composition now uses `rgbcomp -nosum` when OIII is reused for both green and blue so FITS exposure and stack-count metadata are not double-counted.
+- Pixel Math channel-balancing intermediates are saved as 32-bit FITS with `set32bits`.
+
 ---
 ## ✨ Update Release (v2.2)
 - Added the ability to apply background extraction to individual subs using the seqsubsky sequencename command for non-mosaic stacking. The mosaic feature already had this capability.
@@ -166,7 +183,317 @@ ProjectRoot/
 - Click the **Run Siril Script** button in the main window.  
 - The application automatically executes the configured **`run_project.ssf`** Siril script via the Siril Python API or uses the **`siril-cli`** as a backup
 - Progress and script output appear in the console log panel in Siril and in a log file in the *working directory*
-- When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`** and loaded into Siril
+- When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`** and loaded into Siril. In narrowband extraction mode, the final filename includes the selected palette, for example **`[ProjectName]_HOO_final.fit`**, **`[ProjectName]_SHO_final.fit`**, or **`[ProjectName]_HSO_final.fit`**.
+
+---
+
+## Ha/SII and OIII Extraction (v3.0)
+
+The v3.0 script adds a narrowband extraction workflow for OSC cameras used with dual-band filters. It is intended for datasets such as:
+
+- Ha/OIII dual-band data, for example Optolong L-eXtreme style filters.
+- SII/OIII dual-band data.
+- Mixed projects where Ha/OIII and SII/OIII were captured on different nights or during the same night.
+- Optional broadband/no-filter/UV-IR-cut OSC data that should be processed as a companion RGB or luminance source.
+
+This feature is enabled from the **Ha/SII and OIII Extraction** processing tab. When it is enabled, the normal OSC final is skipped unless the optional OSC broadband feature is also selected. The generated final is the selected narrowband palette output.
+
+### Session and Filter Tabs
+
+Each Session and Mosaic Panel has three data-entry tabs:
+
+- **OSC** - Use for normal OSC broadband/no-filter/UV-IR-cut data, or traditional OSC stacking when narrowband extraction is off. In narrowband mode, this tab is optional and is used only when **Use OSC tab as broadband RGB / luminance source** is enabled.
+- **Ha/OIII** - Use for lights captured with a Ha/OIII dual-band filter. The red extraction becomes the Ha channel and the OIII extraction contributes to the merged OIII channel.
+- **SII/OIII** - Use for lights captured with a SII/OIII dual-band filter. Siril's red extraction is still named `Ha_...` by `seqextract_HaOIII`, but the v3.0 workflow treats that red-channel output as SII. The OIII extraction contributes to the merged OIII channel.
+
+You may put multiple filter groups in the same session. This is useful when you captured Ha/OIII and SII/OIII on the same night. The script keeps the filter groups in separate working folders, so the data are not mixed before extraction.
+
+Recommended practice:
+
+- Put each real imaging night in one Session.
+- Put each filter's frames in the matching tab.
+- Use filter-specific flats or master flats whenever possible.
+- Biases, darks, and dark-flats may often be shared, but flats should match the filter and optical path.
+- Use separate sessions when it helps isolate very different acquisition conditions, exposure lengths, framing, or calibration sets.
+
+### Narrowband Options
+
+The **Ha/SII and OIII Extraction** tab includes these key controls:
+
+- **Enable Ha/SII and OIII Extraction** - Generates the narrowband extraction workflow instead of the normal OSC stack.
+- **Output** - Selects the RGB palette:
+    * `SHO with HOO fallback`
+    * `SHO`
+    * `HSO`
+    * `HOO`
+- **NB Channel Balancing** - Controls optional post-stack channel balancing before RGB composition:
+    * `Median/MAD Match` - Default. Matches each non-reference channel's median background and MAD contrast to the reference channel.
+    * `Background Match Only` - Matches only the background median. This preserves more of the original channel contrast.
+    * `None` - Sends the aligned channel masters directly to `rgbcomp`.
+- **Save Ha, SII, and OIII mono stacks** - Saves named mono masters such as `NB_Ha_mono.fit`, `NB_SII_mono.fit`, and `NB_OIII_mono.fit`.
+- **Use OSC tab as broadband RGB / luminance source** - Processes the OSC tab as an additional broadband stack.
+- **Create LRGB output from OSC luminance** - Uses the OSC broadband stack as luminance for an additional narrowband-plus-broadband output.
+
+### Output Palettes
+
+The final RGB mapping depends on the selected palette:
+
+| Palette | Red | Green | Blue | Notes |
+|---------|-----|-------|------|-------|
+| HOO | Ha | OIII | OIII | Uses `rgbcomp -nosum` because OIII is reused for both green and blue. |
+| SHO | SII | Ha | OIII | Classic Hubble-style mapping. |
+| HSO | Ha | SII | OIII | Keeps Ha in red while using SII as the green channel. |
+| SHO with HOO fallback | See notes | See notes | OIII | Uses SHO (`SII`, `Ha`, `OIII`) when SII/OIII data are available; otherwise uses HOO (`Ha`, `OIII`, `OIII`). |
+
+The final file is saved as:
+
+```text
+<project_slug>_<palette>_final.fit
+```
+
+Examples:
+
+```text
+NGC_6888_Crescent_Nebula_HOO_final.fit
+NGC_6888_Crescent_Nebula_SHO_final.fit
+NGC_6888_Crescent_Nebula_HSO_final.fit
+```
+
+### What the Script Does Under the Covers
+
+The generated Siril script follows this high-level narrowband path:
+
+1. Convert and calibrate each filter group separately.
+2. Calibrate narrowband lights as CFA data and do not debayer them before extraction.
+3. Run `seqextract_HaOIII` on each calibrated filter-group light sequence.
+4. Optionally run `seqsubsky` on the extracted Ha/SII and OIII sequences when Background Extraction is enabled.
+5. Register and stack each mono emission channel.
+6. Merge OIII extracted from both Ha/OIII and SII/OIII filter groups.
+7. Align the final Ha, SII, and OIII mono masters to each other.
+8. Apply the selected NB Channel Balancing mode with Siril Pixel Math, when enabled.
+9. Compose the selected RGB palette with `rgbcomp`.
+10. Run `mirrorx -bottomup` and save the final palette-named FITS file.
+
+The main extraction command is:
+
+```text
+seqextract_HaOIII pp_light -resample=ha
+```
+
+For a Ha/OIII filter group:
+
+```text
+Ha_pp_light   -> Ha
+OIII_pp_light -> OIII
+```
+
+For a SII/OIII filter group:
+
+```text
+Ha_pp_light   -> SII
+OIII_pp_light -> OIII
+```
+
+If Background Extraction is enabled, the script runs:
+
+```text
+seqsubsky Ha_pp_light 1
+seqsubsky OIII_pp_light 1
+```
+
+The downstream merge, registration, and stacking steps then use Siril's `bkg_` output sequences, for example:
+
+```text
+bkg_Ha_pp_light
+bkg_OIII_pp_light
+```
+
+### Mono Masters
+
+When **Save Ha, SII, and OIII mono stacks** is enabled, the script saves:
+
+```text
+NB_Ha_mono.fit
+NB_SII_mono.fit
+NB_OIII_mono.fit
+```
+
+These are useful for:
+
+- Inspecting the true Ha, SII, and OIII signal separately.
+- Building custom HOO, SHO, or HSO compositions outside the script.
+- Stretching, denoising, sharpening, or star-removing each channel separately.
+- Creating masks for selective SII or OIII enhancement.
+- Building synthetic luminance from the strongest channels.
+
+### Channel Alignment Before RGB Composition
+
+Before RGB composition, the script loads the final channel masters into a scratch sequence:
+
+```text
+nb_comp_00001.fit
+nb_comp_00002.fit
+nb_comp_00003.fit
+```
+
+It then sets the reference channel and aligns the channels:
+
+```text
+setref nb_comp <reference_index>
+register nb_comp -layer=0 -2pass
+seqapplyreg nb_comp
+```
+
+The reference is Ha:
+
+- HOO: Ha is `nb_comp_00001`, so the reference index is `1`.
+- HSO: Ha is `nb_comp_00001`, so the reference index is `1`.
+- SHO: Ha is `nb_comp_00002`, so the reference index is `2`.
+
+After registration, the aligned images are named:
+
+```text
+r_nb_comp_00001.fit
+r_nb_comp_00002.fit
+r_nb_comp_00003.fit
+```
+
+### NB Channel Balancing and Pixel Math
+
+NB Channel Balancing happens after the final mono masters are aligned and before `rgbcomp`.
+
+This is not the same thing as Siril stacking normalization such as `stack ... -norm=addscale`. The mono channels have already been stacked by this point. NB Channel Balancing is a post-stack Pixel Math step applied to the aligned Ha/SII/OIII channel masters.
+
+Let:
+
+```text
+R = reference channel, usually Ha
+C = channel being balanced
+median(X) = median value of image X
+mad(X) = median absolute deviation of image X
+```
+
+#### Median/MAD Match
+
+`Median/MAD Match` aligns both the background median and the MAD contrast of each non-reference channel to the reference channel.
+
+Mathematically:
+
+```text
+scale = mad(R) / mad(C)
+C' = C * scale - scale * median(C) + median(R)
+```
+
+Equivalent form:
+
+```text
+C' = median(R) + (C - median(C)) * mad(R) / mad(C)
+```
+
+For SHO, where `r_nb_comp_00002` is Ha/reference and `r_nb_comp_00001` is SII, the generated Pixel Math looks like:
+
+```text
+set32bits
+pm "$r_nb_comp_00001$*mad($r_nb_comp_00002$)/mad($r_nb_comp_00001$)-mad($r_nb_comp_00002$)/mad($r_nb_comp_00001$)*median($r_nb_comp_00001$)+median($r_nb_comp_00002$)"
+save "nb_comp_norm_00001.fit"
+```
+
+The same formula is applied to OIII when OIII is not the reference channel:
+
+```text
+pm "$r_nb_comp_00003$*mad($r_nb_comp_00002$)/mad($r_nb_comp_00003$)-mad($r_nb_comp_00002$)/mad($r_nb_comp_00003$)*median($r_nb_comp_00003$)+median($r_nb_comp_00002$)"
+save "nb_comp_norm_00003.fit"
+```
+
+The script emits `set32bits` before these Pixel Math saves so the temporary balanced files remain 32-bit FITS.
+
+#### Background Match Only
+
+`Background Match Only` aligns only the background median. It does not scale the MAD contrast.
+
+Mathematically:
+
+```text
+C' = C - median(C) + median(R)
+```
+
+Example Pixel Math:
+
+```text
+set32bits
+pm "$r_nb_comp_00003$-median($r_nb_comp_00003$)+median($r_nb_comp_00002$)"
+save "nb_comp_bg_00003.fit"
+```
+
+This mode is useful when you want to remove a channel background offset without reducing the relative contrast of OIII or SII.
+
+#### None
+
+`None` skips Pixel Math balancing completely. The aligned channel files are passed directly to `rgbcomp`.
+
+### RGB Composition with rgbcomp
+
+After channel alignment and optional balancing, the script uses `rgbcomp` to build the final RGB image.
+
+Example HOO composition:
+
+```text
+rgbcomp r_nb_comp_00001 nb_comp_bg_00002 nb_comp_bg_00003 -out=hoo_composed -nosum
+```
+
+Example SHO composition:
+
+```text
+rgbcomp nb_comp_norm_00001 r_nb_comp_00002 nb_comp_norm_00003 -out=sho_composed
+```
+
+Example HSO composition:
+
+```text
+rgbcomp r_nb_comp_00001 nb_comp_norm_00002 nb_comp_norm_00003 -out=hso_composed
+```
+
+HOO uses `-nosum` because the same OIII master is intentionally used for both green and blue. Without `-nosum`, FITS exposure and stack-count metadata can double-count the reused OIII channel. The image pixels are the intended HOO mapping either way, but `-nosum` keeps the FITS metadata more accurate.
+
+### Optional OSC Broadband and LRGB Output
+
+When narrowband extraction is enabled, the OSC tab is ignored unless **Use OSC tab as broadband RGB / luminance source** is selected.
+
+When selected, the OSC tab can produce a separate broadband RGB output:
+
+```text
+<project_slug>_broadband_rgb.fit
+```
+
+If **Create LRGB output from OSC luminance** is also selected, the script:
+
+1. Aligns the broadband OSC stack to the narrowband RGB final.
+2. Splits the aligned broadband stack in Lab mode.
+3. Uses the Lab L image as luminance.
+4. Creates an additional output:
+
+```text
+<project_slug>_<palette>_LRGB.fit
+```
+
+This does not replace the plain HOO/SHO/HSO narrowband final.
+
+### Important Notes and Limitations
+
+- Narrowband extraction requires CFA input. The script does not debayer the narrowband lights before `seqextract_HaOIII`.
+- Drizzle is disabled in the narrowband extraction path.
+- SII/OIII extraction relies on Siril's `seqextract_HaOIII` command and treats the red-channel `Ha_...` output as SII.
+- The OIII master is merged from all contributing Ha/OIII and SII/OIII filter groups.
+- Correct filter placement matters. Ha/OIII data should go in the Ha/OIII tab; SII/OIII data should go in the SII/OIII tab.
+- Correct flats matter. Use filter-specific flats or filter-specific master flat overrides when possible.
+- Normal color calibration is usually not required for false-color narrowband palettes. HOO, SHO, and HSO are intentional channel mappings, not natural broadband color.
+
+Relevant Siril documentation:
+
+- Commands reference: <https://siril.readthedocs.io/en/stable/Commands.html>
+- RGB composition tutorial: <https://siril.org/tutorials/rgb_composition/>
+- Pixel Math documentation: <https://siril.readthedocs.io/en/stable/processing/pixelmath.html>
+
 ---
 
 ### 🕒 Typical Workflow Timeline

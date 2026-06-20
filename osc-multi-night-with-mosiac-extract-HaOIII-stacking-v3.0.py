@@ -4189,7 +4189,7 @@ class ProjectWidget(QtWidgets.QWidget):
         nb_layout.addWidget(nb_box)
         nb_layout.addStretch(1)
 
-        reg_idx = self.left_options_tabs.addTab(reg_page, "Registration & Stacking")
+        reg_idx = self.left_options_tabs.addTab(reg_page, "Registration and Stacking")
         mosaic_idx = self.left_options_tabs.addTab(mosaic_page, "Mosaic Processing")
         nb_idx = self.left_options_tabs.addTab(nb_page, "Ha/SII and OIII Extraction")
         self.left_options_tabs.setTabToolTip(reg_idx, LEFT_TAB_TOOLTIPS["registration"])

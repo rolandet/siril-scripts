@@ -20,7 +20,7 @@ All notable user-facing changes to this project should be documented here.
 - Clarified that the active development script is `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`, and that v2.1/v2.2 scripts are locked historical versions.
 - Renamed the Drizzle UI group in the active v2.2 script to `Drizzle and Background Extraction`.
 - Updated the v2.2 script's displayed version labels to `2.2` and renamed it to `osc-multi-night-with-mosiac-stacking-v2.2.py`.
-- Reorganized the v3.0 left-side processing controls into `Registration & Stacking`, `Mosaic Processing`, and `Ha/SII and OIII Extraction` tabs while keeping Sessions, Panels, and run buttons visible.
+- Reorganized the v3.0 left-side processing controls into `Registration and Stacking`, `Mosaic Processing`, and `Ha/SII and OIII Extraction` tabs while keeping Sessions, Panels, and run buttons visible.
 - Narrowband mode now ignores drizzle settings and keeps extraction data in filter-specific working folders to avoid Siril sequence-name collisions.
 - Expanded v3.0 Ha/OIII and SII/OIII filter tabs to include the same frame-list categories as OSC: lights, biases, darks, flats, and dark-flats.
 - Added per-filter master override boxes for v3.0 Ha/OIII and SII/OIII tabs.
