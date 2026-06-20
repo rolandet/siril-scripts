@@ -13,6 +13,7 @@ All notable user-facing changes to this project should be documented here.
 - Added tooltips for the v3.0 processing tabs and filter-group tabs.
 - Added v3.0 narrowband-mode broadband support: the `OSC` tab can now produce a companion `<project>_broadband_rgb.fit`, and an optional LRGB compose step can write `<project>_<palette>_LRGB.fit`.
 - Added a v3.0 `NB Channel Balancing` selector with `Median/MAD Match` as the default, plus `Background Match Only` and `None` options for narrowband RGB composition.
+- Added a v3.0 `Final NB Framing` selector for final Ha/SII/OIII channel registration, defaulting to common-overlap framing.
 
 ### Changed
 
@@ -31,6 +32,7 @@ All notable user-facing changes to this project should be documented here.
 - Expanded the v3.0 narrowband output dropdown to support `SHO with HOO fallback`, forced `SHO`, forced `HSO`, and forced `HOO`.
 - Replaced the v3.0 narrowband channel-normalization checkbox with the `NB Channel Balancing` selector. Existing projects with normalization enabled load as `Median/MAD Match`; existing projects with normalization disabled load as `None`.
 - Narrowband final FITS filenames now include the resolved palette label, such as `<project>_SHO_final.fit`, `<project>_HOO_final.fit`, or `<project>_HSO_final.fit`.
+- Narrowband RGB composition now defaults final channel registration to `seqapplyreg nb_comp -framing=min`, preventing blank registration borders from being fed into channel balancing and `rgbcomp`.
 - In v3.0, removing a session now renumbers remaining sessions to `Session 1..N`, remaps mosaic session references, and renames default session working folders when possible.
 - In v3.0, removing the final remaining session now runs the normal deletion flow, then recreates an empty `Session 1` with a clear dialog.
 - v3.0 mosaic sessions can again remove the final panel, leaving the session with no panels until a new one is added.

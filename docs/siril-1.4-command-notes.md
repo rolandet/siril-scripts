@@ -20,7 +20,7 @@ Before adding or changing generated Siril commands, verify the command exists in
 - Conversion: `convert <sequence> -out=...`, optionally with `-fitseq` or `-ser` in non-mosaic mode.
 - Calibration: `calibrate flat`, `calibrate light`, `-dark=`, `-bias=`, `-flat=`, `$defbias`, `$defdark`, `$defflat`, `-cfa`, `-cc=dark`, `-equalize_cfa`, `-debayer`.
 - Registration: `register`, `-layer=0`, `-2pass`, `-disto=file`, drizzle args.
-- Sequence application: `seqapplyreg`, drizzle args, `-framing=max`.
+- Sequence application: `seqapplyreg`, drizzle args, `-framing=min`, `-framing=current`, `-framing=max`, `-framing=cog`.
 - Stacking: `stack`, `rej`, `rej sigma`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
 - Sequence and image operations: `merge`, `load`, `save`, `mirrorx -bottomup`, `resample`, `split ... -lab`.
 - Background and mosaic WCS commands: `seqsubsky pp_light 1`, `parse $RA:ra$_$DEC:dec$`, `platesolve -force -disto=platesolve_data.wcs`, `seqplatesolve mosaic -force -nocache`.
@@ -63,6 +63,7 @@ Resolution: do not rely on guessed command parameters. Validate against Siril 1.
 - Siril's `seqextract_HaOIII` creates `Ha_` and `OIII_` output sequences. The v3.0 SII/OIII workflow uses the same command and treats the red-channel `Ha_` output as SII.
 - v3.0 narrowband calibration can use filter-specific master overrides and raw bias, dark, flat, and dark-flat frames from the Ha/OIII or SII/OIII tabs; shared session/panel master overrides and Master Library variables remain fallbacks.
 - `setref` takes the sequence name and a one-based image number, not a filename.
+- v3.0 applies the selected `Final NB Framing` mode during final Ha/SII/OIII channel registration before balancing and RGB composition. The default `Common overlap (recommended)` emits `seqapplyreg nb_comp -framing=min`; advanced options emit `-framing=current`, `-framing=max`, or `-framing=cog`.
 - v3.0 balances final aligned NB channel levels before RGB composition according to the `NB Channel Balancing` mode. The default `Median/MAD Match` uses Siril Pixel Math with the median/MAD normalization form documented in Siril's RGB composition guidance, emitting `set32bits` and `pm "..."` commands against the aligned `r_nb_comp_...` files and saving 32-bit `nb_comp_norm_...` files for `rgbcomp`.
 - The `Background Match Only` NB channel-balancing mode uses Siril Pixel Math to subtract each non-reference channel median and add the reference channel median, saving 32-bit `nb_comp_bg_...` files for `rgbcomp`. The `None` mode skips these `pm` balancing commands and sends the aligned `r_nb_comp_...` files directly to `rgbcomp`.
 - v3.0 HOO composition reuses OIII as both green and blue, so the generated `rgbcomp` command includes `-nosum` to avoid double-counting OIII in FITS exposure and stack-count metadata.

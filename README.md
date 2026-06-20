@@ -19,6 +19,7 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
     * `HSO`
     * `HOO`
 - Added `NB Channel Balancing` with `Median/MAD Match`, `Background Match Only`, and `None`.
+- Added `Final NB Framing`, defaulting to common-overlap framing to avoid blank channel borders during SHO/HSO/HOO composition.
 - Added optional OSC broadband companion output and optional LRGB composition from OSC luminance.
 - Narrowband extraction disables drizzle in the extraction path, keeps filter groups in separate working folders, and writes aggregate narrowband sequence scratch files under `Session 1/nb_sequences`.
 - HOO composition now uses `rgbcomp -nosum` when OIII is reused for both green and blue so FITS exposure and stack-count metadata are not double-counted.
@@ -228,6 +229,11 @@ The **Ha/SII and OIII Extraction** tab includes these key controls:
     * `SHO`
     * `HSO`
     * `HOO`
+- **Final NB Framing** - Controls how the final registered Ha/SII/OIII channels are framed before channel balancing and RGB composition:
+    * `Common overlap (recommended)` - Default. Emits `seqapplyreg nb_comp -framing=min` so only the shared valid channel area is composed.
+    * `Reference frame` - Emits `-framing=current` to keep the reference channel frame.
+    * `Maximum extent` - Emits `-framing=max` to preserve the widest registered extent.
+    * `Center of gravity` - Emits `-framing=cog`.
 - **NB Channel Balancing** - Controls optional post-stack channel balancing before RGB composition:
     * `Median/MAD Match` - Default. Matches each non-reference channel's median background and MAD contrast to the reference channel.
     * `Background Match Only` - Matches only the background median. This preserves more of the original channel contrast.
@@ -271,7 +277,7 @@ The generated Siril script follows this high-level narrowband path:
 4. Optionally run `seqsubsky` on the extracted Ha/SII and OIII sequences when Background Extraction is enabled.
 5. Register and stack each mono emission channel.
 6. Merge OIII extracted from both Ha/OIII and SII/OIII filter groups.
-7. Align the final Ha, SII, and OIII mono masters to each other.
+7. Align the final Ha, SII, and OIII mono masters to each other and apply the selected Final NB Framing mode.
 8. Apply the selected NB Channel Balancing mode with Siril Pixel Math, when enabled.
 9. Compose the selected RGB palette with `rgbcomp`.
 10. Run `mirrorx -bottomup` and save the final palette-named FITS file.
@@ -343,8 +349,10 @@ It then sets the reference channel and aligns the channels:
 ```text
 setref nb_comp <reference_index>
 register nb_comp -layer=0 -2pass
-seqapplyreg nb_comp
+seqapplyreg nb_comp -framing=<mode>
 ```
+
+The default Final NB Framing mode is `Common overlap (recommended)`, which emits `-framing=min`. This crops the registered channels to their shared valid area before channel balancing and `rgbcomp`, avoiding false-color borders when one filter group has a slightly different nightly framing. Advanced users can choose `current`, `max`, or `cog` from the Ha/SII and OIII Extraction tab when they want to preserve a different frame and crop manually later.
 
 The reference is Ha:
 

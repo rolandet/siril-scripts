@@ -276,6 +276,12 @@ NB_CHANNEL_BALANCE_OPTIONS = [
     ("Background Match Only", "BACKGROUND"),
     ("None", "NONE"),
 ]
+NB_FINAL_FRAMING_OPTIONS = [
+    ("Common overlap (recommended)", "MIN"),
+    ("Reference frame", "CURRENT"),
+    ("Maximum extent", "MAX"),
+    ("Center of gravity", "COG"),
+]
 
 
 def normalize_nb_channel_balance_mode(value, legacy_normalize=True) -> str:
@@ -284,6 +290,23 @@ def normalize_nb_channel_balance_mode(value, legacy_normalize=True) -> str:
     if token in valid_tokens:
         return token
     return "MEDIAN_MAD" if bool(legacy_normalize) else "NONE"
+
+
+def normalize_nb_final_framing_mode(value) -> str:
+    token = str(value or "").upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "COMMON": "MIN",
+        "COMMON_OVERLAP": "MIN",
+        "REFERENCE": "CURRENT",
+        "REFERENCE_FRAME": "CURRENT",
+        "MAXIMUM": "MAX",
+        "MAXIMUM_EXTENT": "MAX",
+        "CENTER": "COG",
+        "CENTER_OF_GRAVITY": "COG",
+    }
+    token = aliases.get(token, token)
+    valid_tokens = {mode_token for _label, mode_token in NB_FINAL_FRAMING_OPTIONS}
+    return token if token in valid_tokens else "MIN"
 
 
 FRAME_TAB_TOOLTIPS = {
@@ -502,6 +525,7 @@ class Project:
     nb_extraction_enabled: bool = False
     nb_save_mono_outputs: bool = True
     nb_output_palette: str = "SHO_WITH_HOO_FALLBACK"
+    nb_final_framing_mode: str = "MIN"
     nb_channel_balance_mode: str = "MEDIAN_MAD"
     nb_normalize_channels: bool = True
     nb_resample_mode: str = "ha"
@@ -516,6 +540,9 @@ class Project:
         nb_channel_balance_mode = normalize_nb_channel_balance_mode(
             getattr(self, "nb_channel_balance_mode", None),
             getattr(self, "nb_normalize_channels", True),
+        )
+        nb_final_framing_mode = normalize_nb_final_framing_mode(
+            getattr(self, "nb_final_framing_mode", None)
         )
         return {
             "name": self.name,
@@ -568,6 +595,7 @@ class Project:
             "nb_extraction_enabled": bool(self.nb_extraction_enabled),
             "nb_save_mono_outputs": bool(self.nb_save_mono_outputs),
             "nb_output_palette": self.nb_output_palette,
+            "nb_final_framing_mode": nb_final_framing_mode,
             "nb_channel_balance_mode": nb_channel_balance_mode,
             "nb_normalize_channels": nb_channel_balance_mode != "NONE",
             "nb_resample_mode": self.nb_resample_mode,
@@ -639,6 +667,7 @@ class Project:
         p.nb_extraction_enabled = bool(d.get("nb_extraction_enabled", False))
         p.nb_save_mono_outputs = bool(d.get("nb_save_mono_outputs", True))
         p.nb_output_palette = d.get("nb_output_palette", "SHO_WITH_HOO_FALLBACK")
+        p.nb_final_framing_mode = normalize_nb_final_framing_mode(d.get("nb_final_framing_mode"))
         p.nb_channel_balance_mode = normalize_nb_channel_balance_mode(
             d.get("nb_channel_balance_mode"),
             d.get("nb_normalize_channels", True),
@@ -1642,7 +1671,10 @@ class SirilCommandBuilder:
             L.append(f'save "nb_comp_{i:05d}.fit"')
         L.append(f"setref nb_comp {ref_index}")
         L.append("register nb_comp -layer=0 -2pass")
-        L.append("seqapplyreg nb_comp")
+        framing_mode = normalize_nb_final_framing_mode(
+            getattr(self.project, "nb_final_framing_mode", None)
+        ).lower()
+        L.append(f"seqapplyreg nb_comp -framing={framing_mode}")
         comp_inputs = self._nb_compose_inputs(L, ref_index=ref_index)
         rgbcomp_options = f"-out={out_name}"
         if len(set(ordered)) < len(ordered):
@@ -3882,6 +3914,13 @@ class ProjectWidget(QtWidgets.QWidget):
             "Controls how aligned SII/Ha/OIII channel levels are balanced before RGB composition.\n"
             "Median/MAD Match aligns background and contrast. Background Match Only aligns medians while preserving channel contrast. None preserves raw channel levels."
         )
+        self.cmb_nb_final_framing = QtWidgets.QComboBox()
+        self.cmb_nb_final_framing.addItems([label for label, _token in NB_FINAL_FRAMING_OPTIONS])
+        self.cmb_nb_final_framing.setToolTip(
+            "Controls how final Ha/SII/OIII channels are framed after channel registration.\n"
+            "Common overlap avoids blank channel borders and false-color edges.\n"
+            "Reference frame or Maximum extent can preserve more field, but may leave areas where one channel has no data."
+        )
         self.chk_nb_use_osc_broadband = QtWidgets.QCheckBox("Use OSC tab as broadband RGB / luminance source")
         self.chk_nb_use_osc_broadband.setChecked(False)
         self.chk_nb_use_osc_broadband.setToolTip(
@@ -4165,6 +4204,7 @@ class ProjectWidget(QtWidgets.QWidget):
         nb_form = QtWidgets.QFormLayout(nb_box)
         nb_form.addRow("", self.chk_nb_enabled)
         nb_form.addRow("Output", self.cmb_nb_palette)
+        nb_form.addRow("Final NB Framing", self.cmb_nb_final_framing)
         nb_form.addRow("NB Channel Balancing", self.cmb_nb_channel_balance)
         nb_form.addRow("", self.chk_nb_save_mono)
         nb_form.addRow("", self.chk_nb_use_osc_broadband)
@@ -4323,6 +4363,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.chk_nb_enabled.toggled.connect(self._on_nb_toggled)
         self.chk_nb_enabled.toggled.connect(self.mark_dirty)
         self.cmb_nb_palette.currentIndexChanged.connect(self.mark_dirty)
+        self.cmb_nb_final_framing.currentIndexChanged.connect(self.mark_dirty)
         self.cmb_nb_channel_balance.currentIndexChanged.connect(self.mark_dirty)
         self.chk_nb_use_osc_broadband.toggled.connect(self._on_nb_broadband_toggled)
         self.chk_nb_use_osc_broadband.toggled.connect(self.mark_dirty)
@@ -4540,6 +4581,7 @@ class ProjectWidget(QtWidgets.QWidget):
     def _on_nb_toggled(self, enabled: bool):
         self.chk_nb_save_mono.setEnabled(enabled)
         self.cmb_nb_channel_balance.setEnabled(enabled)
+        self.cmb_nb_final_framing.setEnabled(enabled)
         self.cmb_nb_palette.setEnabled(enabled)
         self.chk_nb_use_osc_broadband.setEnabled(enabled)
         self.lbl_nb_fixed.setEnabled(enabled)
@@ -5169,6 +5211,11 @@ class ProjectWidget(QtWidgets.QWidget):
             palette = str(getattr(p, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK")
             palette_tokens = [token for _label, token in NB_PALETTE_OPTIONS]
             self.cmb_nb_palette.setCurrentIndex(palette_tokens.index(palette) if palette in palette_tokens else 0)
+            framing_mode = normalize_nb_final_framing_mode(getattr(p, "nb_final_framing_mode", None))
+            framing_tokens = [token for _label, token in NB_FINAL_FRAMING_OPTIONS]
+            self.cmb_nb_final_framing.setCurrentIndex(
+                framing_tokens.index(framing_mode) if framing_mode in framing_tokens else 0
+            )
             self.chk_nb_use_osc_broadband.setChecked(bool(getattr(p, "nb_use_osc_broadband", False)))
             self.chk_nb_luminance_combine.setChecked(bool(getattr(p, "nb_luminance_combine", False)))
             self._on_nb_toggled(self.chk_nb_enabled.isChecked())
@@ -5293,6 +5340,11 @@ class ProjectWidget(QtWidgets.QWidget):
             p.nb_output_palette = NB_PALETTE_OPTIONS[palette_index][1]
         else:
             p.nb_output_palette = "SHO_WITH_HOO_FALLBACK"
+        framing_index = self.cmb_nb_final_framing.currentIndex()
+        if 0 <= framing_index < len(NB_FINAL_FRAMING_OPTIONS):
+            p.nb_final_framing_mode = NB_FINAL_FRAMING_OPTIONS[framing_index][1]
+        else:
+            p.nb_final_framing_mode = "MIN"
         p.nb_resample_mode = "ha"
         p.nb_oiii_merge_policy = "merge_all"
         p.nb_drizzle_policy = "disabled"
