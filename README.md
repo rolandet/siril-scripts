@@ -9,7 +9,7 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
 **Note: Siril 1.4 or later is required **
 
 ---
-## Update Release (v3.0)
+## ✨Update Release (v3.0)
 - Added Ha/SII and OIII Extraction for OSC dual-band narrowband data.
 - Added `OSC`, `Ha/OIII`, and `SII/OIII` data tabs for each Session and Mosaic Panel.
 - Added mono master outputs for `NB_Ha_mono.fit`, `NB_SII_mono.fit`, and `NB_OIII_mono.fit`.
