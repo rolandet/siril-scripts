@@ -138,7 +138,7 @@ ProjectRoot/
 > Use this 7-step guide to run the Multi-Night Stacking Python Application and process all of your sessions in Siril 1.4.
 
 ### 🧰 Requirements
-- **Siril 1.4 Beta 4** (with Python scripting enabled)  
+- **Siril 1.4** (with Python scripting enabled)  
 - **Python 3.10 +** with `PyQt6`, `astropy`, and `sirilpy` installed   
 
 ---
