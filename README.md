@@ -24,6 +24,8 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
 - HOO composition now uses `rgbcomp -nosum` when OIII is reused for both green and blue so FITS exposure and stack-count metadata are not double-counted.
 - Pixel Math channel-balancing intermediates are saved as 32-bit FITS with `set32bits`.
 
+<img width="1518" height="992" alt="image" src="https://github.com/user-attachments/assets/34770003-049a-4188-8a6c-c09dad01a7d1" />
+
 ---
 ## ✨ Update Release (v2.2)
 - Added the ability to apply background extraction to individual subs using the seqsubsky sequencename command for non-mosaic stacking. The mosaic feature already had this capability.
