@@ -20,6 +20,7 @@ It provides a Sirilic-like interface using the new Siril Python API that is full
     * `HOO`
 - Added `NB Channel Balancing` with `Median/MAD Match`, `Background Match Only`, and `None`.
 - Added `Final NB Framing`, defaulting to common-overlap framing to avoid blank channel borders during SHO/HSO/HOO composition.
+- Added an advanced `OIII Combine Policy` for keeping the default merge-all OIII stack or blending separately stacked Ha/OIII-derived and SII/OIII-derived OIII masters.
 - Added optional OSC broadband companion output and optional LRGB composition from OSC luminance.
 - Narrowband extraction disables drizzle in the extraction path, keeps filter groups in separate working folders, and writes aggregate narrowband sequence scratch files under `Session 1/nb_sequences`.
 - HOO composition now uses `rgbcomp -nosum` when OIII is reused for both green and blue so FITS exposure and stack-count metadata are not double-counted.
@@ -234,6 +235,12 @@ The **Ha/SII and OIII Extraction** tab includes these key controls:
     * `Reference frame` - Emits `-framing=current` to keep the reference channel frame.
     * `Maximum extent` - Emits `-framing=max` to preserve the widest registered extent.
     * `Center of gravity` - Emits `-framing=cog`.
+- **OIII Combine Policy** - Controls how OIII extracted from the Ha/OIII and SII/OIII filter groups is combined:
+    * `Merge all OIII subs before stacking (recommended)` - Default. Merges all OIII extracted subs into one OIII stack.
+    * `Stack filter OIII separately, auto weighted blend` - Stacks Ha/OIII-derived OIII and SII/OIII-derived OIII separately, aligns the two OIII masters, applies the selected NB Channel Balancing source-match mode, then blends them using source-group OIII sub counts as weights.
+    * `Stack filter OIII separately, manual weighted blend` - Uses the same separate-stack workflow, but the `Manual OIII Blend` slider sets the Ha/OIII vs SII/OIII contribution.
+- **Manual OIII Blend** - Enabled only for manual weighted OIII blending. `0%` uses only SII/OIII-derived OIII, `100%` uses only Ha/OIII-derived OIII.
+- **OIII Weights** - Shows the estimated Ha/OIII vs SII/OIII blend percentages from the project light lists. The generated script recalculates auto weights from the prepared filter-group light folders at build time.
 - **NB Channel Balancing** - Controls optional post-stack channel balancing before RGB composition:
     * `Median/MAD Match` - Default. Matches each non-reference channel's median background and MAD contrast to the reference channel.
     * `Background Match Only` - Matches only the background median. This preserves more of the original channel contrast.
@@ -276,7 +283,7 @@ The generated Siril script follows this high-level narrowband path:
 3. Run `seqextract_HaOIII` on each calibrated filter-group light sequence.
 4. Optionally run `seqsubsky` on the extracted Ha/SII and OIII sequences when Background Extraction is enabled.
 5. Register and stack each mono emission channel.
-6. Merge OIII extracted from both Ha/OIII and SII/OIII filter groups.
+6. Combine OIII according to the selected OIII Combine Policy.
 7. Align the final Ha, SII, and OIII mono masters to each other and apply the selected Final NB Framing mode.
 8. Apply the selected NB Channel Balancing mode with Siril Pixel Math, when enabled.
 9. Compose the selected RGB palette with `rgbcomp`.
@@ -493,7 +500,7 @@ This does not replace the plain HOO/SHO/HSO narrowband final.
 - Narrowband extraction requires CFA input. The script does not debayer the narrowband lights before `seqextract_HaOIII`.
 - Drizzle is disabled in the narrowband extraction path.
 - SII/OIII extraction relies on Siril's `seqextract_HaOIII` command and treats the red-channel `Ha_...` output as SII.
-- The OIII master is merged from all contributing Ha/OIII and SII/OIII filter groups.
+- By default, the OIII master is merged from all contributing Ha/OIII and SII/OIII filter groups. Advanced OIII Combine Policy modes can stack each filter group's OIII separately and blend the two OIII masters.
 - Correct filter placement matters. Ha/OIII data should go in the Ha/OIII tab; SII/OIII data should go in the SII/OIII tab.
 - Correct flats matter. Use filter-specific flats or filter-specific master flat overrides when possible.
 - Normal color calibration is usually not required for false-color narrowband palettes. HOO, SHO, and HSO are intentional channel mappings, not natural broadband color.

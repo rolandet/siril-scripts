@@ -115,11 +115,12 @@ When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-ext
 
 - Calibrate narrowband lights as CFA and do not emit `-debayer`.
 - Run `seqextract_HaOIII pp_light -resample=ha` for Ha/OIII and SII/OIII filter groups.
-- Map Ha/OIII red extraction to Ha, SII/OIII red extraction to SII, and merge OIII extractions from both filters.
+- Map Ha/OIII red extraction to Ha, SII/OIII red extraction to SII, and combine OIII extractions from both filters.
 - Allow asymmetric filter coverage across sessions. Sessions with only one narrowband filter group contribute only that group's channels; for example, four SII/OIII sessions and two Ha/OIII sessions produce SII from four sessions, Ha from two sessions, and OIII from all contributing groups.
 - Prefer filter-group master overrides over shared session/panel overrides, raw filter-group calibration frames, and Master Library variables.
 - Disable drizzle for the narrowband path while preserving the user's drizzle settings for normal OSC processing.
 - Register and stack mono Ha, SII, and OIII channels.
+- Combine OIII with the selected `OIII Combine Policy`. The default merge-all policy stacks all OIII subs together. Advanced weighted policies stack Ha/OIII-derived OIII and SII/OIII-derived OIII separately, align the two source OIII masters with `seqapplyreg nb_oiii_blend -framing=min`, apply the selected `NB Channel Balancing` source-match mode, and PixelMath blend them with auto sub-count weights or the manual slider weight. The UI displays estimated blend weights from the project light lists; generated scripts recalculate auto weights from the prepared light folders.
 - Apply the selected `Final NB Framing` mode during final channel registration. The default `Common overlap (recommended)` emits `seqapplyreg nb_comp -framing=min` so SHO/HSO/HOO composition uses only the shared valid channel area; advanced options expose reference-frame, maximum-extent, and center-of-gravity framing.
 - Balance the aligned mono channels before RGB composition with the `NB Channel Balancing` mode. The default `Median/MAD Match` aligns channel medians and MAD contrast, `Background Match Only` aligns channel medians while preserving channel contrast, and `None` preserves raw aligned channel levels. Pixel Math balancing intermediates are saved as 32-bit FITS before `rgbcomp`.
 - Compose using the selected palette: `SHO with HOO fallback`, forced `SHO`, forced `HSO`, or forced `HOO`.

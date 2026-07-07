@@ -14,6 +14,8 @@ All notable user-facing changes to this project should be documented here.
 - Added v3.0 narrowband-mode broadband support: the `OSC` tab can now produce a companion `<project>_broadband_rgb.fit`, and an optional LRGB compose step can write `<project>_<palette>_LRGB.fit`.
 - Added a v3.0 `NB Channel Balancing` selector with `Median/MAD Match` as the default, plus `Background Match Only` and `None` options for narrowband RGB composition.
 - Added a v3.0 `Final NB Framing` selector for final Ha/SII/OIII channel registration, defaulting to common-overlap framing.
+- Added a v3.0 `OIII Combine Policy` selector with the current merge-all behavior as the default, plus advanced auto-weighted and manual-weighted blends of separately stacked Ha/OIII-derived and SII/OIII-derived OIII masters.
+- Added a read-only `OIII Weights` display showing estimated Ha/OIII vs SII/OIII blend percentages from the project light lists.
 
 ### Changed
 
@@ -33,6 +35,8 @@ All notable user-facing changes to this project should be documented here.
 - Replaced the v3.0 narrowband channel-normalization checkbox with the `NB Channel Balancing` selector. Existing projects with normalization enabled load as `Median/MAD Match`; existing projects with normalization disabled load as `None`.
 - Narrowband final FITS filenames now include the resolved palette label, such as `<project>_SHO_final.fit`, `<project>_HOO_final.fit`, or `<project>_HSO_final.fit`.
 - Narrowband RGB composition now defaults final channel registration to `seqapplyreg nb_comp -framing=min`, preventing blank registration borders from being fed into channel balancing and `rgbcomp`.
+- Advanced weighted OIII blend modes now align source-specific OIII masters, optionally match them onto a common scale, and blend them with either OIII sub-count weights or the manual Ha/OIII vs SII/OIII slider.
+- Weighted OIII blend source matching now follows `NB Channel Balancing`: Median/MAD match, background-only match, or no source matching when set to `None`.
 - In v3.0, removing a session now renumbers remaining sessions to `Session 1..N`, remaps mosaic session references, and renames default session working folders when possible.
 - In v3.0, removing the final remaining session now runs the normal deletion flow, then recreates an empty `Session 1` with a clear dialog.
 - v3.0 mosaic sessions can again remove the final panel, leaving the session with no panels until a new one is added.

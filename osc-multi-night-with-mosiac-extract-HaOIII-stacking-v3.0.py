@@ -282,6 +282,11 @@ NB_FINAL_FRAMING_OPTIONS = [
     ("Maximum extent", "MAX"),
     ("Center of gravity", "COG"),
 ]
+NB_OIII_COMBINE_OPTIONS = [
+    ("Merge all OIII subs before stacking (recommended)", "MERGE_ALL"),
+    ("Stack filter OIII separately, auto weighted blend", "WEIGHTED_AUTO"),
+    ("Stack filter OIII separately, manual weighted blend", "WEIGHTED_MANUAL"),
+]
 
 
 def normalize_nb_channel_balance_mode(value, legacy_normalize=True) -> str:
@@ -307,6 +312,32 @@ def normalize_nb_final_framing_mode(value) -> str:
     token = aliases.get(token, token)
     valid_tokens = {mode_token for _label, mode_token in NB_FINAL_FRAMING_OPTIONS}
     return token if token in valid_tokens else "MIN"
+
+
+def normalize_nb_oiii_combine_policy(value) -> str:
+    token = str(value or "").upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": "MERGE_ALL",
+        "MERGE": "MERGE_ALL",
+        "MERGE_ALL_OIII": "MERGE_ALL",
+        "MERGE_ALL_SUBS": "MERGE_ALL",
+        "AUTO": "WEIGHTED_AUTO",
+        "AUTO_WEIGHTED": "WEIGHTED_AUTO",
+        "WEIGHTED": "WEIGHTED_AUTO",
+        "MANUAL": "WEIGHTED_MANUAL",
+        "MANUAL_WEIGHTED": "WEIGHTED_MANUAL",
+    }
+    token = aliases.get(token, token)
+    valid_tokens = {mode_token for _label, mode_token in NB_OIII_COMBINE_OPTIONS}
+    return token if token in valid_tokens else "MERGE_ALL"
+
+
+def clamp_percent(value, default=50) -> int:
+    try:
+        ivalue = int(value)
+    except Exception:
+        ivalue = int(default)
+    return max(0, min(100, ivalue))
 
 
 FRAME_TAB_TOOLTIPS = {
@@ -530,6 +561,7 @@ class Project:
     nb_normalize_channels: bool = True
     nb_resample_mode: str = "ha"
     nb_oiii_merge_policy: str = "merge_all"
+    nb_oiii_manual_ha_weight: int = 50
     nb_drizzle_policy: str = "disabled"
     nb_use_osc_broadband: bool = False
     nb_luminance_combine: bool = False
@@ -543,6 +575,9 @@ class Project:
         )
         nb_final_framing_mode = normalize_nb_final_framing_mode(
             getattr(self, "nb_final_framing_mode", None)
+        )
+        nb_oiii_merge_policy = normalize_nb_oiii_combine_policy(
+            getattr(self, "nb_oiii_merge_policy", None)
         )
         return {
             "name": self.name,
@@ -599,7 +634,8 @@ class Project:
             "nb_channel_balance_mode": nb_channel_balance_mode,
             "nb_normalize_channels": nb_channel_balance_mode != "NONE",
             "nb_resample_mode": self.nb_resample_mode,
-            "nb_oiii_merge_policy": self.nb_oiii_merge_policy,
+            "nb_oiii_merge_policy": nb_oiii_merge_policy,
+            "nb_oiii_manual_ha_weight": clamp_percent(getattr(self, "nb_oiii_manual_ha_weight", 50)),
             "nb_drizzle_policy": self.nb_drizzle_policy,
             "nb_use_osc_broadband": bool(self.nb_use_osc_broadband),
             "nb_luminance_combine": bool(self.nb_luminance_combine),
@@ -674,7 +710,8 @@ class Project:
         )
         p.nb_normalize_channels = p.nb_channel_balance_mode != "NONE"
         p.nb_resample_mode = d.get("nb_resample_mode", "ha")
-        p.nb_oiii_merge_policy = d.get("nb_oiii_merge_policy", "merge_all")
+        p.nb_oiii_merge_policy = normalize_nb_oiii_combine_policy(d.get("nb_oiii_merge_policy"))
+        p.nb_oiii_manual_ha_weight = clamp_percent(d.get("nb_oiii_manual_ha_weight", 50))
         p.nb_drizzle_policy = d.get("nb_drizzle_policy", "disabled")
         p.nb_use_osc_broadband = bool(d.get("nb_use_osc_broadband", False))
         p.nb_luminance_combine = bool(d.get("nb_luminance_combine", False))
@@ -1596,6 +1633,88 @@ class SirilCommandBuilder:
         L.append("")
         return final_path
 
+    def _nb_blend_oiii_sources(
+        self,
+        L: list[str],
+        *,
+        work: Path,
+        source_files: dict[str, str],
+        source_counts: dict[str, int],
+        set_comp,
+        save_public: bool = True,
+        sequence_work: Optional[Path] = None,
+    ) -> str:
+        set_comp(0)
+        scratch_dir = (sequence_work or work).resolve()
+        effective_out = "NB_OIII_mono" if save_public else "NB_OIII_mono_work"
+        final_dir = work if save_public else scratch_dir
+        final_path = (final_dir / f"{effective_out}.fit").as_posix()
+        policy = normalize_nb_oiii_combine_policy(
+            getattr(self.project, "nb_oiii_merge_policy", None)
+        )
+
+        ref_key = "ha_oiii"
+        other_key = "sii_oiii"
+        ref_file = source_files[ref_key]
+        other_file = source_files[other_key]
+        ref_name = "r_nb_oiii_blend_00001"
+        other_name = "r_nb_oiii_blend_00002"
+        other_blend_name = other_name
+        balance_mode = normalize_nb_channel_balance_mode(
+            getattr(self.project, "nb_channel_balance_mode", None),
+            getattr(self.project, "nb_normalize_channels", True),
+        )
+
+        if policy == "WEIGHTED_MANUAL":
+            ha_weight = clamp_percent(getattr(self.project, "nb_oiii_manual_ha_weight", 50)) / 100.0
+            weight_note = "manual"
+        else:
+            ha_count = max(0, int(source_counts.get(ref_key, 0) or 0))
+            sii_count = max(0, int(source_counts.get(other_key, 0) or 0))
+            total_count = max(1, ha_count + sii_count)
+            ha_weight = ha_count / total_count
+            weight_note = f"auto by OIII sub count ({ha_count}:{sii_count})"
+        sii_weight = 1.0 - ha_weight
+
+        L.append("# ---- Blend OIII sources from Ha/OIII and SII/OIII ----")
+        L.append(f"# OIII blend weights ({weight_note}): Ha/OIII {ha_weight:.1%}, SII/OIII {sii_weight:.1%}")
+        L.append(f'cd "{scratch_dir.as_posix()}"')
+        L.append(f'load "{Path(ref_file).as_posix()}"')
+        L.append('save "nb_oiii_blend_00001.fit"')
+        L.append(f'load "{Path(other_file).as_posix()}"')
+        L.append('save "nb_oiii_blend_00002.fit"')
+        L.append("setref nb_oiii_blend 1")
+        L.append("register nb_oiii_blend -layer=0 -2pass")
+        L.append("seqapplyreg nb_oiii_blend -framing=min")
+        L.append("set32bits")
+        if balance_mode == "BACKGROUND":
+            L.append("# Background-match SII/OIII-derived OIII to Ha/OIII-derived OIII before weighted blend.")
+            other_blend_name = "nb_oiii_blend_bg_00002"
+            norm_expr = f"${other_name}$-median(${other_name}$)+median(${ref_name}$)"
+            L.append(f'pm "{norm_expr}"')
+            L.append(f'save "{other_blend_name}.fit"')
+        elif balance_mode == "MEDIAN_MAD":
+            L.append("# Median/MAD-match SII/OIII-derived OIII to Ha/OIII-derived OIII before weighted blend.")
+            other_blend_name = "nb_oiii_blend_norm_00002"
+            norm_expr = (
+                f"${other_name}$*mad(${ref_name}$)/mad(${other_name}$)"
+                f"-mad(${ref_name}$)/mad(${other_name}$)*median(${other_name}$)"
+                f"+median(${ref_name}$)"
+            )
+            L.append(f'pm "{norm_expr}"')
+            L.append(f'save "{other_blend_name}.fit"')
+        else:
+            L.append("# OIII source matching is disabled because NB Channel Balancing is set to None.")
+        blend_expr = f"{ha_weight:.6f}*${ref_name}$+{sii_weight:.6f}*${other_blend_name}$"
+        L.append(f'pm "{blend_expr}"')
+        L.append(f'save "{final_path}"')
+        if save_public:
+            L.append(f"# Blended OIII output: {final_path}")
+        else:
+            L.append(f"# Internal blended OIII channel for NB composition: {final_path}")
+        L.append("")
+        return final_path
+
     def _nb_compose_inputs(self, L: list[str], *, ref_index: int) -> list[str]:
         inputs = [f"r_nb_comp_{i:05d}" for i in range(1, 4)]
         balance_mode = normalize_nb_channel_balance_mode(
@@ -1739,7 +1858,7 @@ class SirilCommandBuilder:
         L.append(f'cd "{work.as_posix()}"')
         L.append("# Narrowband extraction enabled: normal OSC final is skipped.")
         L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
-        L.append("# OIII merge policy: merge all OIII extracted from Ha/OIII and SII/OIII filters.")
+        L.append(f"# OIII combine policy: {normalize_nb_oiii_combine_policy(getattr(p, 'nb_oiii_merge_policy', None))}.")
         L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
         L.append("")
 
@@ -1753,6 +1872,8 @@ class SirilCommandBuilder:
             L.append("")
 
         channel_seqs: dict[str, list[tuple[str, str]]] = {"Ha": [], "SII": [], "OIII": []}
+        oiii_source_seqs: dict[str, list[tuple[str, str]]] = {key: [] for key in NB_GROUP_KEYS}
+        oiii_source_counts: dict[str, int] = {key: 0 for key in NB_GROUP_KEYS}
         broadband_seqs: list[tuple[str, str]] = []
         for sess in p.sessions:
             sess_root = (work / (sess.work_subdir or sess.name)).resolve()
@@ -1773,6 +1894,9 @@ class SirilCommandBuilder:
                 )
                 for channel, seqs in found.items():
                     channel_seqs[channel].extend(seqs)
+                if found["OIII"]:
+                    oiii_source_seqs[group_key].extend(found["OIII"])
+                    oiii_source_counts[group_key] += sum(1 for _ in (group_root / "lights").glob("*.fit*"))
             if bool(getattr(p, "nb_use_osc_broadband", False)):
                 broadband_seqs.extend(self._nb_emit_broadband_unit(
                     L,
@@ -1790,7 +1914,7 @@ class SirilCommandBuilder:
         L.append("# ---- Stack extracted NB channels ----")
         L.append("setfindstar")
         channel_files: dict[str, str] = {}
-        for channel in ("Ha", "SII", "OIII"):
+        for channel in ("Ha", "SII"):
             if channel_seqs[channel]:
                 channel_files[channel] = self._nb_stack_channel(
                     L,
@@ -1798,6 +1922,47 @@ class SirilCommandBuilder:
                     channel=channel,
                     seqs=channel_seqs[channel],
                     out_name=f"NB_{channel}_mono",
+                    set_comp=set_comp,
+                    save_public=save_mono,
+                    sequence_work=sequence_work,
+                )
+        oiii_policy = normalize_nb_oiii_combine_policy(getattr(p, "nb_oiii_merge_policy", None))
+        oiii_sources = [key for key in NB_GROUP_KEYS if oiii_source_seqs[key]]
+        if channel_seqs["OIII"]:
+            if oiii_policy != "MERGE_ALL" and len(oiii_sources) == 2:
+                source_files: dict[str, str] = {}
+                source_counts: dict[str, int] = {}
+                for key in NB_GROUP_KEYS:
+                    source_files[key] = self._nb_stack_channel(
+                        L,
+                        work=work,
+                        channel=f"OIII_{NB_GROUP_FOLDERS[key]}",
+                        seqs=oiii_source_seqs[key],
+                        out_name=f"NB_OIII_{NB_GROUP_FOLDERS[key]}_mono",
+                        set_comp=set_comp,
+                        save_public=False,
+                        sequence_work=sequence_work,
+                    )
+                    source_counts[key] = oiii_source_counts[key]
+                channel_files["OIII"] = self._nb_blend_oiii_sources(
+                    L,
+                    work=work,
+                    source_files=source_files,
+                    source_counts=source_counts,
+                    set_comp=set_comp,
+                    save_public=save_mono,
+                    sequence_work=sequence_work,
+                )
+            else:
+                if oiii_policy != "MERGE_ALL" and len(oiii_sources) < 2:
+                    L.append("# OIII weighted blend requested, but only one OIII source group was found; using merge-all OIII stack.")
+                    L.append("")
+                channel_files["OIII"] = self._nb_stack_channel(
+                    L,
+                    work=work,
+                    channel="OIII",
+                    seqs=channel_seqs["OIII"],
+                    out_name="NB_OIII_mono",
                     set_comp=set_comp,
                     save_public=save_mono,
                     sequence_work=sequence_work,
@@ -1852,6 +2017,7 @@ class SirilCommandBuilder:
         L.append(f'cd "{work.as_posix()}"')
         L.append("# Narrowband extraction enabled: normal OSC mosaic final is skipped.")
         L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
+        L.append(f"# OIII combine policy: {normalize_nb_oiii_combine_policy(getattr(p, 'nb_oiii_merge_policy', None))}.")
         L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
         L.append("")
 
@@ -1867,6 +2033,10 @@ class SirilCommandBuilder:
         panel_channel_seqs: dict[str, dict[str, list[tuple[str, str]]]] = {
             "Ha": {}, "SII": {}, "OIII": {}
         }
+        panel_oiii_source_seqs: dict[str, dict[str, list[tuple[str, str]]]] = {
+            key: {} for key in NB_GROUP_KEYS
+        }
+        panel_oiii_source_counts: dict[str, int] = {key: 0 for key in NB_GROUP_KEYS}
         broadband_panel_seqs: dict[str, list[tuple[str, str]]] = {}
 
         for sess in p.sessions:
@@ -1894,6 +2064,9 @@ class SirilCommandBuilder:
                     for channel, seqs in found.items():
                         if seqs:
                             panel_channel_seqs[channel].setdefault(pid, []).extend(seqs)
+                    if found["OIII"]:
+                        panel_oiii_source_seqs[group_key].setdefault(pid, []).extend(found["OIII"])
+                        panel_oiii_source_counts[group_key] += sum(1 for _ in (group_root / "lights").glob("*.fit*"))
                 if bool(getattr(p, "nb_use_osc_broadband", False)):
                     seqs = self._nb_emit_broadband_unit(
                         L,
@@ -1913,7 +2086,9 @@ class SirilCommandBuilder:
 
         L.append("# ---- Stack per-panel NB channels ----")
         panel_finals: dict[str, list[str]] = {"Ha": [], "SII": [], "OIII": []}
-        for channel in ("Ha", "SII", "OIII"):
+        oiii_policy = normalize_nb_oiii_combine_policy(getattr(p, "nb_oiii_merge_policy", None))
+        oiii_sources = [key for key in NB_GROUP_KEYS if any(panel_oiii_source_seqs[key].values())]
+        for channel in ("Ha", "SII"):
             for pid, seqs in panel_channel_seqs[channel].items():
                 if not seqs:
                     continue
@@ -1928,10 +2103,31 @@ class SirilCommandBuilder:
                     save_public=False,
                     sequence_work=sequence_work,
                 ))
+        if panel_channel_seqs["OIII"]:
+            if oiii_policy == "MERGE_ALL" or len(oiii_sources) < 2:
+                if oiii_policy != "MERGE_ALL" and len(oiii_sources) < 2:
+                    L.append("# OIII weighted blend requested, but only one OIII source group was found; using merge-all OIII stack.")
+                    L.append("")
+                for pid, seqs in panel_channel_seqs["OIII"].items():
+                    if not seqs:
+                        continue
+                    out_name = f"NB_{safe_slug(pid)}_OIII_panel"
+                    panel_finals["OIII"].append(self._nb_stack_channel(
+                        L,
+                        work=work,
+                        channel="OIII",
+                        seqs=seqs,
+                        out_name=out_name,
+                        set_comp=set_comp,
+                        save_public=False,
+                        sequence_work=sequence_work,
+                    ))
 
         L.append("# ---- Build channel mosaics ----")
         channel_files: dict[str, str] = {}
         for channel in ("Ha", "SII", "OIII"):
+            if channel == "OIII" and oiii_policy != "MERGE_ALL" and len(oiii_sources) == 2:
+                continue
             path = self._nb_emit_channel_mosaic(
                 L,
                 work=work,
@@ -1943,6 +2139,48 @@ class SirilCommandBuilder:
             )
             if path:
                 channel_files[channel] = path
+        if oiii_policy != "MERGE_ALL" and len(oiii_sources) == 2:
+            L.append("# ---- Stack and mosaic OIII sources separately ----")
+            source_mosaic_files: dict[str, str] = {}
+            source_counts: dict[str, int] = {}
+            for key in NB_GROUP_KEYS:
+                source_panel_finals: list[str] = []
+                for pid, seqs in panel_oiii_source_seqs[key].items():
+                    if not seqs:
+                        continue
+                    out_name = f"NB_{safe_slug(pid)}_OIII_{NB_GROUP_FOLDERS[key]}_panel"
+                    source_panel_finals.append(self._nb_stack_channel(
+                        L,
+                        work=work,
+                        channel=f"OIII_{NB_GROUP_FOLDERS[key]}",
+                        seqs=seqs,
+                        out_name=out_name,
+                        set_comp=set_comp,
+                        save_public=False,
+                        sequence_work=sequence_work,
+                    ))
+                    source_counts[key] = panel_oiii_source_counts[key]
+                source_path = self._nb_emit_channel_mosaic(
+                    L,
+                    work=work,
+                    channel=f"OIII_{NB_GROUP_FOLDERS[key]}",
+                    finals=source_panel_finals,
+                    set_comp=set_comp,
+                    save_public=False,
+                    sequence_work=sequence_work,
+                )
+                if source_path:
+                    source_mosaic_files[key] = source_path
+            if len(source_mosaic_files) == 2:
+                channel_files["OIII"] = self._nb_blend_oiii_sources(
+                    L,
+                    work=work,
+                    source_files=source_mosaic_files,
+                    source_counts=source_counts,
+                    set_comp=set_comp,
+                    save_public=save_mono,
+                    sequence_work=sequence_work,
+                )
 
         broadband_path = None
         if bool(getattr(p, "nb_use_osc_broadband", False)) and broadband_panel_seqs:
@@ -3921,6 +4159,35 @@ class ProjectWidget(QtWidgets.QWidget):
             "Common overlap avoids blank channel borders and false-color edges.\n"
             "Reference frame or Maximum extent can preserve more field, but may leave areas where one channel has no data."
         )
+        self.cmb_nb_oiii_combine = QtWidgets.QComboBox()
+        self.cmb_nb_oiii_combine.addItems([label for label, _token in NB_OIII_COMBINE_OPTIONS])
+        self.cmb_nb_oiii_combine.setToolTip(
+            "Controls how OIII extracted from Ha/OIII and SII/OIII filter groups is combined.\n"
+            "Merge all OIII subs stacks every OIII frame together and is recommended for most projects.\n"
+            "Weighted blend modes stack each filter group's OIII separately, align the two OIII masters, normalize them, then blend them."
+        )
+        self.sld_nb_oiii_manual_ha = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.sld_nb_oiii_manual_ha.setRange(0, 100)
+        self.sld_nb_oiii_manual_ha.setValue(50)
+        self.sld_nb_oiii_manual_ha.setSingleStep(5)
+        self.sld_nb_oiii_manual_ha.setPageStep(10)
+        self.sld_nb_oiii_manual_ha.setToolTip(
+            "Manual OIII blend balance. 0% uses only SII/OIII-derived OIII; 100% uses only Ha/OIII-derived OIII."
+        )
+        self.lbl_nb_oiii_manual = QtWidgets.QLabel()
+        self.lbl_nb_oiii_manual.setMinimumWidth(165)
+        self.nb_oiii_manual_widget = QtWidgets.QWidget()
+        nb_oiii_manual_layout = QtWidgets.QHBoxLayout(self.nb_oiii_manual_widget)
+        nb_oiii_manual_layout.setContentsMargins(0, 0, 0, 0)
+        nb_oiii_manual_layout.addWidget(self.sld_nb_oiii_manual_ha, 1)
+        nb_oiii_manual_layout.addWidget(self.lbl_nb_oiii_manual)
+        self._update_nb_oiii_manual_label()
+        self.lbl_nb_oiii_weights = QtWidgets.QLabel()
+        self.lbl_nb_oiii_weights.setWordWrap(True)
+        self.lbl_nb_oiii_weights.setToolTip(
+            "Estimated OIII blend weights from the project light lists.\n"
+            "Generated scripts calculate auto weights from prepared Ha/OIII and SII/OIII light folders at build time."
+        )
         self.chk_nb_use_osc_broadband = QtWidgets.QCheckBox("Use OSC tab as broadband RGB / luminance source")
         self.chk_nb_use_osc_broadband.setChecked(False)
         self.chk_nb_use_osc_broadband.setToolTip(
@@ -3976,6 +4243,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.panel_editor = PanelEditor()
         self.panel_editor.changed.connect(self.update_current_panel)
         self.panel_editor.changed.connect(self.mark_dirty)
+        self.panel_editor.changed.connect(self._on_nb_oiii_policy_changed)
         self.panel_editor.copy_cals_from_first_requested.connect(self._on_copy_cals_from_first_panel)
 
         # Bottom actions
@@ -4205,6 +4473,9 @@ class ProjectWidget(QtWidgets.QWidget):
         nb_form.addRow("", self.chk_nb_enabled)
         nb_form.addRow("Output", self.cmb_nb_palette)
         nb_form.addRow("Final NB Framing", self.cmb_nb_final_framing)
+        nb_form.addRow("OIII Combine Policy", self.cmb_nb_oiii_combine)
+        nb_form.addRow("Manual OIII Blend", self.nb_oiii_manual_widget)
+        nb_form.addRow("OIII Weights", self.lbl_nb_oiii_weights)
         nb_form.addRow("NB Channel Balancing", self.cmb_nb_channel_balance)
         nb_form.addRow("", self.chk_nb_save_mono)
         nb_form.addRow("", self.chk_nb_use_osc_broadband)
@@ -4364,6 +4635,10 @@ class ProjectWidget(QtWidgets.QWidget):
         self.chk_nb_enabled.toggled.connect(self.mark_dirty)
         self.cmb_nb_palette.currentIndexChanged.connect(self.mark_dirty)
         self.cmb_nb_final_framing.currentIndexChanged.connect(self.mark_dirty)
+        self.cmb_nb_oiii_combine.currentIndexChanged.connect(self._on_nb_oiii_policy_changed)
+        self.cmb_nb_oiii_combine.currentIndexChanged.connect(self.mark_dirty)
+        self.sld_nb_oiii_manual_ha.valueChanged.connect(self._update_nb_oiii_manual_label)
+        self.sld_nb_oiii_manual_ha.valueChanged.connect(self.mark_dirty)
         self.cmb_nb_channel_balance.currentIndexChanged.connect(self.mark_dirty)
         self.chk_nb_use_osc_broadband.toggled.connect(self._on_nb_broadband_toggled)
         self.chk_nb_use_osc_broadband.toggled.connect(self.mark_dirty)
@@ -4378,6 +4653,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.sessions_list.currentRowChanged.connect(self.load_selected_session)
         self.session_editor.changed.connect(self.update_current_session)
         self.session_editor.changed.connect(self.mark_dirty)
+        self.session_editor.changed.connect(self._on_nb_oiii_policy_changed)
 
         self.btn_prepare.clicked.connect(self.prepare_working_dir)
         self.btn_build_script.clicked.connect(self.build_script)
@@ -4582,10 +4858,81 @@ class ProjectWidget(QtWidgets.QWidget):
         self.chk_nb_save_mono.setEnabled(enabled)
         self.cmb_nb_channel_balance.setEnabled(enabled)
         self.cmb_nb_final_framing.setEnabled(enabled)
+        self.cmb_nb_oiii_combine.setEnabled(enabled)
         self.cmb_nb_palette.setEnabled(enabled)
         self.chk_nb_use_osc_broadband.setEnabled(enabled)
         self.lbl_nb_fixed.setEnabled(enabled)
+        self._on_nb_oiii_policy_changed()
         self._on_nb_broadband_toggled()
+
+    def _selected_nb_oiii_policy(self) -> str:
+        idx = self.cmb_nb_oiii_combine.currentIndex()
+        if 0 <= idx < len(NB_OIII_COMBINE_OPTIONS):
+            return NB_OIII_COMBINE_OPTIONS[idx][1]
+        return "MERGE_ALL"
+
+    def _estimate_nb_oiii_source_counts(self) -> dict[str, int]:
+        counts = {key: 0 for key in NB_GROUP_KEYS}
+        p = getattr(self, "project", None)
+        if not p:
+            return counts
+
+        def add_counts(owner):
+            for key in NB_GROUP_KEYS:
+                group = NarrowbandFrameSet.from_dict(getattr(owner, key, None))
+                counts[key] += len(getattr(group, "lights", []) or [])
+
+        if bool(getattr(p, "mosaic_enabled", False)):
+            for sess in getattr(p, "sessions", []) or []:
+                for panel in getattr(sess, "panels", []) or []:
+                    add_counts(panel)
+        else:
+            for sess in getattr(p, "sessions", []) or []:
+                add_counts(sess)
+        return counts
+
+    def _update_nb_oiii_weights_label(self):
+        policy = self._selected_nb_oiii_policy()
+        counts = self._estimate_nb_oiii_source_counts()
+        ha_count = counts.get("ha_oiii", 0)
+        sii_count = counts.get("sii_oiii", 0)
+        total = ha_count + sii_count
+
+        if policy == "MERGE_ALL":
+            self.lbl_nb_oiii_weights.setText(
+                f"Merge-all mode: {total} listed OIII source lights "
+                f"({ha_count} Ha/OIII, {sii_count} SII/OIII)."
+            )
+            return
+
+        if total <= 0:
+            self.lbl_nb_oiii_weights.setText("No OIII source lights are listed yet.")
+            return
+
+        if policy == "WEIGHTED_MANUAL":
+            ha_pct = clamp_percent(self.sld_nb_oiii_manual_ha.value())
+            source_note = f"project lists {ha_count} Ha/OIII and {sii_count} SII/OIII OIII source lights"
+        else:
+            ha_pct = round((ha_count / total) * 100)
+            source_note = f"from {ha_count}:{sii_count} listed OIII source lights"
+        self.lbl_nb_oiii_weights.setText(
+            f"Estimated blend: Ha/OIII {ha_pct}% / SII/OIII {100 - ha_pct}% ({source_note})."
+        )
+
+    def _update_nb_oiii_manual_label(self, *_):
+        ha_weight = clamp_percent(self.sld_nb_oiii_manual_ha.value())
+        self.lbl_nb_oiii_manual.setText(f"Ha/OIII {ha_weight}% / SII/OIII {100 - ha_weight}%")
+        if hasattr(self, "lbl_nb_oiii_weights"):
+            self._update_nb_oiii_weights_label()
+
+    def _on_nb_oiii_policy_changed(self, *_):
+        self._update_nb_oiii_manual_label()
+        manual_enabled = (
+            self.chk_nb_enabled.isChecked()
+            and self._selected_nb_oiii_policy() == "WEIGHTED_MANUAL"
+        )
+        self.nb_oiii_manual_widget.setEnabled(manual_enabled)
+        self._update_nb_oiii_weights_label()
 
     def _on_nb_broadband_toggled(self, *_):
         enabled = bool(self.chk_nb_enabled.isChecked() and self.chk_nb_use_osc_broadband.isChecked())
@@ -5216,6 +5563,13 @@ class ProjectWidget(QtWidgets.QWidget):
             self.cmb_nb_final_framing.setCurrentIndex(
                 framing_tokens.index(framing_mode) if framing_mode in framing_tokens else 0
             )
+            oiii_policy = normalize_nb_oiii_combine_policy(getattr(p, "nb_oiii_merge_policy", None))
+            oiii_policy_tokens = [token for _label, token in NB_OIII_COMBINE_OPTIONS]
+            self.cmb_nb_oiii_combine.setCurrentIndex(
+                oiii_policy_tokens.index(oiii_policy) if oiii_policy in oiii_policy_tokens else 0
+            )
+            self.sld_nb_oiii_manual_ha.setValue(clamp_percent(getattr(p, "nb_oiii_manual_ha_weight", 50)))
+            self._on_nb_oiii_policy_changed()
             self.chk_nb_use_osc_broadband.setChecked(bool(getattr(p, "nb_use_osc_broadband", False)))
             self.chk_nb_luminance_combine.setChecked(bool(getattr(p, "nb_luminance_combine", False)))
             self._on_nb_toggled(self.chk_nb_enabled.isChecked())
@@ -5345,8 +5699,13 @@ class ProjectWidget(QtWidgets.QWidget):
             p.nb_final_framing_mode = NB_FINAL_FRAMING_OPTIONS[framing_index][1]
         else:
             p.nb_final_framing_mode = "MIN"
+        oiii_policy_index = self.cmb_nb_oiii_combine.currentIndex()
+        if 0 <= oiii_policy_index < len(NB_OIII_COMBINE_OPTIONS):
+            p.nb_oiii_merge_policy = NB_OIII_COMBINE_OPTIONS[oiii_policy_index][1]
+        else:
+            p.nb_oiii_merge_policy = "MERGE_ALL"
+        p.nb_oiii_manual_ha_weight = clamp_percent(self.sld_nb_oiii_manual_ha.value())
         p.nb_resample_mode = "ha"
-        p.nb_oiii_merge_policy = "merge_all"
         p.nb_drizzle_policy = "disabled"
         p.nb_use_osc_broadband = self.chk_nb_use_osc_broadband.isChecked()
         p.nb_luminance_combine = self.chk_nb_luminance_combine.isChecked()
