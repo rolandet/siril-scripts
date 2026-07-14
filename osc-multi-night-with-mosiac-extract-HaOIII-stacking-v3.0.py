@@ -6274,7 +6274,7 @@ class ProjectWidget(QtWidgets.QWidget):
             "has_raw_flats": has_raw_flats,
         }
 
-    def _validate_calibration_or_warn(self, p) -> bool:
+    def _validate_calibration_or_warn(self, p, *, show_nb_fallback_notice: bool = True) -> bool:
         """
         Return True if calibration coverage is sufficient (or user accepted proceeding),
         False if the user cancels.
@@ -6372,7 +6372,11 @@ class ProjectWidget(QtWidgets.QWidget):
                 )
                 return False
 
-            if not has_sii_oiii:
+            if (
+                not has_sii_oiii
+                and palette == "SHO_WITH_HOO_FALLBACK"
+                and show_nb_fallback_notice
+            ):
                 self._info(
                     "No SII/OIII lights were found. The generated narrowband script will use HOO fallback "
                     "from the Ha/OIII data.",
@@ -6535,7 +6539,7 @@ class ProjectWidget(QtWidgets.QWidget):
         try:
             self.push_to_model()  # copy UI → model (must NOT clear _dirty)
             p = self.project
-            proceed = self._validate_calibration_or_warn(p)
+            proceed = self._validate_calibration_or_warn(p, show_nb_fallback_notice=True)
             if not proceed:
                 return         
             # --- NEW: warn if any mosaic panels have no lights ---
@@ -6601,7 +6605,7 @@ class ProjectWidget(QtWidgets.QWidget):
         if not script_path.exists():
             QtWidgets.QMessageBox.warning(self, "Run", "Script not found. Click 'Build Siril Script' first.")
             return
-        proceed = self._validate_calibration_or_warn(p)
+        proceed = self._validate_calibration_or_warn(p, show_nb_fallback_notice=False)
         if not proceed:
             return
         self.lbl_run_mode.setText("Run mode: deciding…")
