@@ -14,7 +14,7 @@ What's inside:
 - Drizzle workflow per Siril 1.4 docs:
     * Drizzle ON: NO -debayer during calibrate; register (-layer=0 [+ -2pass]); seqapplyreg (-scale, -drizzle, -pixfrac, -kernel); stack r_*.
     * Drizzle OFF: include -debayer in calibrate; register (-layer=0 [+ -2pass]); stack r_*.
-- Global stack options (rej / wrej / mean + sigma low/high), sigma controls hide for Mean.
+- Global stack options (Winsorized / Sigma / GESDT rejection, Mean, or Median) with method-specific rejection parameters.
 - SSF: requires 1.4.0, setcompress 0, setfindstar reset (start & end), final close.
 - Final save to <project_slug>_final.fit, or <project_slug>_<palette>_final.fit in narrowband mode, and auto-open in Siril.
 - Remove Session (config+name+data) and Remove Data (All Sessions) (data only).
@@ -516,9 +516,11 @@ class Project:
     stack_32bit: bool = False
 
     # Global stacking options
-    stack_method: str = "rej"     # "rej", "wrej", "mean"
+    stack_method: str = "rej"     # UI label or legacy token; "rej" defaults to Winsorized
     reject_sigma_low: float = 3.0
     reject_sigma_high: float = 3.0
+    gesdt_outliers: float = 0.3
+    gesdt_significance: float = 0.05
 
     # Pack sequences
     pack_sequences_mode: str = "off"  # off | fitseq | ser | auto
@@ -537,15 +539,17 @@ class Project:
     mosaic_canvas_scale: float = 1.0                # 0.25–4.0
     mosaic_registration_mode: str = "Two-pass"      # "Two-pass" | "One-pass"
 
-    # Mosaic-stage stacking method (independent of per-panel method)
-    mosaic_stack_method: str = "mean"               # "mean" | "wrej" | "rej" | "median"
+    # Legacy mosaic-stage field retained for project-file compatibility; follows the global method.
+    mosaic_stack_method: str = "mean"               # mirrors the global stack method
 
     # Normalization / blending
     panel_background_extraction: bool = True
     mosaic_maximize_framing: bool = True          # apply max framing in Phase 2 (seqapplyreg) and stack -maximize
     mosaic_overlap_norm: bool = True              # normalize on overlaps during mosaic stacking
     mosaic_feather_px: int = 50
-    link_feather_to_overlap: bool = False
+    # Most capture applications describe mosaic geometry as an overlap percentage.
+    # Derive Siril's pixel feathering from that value unless the user opts into manual mode.
+    link_feather_to_overlap: bool = True
     # Drizzle scope (mosaic): apply drizzle during per-panel registration (Phase 1)
     mosaic_drizzle_per_panel: bool = False
 
@@ -599,6 +603,8 @@ class Project:
             "stack_method": self.stack_method,
             "reject_sigma_low": self.reject_sigma_low,
             "reject_sigma_high": self.reject_sigma_high,
+            "gesdt_outliers": self.gesdt_outliers,
+            "gesdt_significance": self.gesdt_significance,
             "stack_32bit": self.stack_32bit,  # <-- add
             "pack_sequences_mode": self.pack_sequences_mode,
             "pack_threshold": int(self.pack_threshold),            
@@ -669,6 +675,8 @@ class Project:
         p.stack_method = d.get("stack_method", "rej")
         p.reject_sigma_low = float(d.get("reject_sigma_low", 3.0))
         p.reject_sigma_high = float(d.get("reject_sigma_high", 3.0))
+        p.gesdt_outliers = float(d.get("gesdt_outliers", 0.3))
+        p.gesdt_significance = float(d.get("gesdt_significance", 0.05))
         p.stack_32bit = bool(d.get("stack_32bit", False))  # <-- add
         p.pack_sequences_mode = (d.get("pack_sequences_mode") or "off").lower()
         p.pack_threshold = int(d.get("pack_threshold", 2000))
@@ -689,7 +697,7 @@ class Project:
         p.mosaic_maximize_framing = bool(d.get("mosaic_maximize_framing", True))
         p.mosaic_overlap_norm     = bool(d.get("mosaic_overlap_norm", False))
         p.mosaic_feather_px       = int(d.get("mosaic_feather_px", 50))
-        p.link_feather_to_overlap = bool(d.get("link_feather_to_overlap", False))
+        p.link_feather_to_overlap = bool(d.get("link_feather_to_overlap", True))
 
         p.mosaic_drizzle_per_panel= bool(d.get("mosaic_drizzle_per_panel", False))
 
@@ -815,72 +823,146 @@ def get_siril_version(siril_path: str) -> Optional[Tuple[int, int, int]]:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 def _read_fits_size_quick(path: str) -> tuple[int, int] | tuple[None, None]:
-    """Read NAXIS1/NAXIS2 from a FITS file header without external deps.
-    Returns (width, height) or (None, None) if unavailable/invalid."""
+    """Read image dimensions from standard or tile-compressed FITS headers.
+
+    This dependency-free reader walks FITS HDUs, accepts NAXIS1/NAXIS2 from
+    primary/image HDUs, and accepts ZNAXIS1/ZNAXIS2 from FPACK compressed-image
+    table extensions. It never reads or decompresses pixel data.
+    """
+
+    def parse_card_value(card: str):
+        eq = card.find("=")
+        if eq < 0:
+            return None
+        value = card[eq + 1:].split("/", 1)[0].strip()
+        if value.startswith("'") and "'" in value[1:]:
+            return value[1:value.find("'", 1)].strip()
+        if value in ("T", "F"):
+            return value == "T"
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
+    def read_header(stream) -> dict | None:
+        header: dict = {}
+        # Protect the UI from malformed files with an unterminated header.
+        for _block_index in range(256):
+            block = stream.read(2880)
+            if len(block) != 2880:
+                return None
+            for offset in range(0, 2880, 80):
+                card = block[offset:offset + 80].decode("ascii", "ignore")
+                key = card[:8].strip()
+                if key == "END":
+                    return header
+                if key:
+                    header[key] = parse_card_value(card)
+        return None
+
+    def positive_int(header: dict, key: str) -> int | None:
+        try:
+            value = int(header.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     try:
-        with open(path, "rb") as f:
-            # Read a few header blocks (each 2880 bytes = 36 cards of 80 bytes)
-            data = f.read(2880 * 4)
-        if not data:
-            return (None, None)
-        naxis1 = naxis2 = None
-        # Iterate 80-char cards
-        for i in range(0, len(data), 80):
-            card = data[i:i+80]
-            try:
-                s = card.decode("ascii", "ignore")
-            except Exception:
-                continue
-            key = s[:8].strip()
-            if key == "END":
-                break
-            if key in ("NAXIS1", "NAXIS2"):
-                # Expect a ' = ' then a number; be tolerant of spacing
-                # Example: 'NAXIS1  =                3008'
-                eq = s.find("=")
-                if eq != -1:
-                    val_part = s[eq+1:].strip()
-                    # strip comment if present
-                    if "/" in val_part:
-                        val_part = val_part.split("/", 1)[0].strip()
-                    try:
-                        val = int(val_part)
-                        if key == "NAXIS1": naxis1 = val
-                        else: naxis2 = val
-                    except Exception:
-                        pass
-            # quick exit if both found
-            if naxis1 is not None and naxis2 is not None:
-                return (naxis1, naxis2)
-        return (naxis1, naxis2)
-    except Exception:
-        return (None, None)
+        with open(path, "rb") as stream:
+            for _hdu_index in range(32):
+                header = read_header(stream)
+                if header is None:
+                    break
+
+                zwidth = positive_int(header, "ZNAXIS1")
+                zheight = positive_int(header, "ZNAXIS2")
+                if bool(header.get("ZIMAGE", False)) and zwidth and zheight:
+                    return (zwidth, zheight)
+
+                xtension = str(header.get("XTENSION", "") or "").strip().upper()
+                width = positive_int(header, "NAXIS1")
+                height = positive_int(header, "NAXIS2")
+                # NAXIS1/NAXIS2 describe table layout for TABLE/BINTABLE HDUs,
+                # not image geometry. Accept them only for image-like HDUs.
+                if width and height and xtension not in ("TABLE", "BINTABLE"):
+                    return (width, height)
+
+                try:
+                    naxis = max(0, int(header.get("NAXIS", 0) or 0))
+                    bitpix = abs(int(header.get("BITPIX", 0) or 0))
+                    pcount = max(0, int(header.get("PCOUNT", 0) or 0))
+                    gcount = max(1, int(header.get("GCOUNT", 1) or 1))
+                except (TypeError, ValueError):
+                    break
+
+                element_count = 0
+                if naxis > 0:
+                    element_count = 1
+                    for axis in range(1, naxis + 1):
+                        try:
+                            axis_size = max(0, int(header.get(f"NAXIS{axis}", 0) or 0))
+                        except (TypeError, ValueError):
+                            axis_size = 0
+                        element_count *= axis_size
+                data_bytes = (bitpix // 8) * gcount * (pcount + element_count)
+                padded_bytes = ((data_bytes + 2879) // 2880) * 2880
+                if padded_bytes:
+                    stream.seek(padded_bytes, os.SEEK_CUR)
+    except (OSError, ValueError):
+        pass
+    return (None, None)
 
 
-def _find_any_light_path(p) -> str | None:
-    """Return an existing light FITS path from the project config, or None."""
-    sessions = getattr(p, "sessions", []) or []
-    for sess in sessions:
-        # panel-level lists first (mosaic)
-        for pan in getattr(sess, "panels", []) or []:
-            for key in NB_GROUP_KEYS:
-                group = getattr(pan, key, None)
-                for fp in getattr(group, "lights", []) or []:
-                    if fp and Path(fp).is_file():
-                        return fp
-            for fp in getattr(pan, "lights", []) or []:
-                if fp and Path(fp).is_file():
-                    return fp
-        # session-level fallback (non-mosaic)
-        for key in NB_GROUP_KEYS:
-            group = getattr(sess, key, None)
-            for fp in getattr(group, "lights", []) or []:
-                if fp and Path(fp).is_file():
-                    return fp
-        for fp in getattr(sess, "lights", []) or []:
-            if fp and Path(fp).is_file():
-                return fp
+def _light_path_candidates(owner) -> list[str]:
+    """Return configured OSC and narrowband light paths in priority order."""
+    candidates = [str(fp) for fp in (getattr(owner, "lights", []) or []) if fp]
+    for key in NB_GROUP_KEYS:
+        group = NarrowbandFrameSet.from_dict(getattr(owner, key, None))
+        candidates.extend(str(fp) for fp in (getattr(group, "lights", []) or []) if fp)
+    return candidates
+
+
+def _first_readable_light_geometry(paths) -> tuple[str, int, int] | None:
+    """Return the first existing light with readable FITS image geometry."""
+    for fp in paths:
+        if not fp or not Path(fp).is_file():
+            continue
+        width, height = _read_fits_size_quick(str(fp))
+        if width and height:
+            return (str(fp), int(width), int(height))
     return None
+
+
+def _mosaic_light_path_candidates(p) -> list[tuple[str, list[str]]]:
+    """Return candidate light paths for every populated mosaic panel/session."""
+    candidates_by_owner: list[tuple[str, list[str]]] = []
+    for sess in getattr(p, "sessions", []) or []:
+        panels = getattr(sess, "panels", []) or []
+        if panels:
+            for panel in panels:
+                paths = _light_path_candidates(panel)
+                if paths:
+                    label = f"{getattr(sess, 'name', 'Session')} / {getattr(panel, 'panel_id', 'Panel')}"
+                    candidates_by_owner.append((label, paths))
+        else:
+            paths = _light_path_candidates(sess)
+            if paths:
+                candidates_by_owner.append((getattr(sess, "name", "Session"), paths))
+    return candidates_by_owner
+
+
+def calculate_mosaic_feather_px(width: int, height: int, overlap_percent: float) -> int:
+    """Convert capture-plan overlap into Siril feathering pixels.
+
+    Feather half of the overlap band, preserving the historical 20-300 px clamp
+    for non-zero overlaps. A zero-percent overlap produces zero feathering.
+    """
+    short_edge = min(max(0, int(width)), max(0, int(height)))
+    overlap_percent = max(0.0, float(overlap_percent))
+    if short_edge <= 0 or overlap_percent <= 0:
+        return 0
+    overlap_px = round(short_edge * overlap_percent / 100.0)
+    return max(20, min(300, round(overlap_px * 0.5)))
 
 # -----------------------------
 # Siril console bridge
@@ -1016,14 +1098,8 @@ class SirilCommandBuilder:
 
     def _stack_cmd(self, seq_name: str, *, norm="addscale", out="stacked",
                 rgb_equal=False, output_norm=True, nonorm=False, use_32b=False) -> str:
-        lo  = float(self.project.reject_sigma_low or 3.0)
-        hi  = float(self.project.reject_sigma_high or 3.0)
-
         # Reuse the same mapping used everywhere else
-        parts, _ = map_stack_method(
-            self.project.stack_method or "Winsorized Rejection",
-            lo, hi
-        )
+        parts, _ = map_project_stack_method(self.project)
 
         opts = []
         if nonorm:     opts.append("-nonorm")
@@ -1381,9 +1457,7 @@ class SirilCommandBuilder:
         else:
             L.append(f"seqapplyreg {prefix}")
 
-        lo = float(getattr(p, "reject_sigma_low", 3.0) or 3.0)
-        hi = float(getattr(p, "reject_sigma_high", 3.0) or 3.0)
-        parts, _ = map_stack_method(p.stack_method, lo, hi)
+        parts, _ = map_project_stack_method(p)
         cmd = ["stack", f"r_{prefix}_"] + parts + ["-norm=addscale"]
         if bool(getattr(p, "mosaic_maximize_framing", True)):
             cmd.append("-maximize")
@@ -1608,9 +1682,7 @@ class SirilCommandBuilder:
         else:
             L.append(f"seqapplyreg {prefix}")
 
-        lo = float(getattr(p, "reject_sigma_low", 3.0) or 3.0)
-        hi = float(getattr(p, "reject_sigma_high", 3.0) or 3.0)
-        parts, _ = map_stack_method(p.stack_method, lo, hi)
+        parts, _ = map_project_stack_method(p)
         cmd = ["stack", f"r_{prefix}_"] + parts + ["-norm=addscale"]
         if bool(getattr(p, "mosaic_maximize_framing", True)):
             cmd.append("-maximize")
@@ -2264,7 +2336,20 @@ class SirilCommandBuilder:
             L.append("# Drizzle: OFF")
         L.append(f"# Background Extraction: {'ON' if p.background_extraction_enabled else 'OFF'}")
         L.append(f"# 2-pass registration: {'ON' if p.two_pass else 'OFF'}")
-        L.append(f"# Global stack method: {p.stack_method} (low={p.reject_sigma_low:g}, high={p.reject_sigma_high:g})")
+        if is_gesdt_stack_method(p.stack_method):
+            outliers, significance = normalized_gesdt_parameters(
+                getattr(p, "gesdt_outliers", 0.3),
+                getattr(p, "gesdt_significance", 0.05),
+            )
+            L.append(
+                f"# Global stack method: {p.stack_method} "
+                f"(outliers={outliers:g}, significance={significance:g})"
+            )
+        else:
+            L.append(
+                f"# Global stack method: {p.stack_method} "
+                f"(low={p.reject_sigma_low:g}, high={p.reject_sigma_high:g})"
+            )
         L.append("")
 
         # Compression control
@@ -2862,10 +2947,6 @@ class SirilCommandBuilder:
         # --- End Mosaic Phase 1 (all panels calibrated, registered & stacked) ---
         # Begin Phase 2: stitch per-panel finals into the mosaic
         # Map UI selections to tokens/flags for the Phase 2 helper
-        two_pass = (str(getattr(p, "mosaic_registration_mode", "")).lower().startswith("two"))
-        mosaic_method_token = (getattr(p, "stack_method", "rej") or "rej").lower()
-        sigma_lo = float(getattr(p, "reject_sigma_low", 3.0) or 3.0)
-        sigma_hi = float(getattr(p, "reject_sigma_high", 3.0) or 3.0)
         feather_px = int(getattr(p, "mosaic_feather_px", 0) or 0)
         maximize_framing = bool(getattr(p, "mosaic_maximize_framing", True))
         overlap_norm = bool(getattr(p, "mosaic_overlap_norm", False))
@@ -2883,9 +2964,7 @@ class SirilCommandBuilder:
             # Phase 1B temporarily disables compression for final per-panel stacks only.
             set_comp(1 if want_fz else 0)
 
-            lo = float(getattr(p, "reject_sigma_low", 3.0) or 3.0)
-            hi = float(getattr(p, "reject_sigma_high", 3.0) or 3.0)
-            parts, _ = map_stack_method(getattr(p, "stack_method", "Winsorized Rejection"), lo, hi)
+            parts, _ = map_project_stack_method(p)
 
             if len(seqs) == 1:
                 # Single session: no merge, no re-register — stack the existing registered seq
@@ -3047,9 +3126,7 @@ def emit_phase2_mosaic(
 
     # Ensure final outputs are uncompressed
 
-    lo = float(getattr(p, "reject_sigma_low", 3.0) or 3.0)
-    hi = float(getattr(p, "reject_sigma_high", 3.0) or 3.0)
-    parts, _ = map_stack_method(p.stack_method, lo, hi)
+    parts, _ = map_project_stack_method(p)
 
     cmd = ["stack", "r_mosaic_"]
     cmd += parts
@@ -3091,11 +3168,59 @@ def emit_phase2_mosaic(
     # Do not close; keep the mosaic open in Siril
     # L.append("close")
 
-def map_stack_method(ui_method: str, sigma_lo: float, sigma_hi: float):
+GESDT_METHOD_NAMES = {
+    "gesdt rejection",
+    "gesdt",
+    "generalized extreme studentized deviate test",
+    "generalized",
+    "rej generalized",
+    "rej_generalized",
+}
+
+
+def is_gesdt_stack_method(ui_method: str) -> bool:
+    return (ui_method or "").strip().lower() in GESDT_METHOD_NAMES
+
+
+def normalized_gesdt_parameters(outliers, significance) -> tuple[float, float]:
+    """Return Siril-safe GESDT parameters, falling back to Siril's defaults."""
+    try:
+        outliers = float(outliers)
+    except (TypeError, ValueError):
+        outliers = 0.3
+    try:
+        significance = float(significance)
+    except (TypeError, ValueError):
+        significance = 0.05
+    if not 0.0 < outliers < 1.0:
+        outliers = 0.3
+    if not 0.0 < significance < 1.0:
+        significance = 0.05
+    return outliers, significance
+
+
+def map_project_stack_method(project):
+    return map_stack_method(
+        getattr(project, "stack_method", None) or "Winsorized Rejection",
+        float(getattr(project, "reject_sigma_low", 3.0) or 3.0),
+        float(getattr(project, "reject_sigma_high", 3.0) or 3.0),
+        getattr(project, "gesdt_outliers", 0.3),
+        getattr(project, "gesdt_significance", 0.05),
+    )
+
+
+def map_stack_method(
+    ui_method: str,
+    sigma_lo: float,
+    sigma_hi: float,
+    gesdt_outliers: float = 0.3,
+    gesdt_significance: float = 0.05,
+):
     """
-    Returns (parts, needs_sigmas).
+    Returns (command parts, needs_rejection_parameters).
     Examples:
       ["rej", "sigma", "3", "3"]  -> Sigma Rejection
+      ["rej", "generalized", "0.3", "0.05"] -> GESDT Rejection
       ["rej", "3", "3"]           -> Winsorized Rejection (default)
       ["mean", "none"]            -> Mean
       ["med"]                     -> Median
@@ -3105,6 +3230,10 @@ def map_stack_method(ui_method: str, sigma_lo: float, sigma_hi: float):
     # Accept either labels or old tokens, just in case
     if ui in ("sigma rejection", "sigma", "sigma clipping", "rej sigma", "rej_sigma"):
         return ["rej", "sigma", f"{sigma_lo:g}", f"{sigma_hi:g}"], True
+
+    if ui in GESDT_METHOD_NAMES:
+        outliers, significance = normalized_gesdt_parameters(gesdt_outliers, gesdt_significance)
+        return ["rej", "generalized", f"{outliers:g}", f"{significance:g}"], True
 
     if ui in ("winsorized rejection", "winsorized", "rejection", "wrej", "rej winsorized", "rej_winsorized"):
         # Simple 'rej' uses Siril's default winsorized rejection
@@ -4089,13 +4218,24 @@ class ProjectWidget(QtWidgets.QWidget):
         self.cb_stack_method.addItems([
             "Winsorized Rejection",  # default
             "Sigma Rejection",
+            "GESDT Rejection",
             "Mean",
             "Median"
         ])
         self.cb_stack_method.setCurrentIndex(0)
+        self.cb_stack_method.setToolTip(
+            "Average stacking with optional pixel rejection. GESDT uses Siril's Generalized Extreme "
+            "Studentized Deviate Test with dedicated outlier-fraction and significance parameters."
+        )
 
         # map UI index -> Siril token
-        self._stack_method_map = {0: "rej", 1: "rej", 2: "wrej", 3: "mean", 4: "median"}
+        self._stack_method_map = {
+            0: "rej",
+            1: "rej sigma",
+            2: "rej generalized",
+            3: "mean",
+            4: "median",
+        }
         self._stack_method_rev = {v: k for k, v in self._stack_method_map.items()}
         self.cb_stack_method.setCurrentIndex(0)  # default to Rejection
 
@@ -4106,6 +4246,26 @@ class ProjectWidget(QtWidgets.QWidget):
         self.lbl_sigma_high = QtWidgets.QLabel("Sigma High")
         self.dbl_sigma_high = QtWidgets.QDoubleSpinBox()
         self.dbl_sigma_high.setRange(0.1, 10.0); self.dbl_sigma_high.setSingleStep(0.1); self.dbl_sigma_high.setValue(3.0)
+
+        self.lbl_gesdt_outliers = QtWidgets.QLabel("Outlier Fraction")
+        self.dbl_gesdt_outliers = QtWidgets.QDoubleSpinBox()
+        self.dbl_gesdt_outliers.setDecimals(3)
+        self.dbl_gesdt_outliers.setRange(0.001, 0.999)
+        self.dbl_gesdt_outliers.setSingleStep(0.01)
+        self.dbl_gesdt_outliers.setValue(0.3)
+        self.dbl_gesdt_outliers.setToolTip(
+            "Maximum fraction of samples GESDT may treat as outliers. Siril default: 0.3."
+        )
+
+        self.lbl_gesdt_significance = QtWidgets.QLabel("Significance")
+        self.dbl_gesdt_significance = QtWidgets.QDoubleSpinBox()
+        self.dbl_gesdt_significance.setDecimals(3)
+        self.dbl_gesdt_significance.setRange(0.001, 0.999)
+        self.dbl_gesdt_significance.setSingleStep(0.01)
+        self.dbl_gesdt_significance.setValue(0.05)
+        self.dbl_gesdt_significance.setToolTip(
+            "GESDT statistical significance level. Siril default: 0.05."
+        )
 
         # Under Stacking
         self.cb_stack_32 = QtWidgets.QCheckBox("32-bit Output for Final Stack")
@@ -4242,6 +4402,7 @@ class ProjectWidget(QtWidgets.QWidget):
         # NEW: Panel editor (right tab)
         self.panel_editor = PanelEditor()
         self.panel_editor.changed.connect(self.update_current_panel)
+        self.panel_editor.changed.connect(self._on_frame_sources_changed)
         self.panel_editor.changed.connect(self.mark_dirty)
         self.panel_editor.changed.connect(self._on_nb_oiii_policy_changed)
         self.panel_editor.copy_cals_from_first_requested.connect(self._on_copy_cals_from_first_panel)
@@ -4327,6 +4488,9 @@ class ProjectWidget(QtWidgets.QWidget):
         srow.addWidget(self.lbl_sigma_low);  srow.addWidget(self.dbl_sigma_low)
         srow.addSpacing(12)
         srow.addWidget(self.lbl_sigma_high); srow.addWidget(self.dbl_sigma_high)
+        srow.addWidget(self.lbl_gesdt_outliers); srow.addWidget(self.dbl_gesdt_outliers)
+        srow.addSpacing(12)
+        srow.addWidget(self.lbl_gesdt_significance); srow.addWidget(self.dbl_gesdt_significance)
         srow.addStretch(1)
         stack_form.addRow("", srow)
         optrow = QtWidgets.QHBoxLayout()
@@ -4421,25 +4585,31 @@ class ProjectWidget(QtWidgets.QWidget):
             "Useful for evening out background/brightness differences between panels."
         )
         mosaic_form.addWidget(self.chk_mosaic_bg, 5, 0, 1, 4)
-        mosaic_form.addWidget(self.chk_mosaic_maximize, 7, 2, 1, 2)
-        mosaic_form.addWidget(self.chk_mosaic_overlap_norm, 7, 0, 1, 2)
+        mosaic_form.addWidget(self.chk_mosaic_maximize, 8, 2, 1, 2)
+        mosaic_form.addWidget(self.chk_mosaic_overlap_norm, 8, 0, 1, 2)
 
-        mosaic_form.addWidget(QtWidgets.QLabel("Borders Feathering:"), 6, 0)
+        mosaic_form.addWidget(QtWidgets.QLabel("Border Feathering:"), 6, 0)
         self.sp_mosaic_feather = QtWidgets.QSpinBox(); self.sp_mosaic_feather.setRange(0, 500); self.sp_mosaic_feather.setSuffix(" px"); self.sp_mosaic_feather.setValue(50)
         mosaic_form.addWidget(self.sp_mosaic_feather, 6, 1)
-        self.chk_link_feather = QtWidgets.QCheckBox("Link feather to Overlap %")
+        self.chk_link_feather = QtWidgets.QCheckBox("Auto-calculate feathering from Overlap %")
+        self.chk_link_feather.setChecked(True)
         self.chk_link_feather.setToolTip(
-            "When enabled and Prepare Working Directory is run succesfully, Borders Feathering (px) is estimated from Overlap % and frame size.\n"
-            "Disable to set feathering manually (default 50 px)."
+            "Uses the mosaic overlap percentage and the short edge of a representative light frame\n"
+            "to calculate Siril's border feathering in pixels. The value updates automatically;\n"
+            "disable this option to enter feathering manually."
         )
         mosaic_form.addWidget(self.chk_link_feather, 6, 2, 1, 2)
+        self.lbl_mosaic_feather_status = QtWidgets.QLabel()
+        self.lbl_mosaic_feather_status.setWordWrap(True)
+        self.lbl_mosaic_feather_status.setStyleSheet("color: #777777;")
+        mosaic_form.addWidget(self.lbl_mosaic_feather_status, 7, 0, 1, 4)
 
         self.chk_mosaic_drizzle_panel = QtWidgets.QCheckBox("Drizzle per panel")
         self.chk_mosaic_drizzle_panel.setToolTip(
             "Enable drizzle during per-panel registration.\n"
             "Selecting this option forces Two-pass registration (required for drizzle)."
         )
-        mosaic_form.addWidget(self.chk_mosaic_drizzle_panel, 8, 0, 1, 2)
+        mosaic_form.addWidget(self.chk_mosaic_drizzle_panel, 9, 0, 1, 2)
 
         # --- Grid-driven panel management ---
         self.chk_auto_grid = QtWidgets.QCheckBox("Auto-manage panels by grid (advanced)")
@@ -4461,11 +4631,11 @@ class ProjectWidget(QtWidgets.QWidget):
         grid_line.addWidget(QtWidgets.QLabel("Names:"))
         grid_line.addWidget(self.cmb_name_scheme)
 
-        mosaic_form.addWidget(self.chk_auto_grid, 8, 2, 1, 2)
-        mosaic_form.addLayout(grid_line, 9, 0, 1, 4)
+        mosaic_form.addWidget(self.chk_auto_grid, 9, 2, 1, 2)
+        mosaic_form.addLayout(grid_line, 10, 0, 1, 4)
 
         self.btn_preview_mosaic = QtWidgets.QPushButton("Preview Mosaic Layout…")
-        mosaic_form.addWidget(self.btn_preview_mosaic, 10, 0, 1, 4)
+        mosaic_form.addWidget(self.btn_preview_mosaic, 11, 0, 1, 4)
 
         # ========== Narrowband Extraction (boxed) ==========
         nb_box = QtWidgets.QGroupBox("Ha/SII and OIII Extraction")
@@ -4617,10 +4787,12 @@ class ProjectWidget(QtWidgets.QWidget):
         self.cb_two_pass.toggled.connect(self.mark_dirty)
         self.cb_background_extraction.toggled.connect(self.mark_dirty)
 
-        self.cb_stack_method.currentIndexChanged.connect(self._toggle_sigma_by_method)
+        self.cb_stack_method.currentIndexChanged.connect(self._update_stack_parameter_controls)
         self.cb_stack_method.currentIndexChanged.connect(self.mark_dirty)
         self.dbl_sigma_low.valueChanged.connect(self.mark_dirty)
         self.dbl_sigma_high.valueChanged.connect(self.mark_dirty)
+        self.dbl_gesdt_outliers.valueChanged.connect(self.mark_dirty)
+        self.dbl_gesdt_significance.valueChanged.connect(self.mark_dirty)
         self.cb_stack_32.toggled.connect(self.mark_dirty)
         self.cb_compress.toggled.connect(self.mark_dirty)
 
@@ -4652,6 +4824,7 @@ class ProjectWidget(QtWidgets.QWidget):
 
         self.sessions_list.currentRowChanged.connect(self.load_selected_session)
         self.session_editor.changed.connect(self.update_current_session)
+        self.session_editor.changed.connect(self._on_frame_sources_changed)
         self.session_editor.changed.connect(self.mark_dirty)
         self.session_editor.changed.connect(self._on_nb_oiii_policy_changed)
 
@@ -4673,9 +4846,10 @@ class ProjectWidget(QtWidgets.QWidget):
         self.cmb_mosaic_reg.currentIndexChanged.connect(self._sync_drizzle_two_pass_locks)
         # When overlap % changes, recompute feather if linked
         self.sp_mosaic_overlap.valueChanged.connect(self._on_overlap_pct_changed)
-        # When link checkbox toggled, recompute once immediately
-        self.chk_link_feather.toggled.connect(self._on_overlap_pct_changed)
+        # Keep automatic/manual feathering state and value synchronized.
+        self.chk_link_feather.toggled.connect(self._on_feather_auto_toggled)
         # Mark dirty when user changes feather manually
+        self.sp_mosaic_feather.valueChanged.connect(self._on_manual_feather_changed)
         self.sp_mosaic_feather.valueChanged.connect(self.mark_dirty)        
         self.chk_mosaic_bg.toggled.connect(self.mark_dirty)
         self.chk_mosaic_maximize.toggled.connect(self.mark_dirty)
@@ -4717,7 +4891,7 @@ class ProjectWidget(QtWidgets.QWidget):
                 self._suspend_dirty = False
 
         self._toggle_drizzle_opts(self.project.drizzle_enabled)
-        self._toggle_sigma_by_method(self.cb_stack_method.currentIndex())
+        self._update_stack_parameter_controls(self.cb_stack_method.currentIndex())
 
     # ---------------- helpers ----------------
     def _detect_siril_home_dir(self) -> str | None:
@@ -4844,11 +5018,18 @@ class ProjectWidget(QtWidgets.QWidget):
         self.sessions_list.setMaximumHeight(_min_height_for_rows(self.sessions_list, max_rows))
         self.lst_panels.setMaximumHeight(_min_height_for_rows(self.lst_panels, max_rows))
 
-    def _toggle_sigma_by_method(self, idx: int):
-        # sigma needed for first two methods
+    def _update_stack_parameter_controls(self, idx: int):
         needs_sigma = idx in (0, 1)
+        needs_gesdt = idx == 2
         for w in (self.lbl_sigma_low, self.dbl_sigma_low, self.lbl_sigma_high, self.dbl_sigma_high):
             w.setVisible(needs_sigma)
+        for w in (
+            self.lbl_gesdt_outliers,
+            self.dbl_gesdt_outliers,
+            self.lbl_gesdt_significance,
+            self.dbl_gesdt_significance,
+        ):
+            w.setVisible(needs_gesdt)
 
     def _toggle_drizzle_opts(self, enabled: bool):
         for w in (self.lbl_scaling, self.spin_scaling, self.lbl_pixfrac, self.spin_pixfrac, self.lbl_kernel, self.cb_kernel):
@@ -5064,6 +5245,7 @@ class ProjectWidget(QtWidgets.QWidget):
 
         # If per-panel drizzle is enabled, keep forced 2-pass + locks consistent
         self._sync_drizzle_two_pass_locks()
+        self._update_feather_from_overlap()
 
     def _on_add_panel(self):
         if not self.chk_mosaic_enabled.isChecked():
@@ -5211,6 +5393,8 @@ class ProjectWidget(QtWidgets.QWidget):
                 self.panel_editor.set_copy_source_panel(None, enabled=False)
         else:
             self.panel_editor.set_copy_source_panel(None, enabled=False)
+
+        self._update_feather_from_overlap()
 
     def _panel_name_for(self, r: int, c: int) -> str:
         # r, c are 0-based
@@ -5484,28 +5668,170 @@ class ProjectWidget(QtWidgets.QWidget):
         """Enable threshold only when 'Auto when > N' is selected (index 3)."""
         self.pack_thresh.setEnabled(self.pack_mode.currentIndex() == 3)
 
-    def _update_feather_from_overlap(self):
-        if not getattr(self, "chk_mosaic_enabled", None) or not self.chk_mosaic_enabled.isChecked():
-            return
-        # Only adjust when linking is enabled
-        if not self.chk_link_feather.isChecked():
-            return
-        w = int(getattr(self.project, "frame_width", 0) or 0)
-        h = int(getattr(self.project, "frame_height", 0) or 0)
-        if not (w and h):
-            # No frame size yet (e.g., before Prepare); do nothing
-            return
+    def _detect_mosaic_frame_geometry(self, *, force_refresh: bool = False) -> dict:
+        """Inspect representative lights and cache geometry for auto feathering."""
+        candidates_by_owner = _mosaic_light_path_candidates(self.project)
+        signature = tuple(
+            (label, tuple(paths)) for label, paths in candidates_by_owner
+        )
+
+        cached_signature = getattr(self.project, "_mosaic_geometry_signature", None)
+        cached_result = getattr(self.project, "_mosaic_geometry_result", None)
+        if (
+            not force_refresh
+            and signature == cached_signature
+            and isinstance(cached_result, dict)
+        ):
+            return cached_result
+
+        counts: Counter = Counter()
+        unreadable: list[str] = []
+        representative_paths: dict[str, str] = {}
+        for label, paths in candidates_by_owner:
+            geometry = _first_readable_light_geometry(paths)
+            if geometry:
+                fp, width, height = geometry
+                representative_paths[label] = fp
+                counts[(width, height)] += 1
+            else:
+                unreadable.append(label)
+
+        if counts:
+            # Mixed cameras/crops are unusual. Use the smallest short edge
+            # conservatively and make that choice visible in the UI.
+            selected = min(counts, key=lambda size: (min(size), size[0] * size[1]))
+            self.project.frame_width, self.project.frame_height = selected
+        else:
+            selected = None
+            self.project.frame_width = 0
+            self.project.frame_height = 0
+
+        result = {
+            "selected": selected,
+            "counts": counts,
+            "unreadable": unreadable,
+            "representative_count": len(representative_paths),
+            "representative_paths": representative_paths,
+        }
+        self.project._mosaic_geometry_signature = signature
+        self.project._mosaic_geometry_result = result
+        return result
+
+    def _set_feather_status(self, text: str, *, warning: bool = False):
+        self.lbl_mosaic_feather_status.setText(text)
+        color = "#c27c0e" if warning else "#777777"
+        self.lbl_mosaic_feather_status.setStyleSheet(f"color: {color};")
+
+    def _update_feather_from_overlap(
+        self,
+        *,
+        show_error: bool = False,
+        force_geometry_refresh: bool = False,
+    ) -> bool:
+        mosaic_enabled = bool(
+            getattr(self, "chk_mosaic_enabled", None)
+            and self.chk_mosaic_enabled.isChecked()
+        )
+        auto_enabled = bool(self.chk_link_feather.isChecked())
+        self.sp_mosaic_feather.setEnabled(mosaic_enabled and not auto_enabled)
+
+        if not mosaic_enabled:
+            self.sp_mosaic_feather.setSpecialValueText("")
+            self._set_feather_status("")
+            return True
+        if not auto_enabled:
+            self.sp_mosaic_feather.setSpecialValueText("")
+            self._set_feather_status(
+                f"Manual: Siril will use {self.sp_mosaic_feather.value()} px."
+            )
+            return True
+
         overlap_pct = float(self.sp_mosaic_overlap.value())
-        overlap_px  = round(min(w, h) * overlap_pct / 100.0)
-        est_feather = max(20, min(300, round(overlap_px * 0.5)))  # clamp 20–300
-        # Avoid feedback loops
+        if overlap_pct <= 0:
+            self.sp_mosaic_feather.setSpecialValueText("")
+            self.sp_mosaic_feather.blockSignals(True)
+            self.sp_mosaic_feather.setValue(0)
+            self.sp_mosaic_feather.blockSignals(False)
+            self.project.mosaic_feather_px = 0
+            self._set_feather_status("Auto: 0 px (0% overlap).")
+            return True
+
+        geometry = self._detect_mosaic_frame_geometry(force_refresh=force_geometry_refresh)
+        selected = geometry.get("selected")
+        if not selected:
+            message = (
+                "Automatic feathering needs at least one readable FITS light frame. "
+                "Add lights or disable automatic mode and enter a pixel value manually."
+            )
+            self.sp_mosaic_feather.blockSignals(True)
+            self.sp_mosaic_feather.setSpecialValueText("Unavailable")
+            self.sp_mosaic_feather.setValue(0)
+            self.sp_mosaic_feather.blockSignals(False)
+            self.project.mosaic_feather_px = 0
+            self._set_feather_status(message, warning=True)
+            if show_error:
+                QtWidgets.QMessageBox.warning(self, "Automatic Feathering", message)
+            return False
+
+        width, height = selected
+        short_edge = min(width, height)
+        overlap_px = round(short_edge * overlap_pct / 100.0)
+        raw_feather = round(overlap_px * 0.5)
+        est_feather = calculate_mosaic_feather_px(width, height, overlap_pct)
+        self.sp_mosaic_feather.setSpecialValueText("")
         self.sp_mosaic_feather.blockSignals(True)
         self.sp_mosaic_feather.setValue(est_feather)
         self.sp_mosaic_feather.blockSignals(False)
+        self.project.mosaic_feather_px = est_feather
+
+        clamp_note = ""
+        if est_feather != raw_feather:
+            clamp_note = f"; limited to {est_feather} px"
+        status = (
+            f"Auto: {est_feather} px ({overlap_pct:g}% overlap x {short_edge} px / 2; "
+            f"frame {width} x {height}{clamp_note})."
+        )
+
+        counts = geometry.get("counts", Counter())
+        issues: list[str] = []
+        if len(counts) > 1:
+            sizes = ", ".join(
+                f"{w}x{h} ({count})" for (w, h), count in sorted(counts.items())
+            )
+            issues.append(
+                f"Mixed light-frame sizes detected: {sizes}. "
+                "Using the smallest short edge conservatively."
+            )
+        unreadable = geometry.get("unreadable", [])
+        if unreadable:
+            issues.append(
+                "Could not read representative FITS geometry for: " + ", ".join(unreadable) + "."
+            )
+        if issues:
+            warning = " ".join(issues + [status])
+            self._set_feather_status(warning, warning=True)
+            if show_error:
+                QtWidgets.QMessageBox.warning(self, "Mosaic Frame Geometry", warning)
+        else:
+            self._set_feather_status(status)
+        return True
 
     def _on_overlap_pct_changed(self, *_):
         self._update_feather_from_overlap()
         self.mark_dirty()
+
+    def _on_feather_auto_toggled(self, *_):
+        self._update_feather_from_overlap()
+        self.mark_dirty()
+
+    def _on_manual_feather_changed(self, *_):
+        if not self.chk_link_feather.isChecked():
+            self._update_feather_from_overlap()
+
+    def _on_frame_sources_changed(self, *_):
+        if self._loading_session or getattr(self, "_loading_panel", False):
+            return
+        self._update_feather_from_overlap()
 
     def _confirm(self, text: str, title: str = "Please confirm") -> bool:
         """
@@ -5586,10 +5912,16 @@ class ProjectWidget(QtWidgets.QWidget):
             if sm_idx < 0:
                 sm_idx = 0
             self.cb_stack_method.setCurrentIndex(sm_idx)
-            self._toggle_sigma_by_method(sm_idx)
+            self._update_stack_parameter_controls(sm_idx)
 
             self.dbl_sigma_low.setValue(float(p.reject_sigma_low or 3.0))
             self.dbl_sigma_high.setValue(float(p.reject_sigma_high or 3.0))
+            gesdt_outliers, gesdt_significance = normalized_gesdt_parameters(
+                getattr(p, "gesdt_outliers", 0.3),
+                getattr(p, "gesdt_significance", 0.05),
+            )
+            self.dbl_gesdt_outliers.setValue(gesdt_outliers)
+            self.dbl_gesdt_significance.setValue(gesdt_significance)
             self.cb_stack_32.setChecked(bool(getattr(p, "stack_32bit", False)))
             self.cb_compress.setChecked(bool(getattr(p, "compress_intermediates", False)))
 
@@ -5648,7 +5980,7 @@ class ProjectWidget(QtWidgets.QWidget):
             self._sync_drizzle_two_pass_locks()
 
             # sigma visibility
-            self._toggle_sigma_by_method(self.cb_stack_method.currentIndex())
+            self._update_stack_parameter_controls(self.cb_stack_method.currentIndex())
         finally:
             self._suspend_dirty = False
         # Keep them mutually exclusive visually after loading
@@ -5670,10 +6002,12 @@ class ProjectWidget(QtWidgets.QWidget):
         p.two_pass        = self.cb_two_pass.isChecked()
 
         # Store exactly what the user picked in the combobox
-        p.stack_method = self.cb_stack_method.currentText()   # "Winsorized Rejection" | "Sigma Rejection" | "Mean" | "Median"
+        p.stack_method = self.cb_stack_method.currentText()   # Winsorized | Sigma | GESDT | Mean | Median
 
         p.reject_sigma_low   = float(self.dbl_sigma_low.value())
         p.reject_sigma_high  = float(self.dbl_sigma_high.value())
+        p.gesdt_outliers     = float(self.dbl_gesdt_outliers.value())
+        p.gesdt_significance = float(self.dbl_gesdt_significance.value())
         p.stack_32bit        = self.cb_stack_32.isChecked()
         p.compress_intermediates = self.cb_compress.isChecked()
         p.pack_sequences_mode = self.pack_mode.currentText().split()[0].lower()  # off|fitseq|ser|auto
@@ -5980,6 +6314,7 @@ class ProjectWidget(QtWidgets.QWidget):
 
         self.mark_dirty()
         self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+        self._update_feather_from_overlap()
 
     def duplicate_session(self):
         row = self.sessions_list.currentRow()
@@ -5999,6 +6334,7 @@ class ProjectWidget(QtWidgets.QWidget):
     def remove_all_sessions_data(self):
         # Operational cleanup: do not mark project dirty
         was_dirty = getattr(self, "_dirty", False)
+        was_suspended = getattr(self, "_suspend_dirty", False)
         self._suspend_dirty = True
         try:
             self.push_to_model()
@@ -6031,8 +6367,12 @@ class ProjectWidget(QtWidgets.QWidget):
 
             QtWidgets.QMessageBox.information(self, "Remove Data", f"Done.\nOK: {ok}\nFailed: {fail}")
         finally:
-            self._suspend_dirty = False
+            self._suspend_dirty = was_suspended
             self._dirty = was_dirty
+            # Keep the visible status consistent with the restored dirty flag.
+            # In particular, Remove Data must not leave a stale unsaved-changes
+            # message behind when the project was clean before the operation.
+            self.status_message.emit("Project has unsaved changes." if was_dirty else "")
 
     def load_selected_session(self, row: int):
         if 0 <= row < len(self.project.sessions):
@@ -6180,22 +6520,11 @@ class ProjectWidget(QtWidgets.QWidget):
                 self, "Prepare",
                 f"Done.\nOK: {ok}\nFailed: {fail}\n\nLog: {log_path}"
             )
-            # After you've loaded or validated project paths in prepare:
+            # Refresh derived feathering after preparation as an additional safety check.
             try:
-                if not getattr(self.project, "frame_width", 0) or not getattr(self.project, "frame_height", 0):
-                    cand = _find_any_light_path(self.project)
-                    if cand:
-                        w, h = _read_fits_size_quick(cand)
-                        if w and h:
-                            self.project.frame_width = int(w)
-                            self.project.frame_height = int(h)
-                            # (Optional) log to console or status bar so user sees it was detected
-                            print(f"Detected frame size: {w} x {h} from {cand}")
-                            self._update_feather_from_overlap()
-                        else:
-                            print(f"Could not read NAXIS1/2 from first light; feather auto-link will remain manual.")
+                self._update_feather_from_overlap()
             except Exception as e:
-                print(f"Frame-size detection error: {e}")
+                print(f"Automatic feathering refresh error: {e}")
         finally:
             # restore original dirty state and lift the guard
             self._suspend_dirty = False
@@ -6539,6 +6868,15 @@ class ProjectWidget(QtWidgets.QWidget):
         try:
             self.push_to_model()  # copy UI → model (must NOT clear _dirty)
             p = self.project
+            if getattr(p, "mosaic_enabled", False) and getattr(p, "link_feather_to_overlap", True):
+                # Never build with a stale pixel value while automatic mode is selected.
+                if not self._update_feather_from_overlap(
+                    show_error=True,
+                    force_geometry_refresh=True,
+                ):
+                    return
+                self.push_to_model()
+                p = self.project
             proceed = self._validate_calibration_or_warn(p, show_nb_fallback_notice=True)
             if not proceed:
                 return         
@@ -7154,7 +7492,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "OSC Multi-Night Stacking for Siril 1.4 (PyQt6) Version 3.0\n"
             "• Drizzle: Scaling, Pixel Fraction, Kernel\n"
             "• 2-pass registration toggle\n"
-            "• Global stacking options (sigma or winsorized rejection (sigma high and low), mean)\n"
+            "• Global stacking options (winsorized, sigma, or GESDT rejection; mean; median)\n"
             "• Ha/OIII and SII/OIII narrowband extraction with SHO/HSO/HOO output\n"
             "• 32-bit output for final stack and intermediate file compression toggles\n"
             "• Siril console logging via sirilpy\n"

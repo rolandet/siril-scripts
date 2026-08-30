@@ -13,7 +13,7 @@ Use this checklist before considering code changes complete. For documentation-o
 ## Python checks for code changes
 
 - [ ] Run Python syntax checks, for example `python -m py_compile osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`.
-- [ ] Run available unit tests, if any.
+- [ ] Run `python -B -m unittest discover -s tests -p "test_*.py" -v`.
 - [ ] Confirm no hard-coded local-only paths were introduced.
 - [ ] Confirm Windows path handling still works.
 - [ ] Confirm destructive file operations are still scoped to intended working directories.
@@ -43,7 +43,7 @@ Use this checklist before considering code changes complete. For documentation-o
 - [ ] `seqapplyreg`, including drizzle args and `-framing=max`.
 - [ ] `seqsubsky pp_light 1` when background extraction is enabled.
 - [ ] `merge`.
-- [ ] `stack` methods and flags: `rej`, `sigma`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
+- [ ] `stack` methods and flags: `rej`, `sigma`, `generalized 0.3 0.05`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
 - [ ] Mosaic commands: `seqsubsky`, `parse`, `platesolve -force -disto=...`, `seqplatesolve -force -nocache`, `resample`.
 - [ ] `load`, `save`, and `mirrorx -bottomup`.
 
@@ -55,6 +55,12 @@ Use this checklist before considering code changes complete. For documentation-o
 - [ ] Non-mosaic registration behavior is unchanged unless intentionally modified.
 - [ ] Mosaic registration behavior is unchanged unless intentionally modified.
 - [ ] Mosaic mode still disables pack sequences.
+- [ ] New mosaic projects default to automatic feathering from overlap percentage; existing saved manual/automatic choices are preserved.
+- [ ] Automatic feathering updates immediately when overlap or representative light frames change, without requiring preparation, and the pixel field is read-only while automatic mode is enabled.
+- [ ] Automatic feathering uses half of the overlap band on the frame's short edge, returns `0 px` for `0%`, and preserves the `20-300 px` clamp for non-zero overlap.
+- [ ] Script generation recalculates automatic feathering and stops with a clear warning if no readable FITS light geometry is available.
+- [ ] Automatic feathering reads standard FITS and FPACK tile-compressed FITS geometry, and falls through to later lights when an earlier header is unreadable.
+- [ ] Mixed mosaic frame sizes are reported and use the smallest short edge conservatively.
 - [ ] Drizzle per panel still forces two-pass behavior.
 - [ ] Phase 2 mosaic drizzle remains skipped unless the workflow changes from RGB panel finals to mono/CFA sequences.
 - [ ] Non-mosaic background extraction, when enabled, runs after calibration and before registration.

@@ -47,7 +47,6 @@ The Prepare Working Directory action:
 - Attempts symlink first, then hardlink, then copy.
 - Writes a timestamped `prepare_*.log`.
 - Reports progress through Siril console integration when available.
-- Can detect frame size from a FITS header and use it for linked mosaic feathering.
 - Does not intentionally clear or change the project dirty state.
 
 ## Calibration selection and validation
@@ -144,6 +143,7 @@ The UI exposes these stacking methods:
 
 - Winsorized Rejection.
 - Sigma Rejection.
+- GESDT Rejection (Generalized Extreme Studentized Deviate Test).
 - Mean.
 - Median.
 
@@ -151,8 +151,11 @@ Generated stack methods map through `map_stack_method()`:
 
 - Winsorized rejection: `stack ... rej <low> <high>`.
 - Sigma rejection: `stack ... rej sigma <low> <high>`.
+- GESDT rejection: `stack ... rej generalized <outlier_fraction> <significance>`.
 - Mean: `stack ... mean none`.
 - Median: `stack ... med`.
+
+GESDT performs average stacking after rejecting outliers with Siril's Generalized Extreme Studentized Deviate Test. Unlike Winsorized and Sigma rejection, its two command parameters are not sigma thresholds. The UI exposes dedicated `Outlier Fraction` and `Significance` controls, both constrained between 0 and 1, with Siril's defaults of `0.3` and `0.05`. Siril documents GESDT as particularly effective for large datasets containing more than 50 images.
 
 Final stacks can optionally include `-32b`.
 
@@ -179,8 +182,10 @@ Mosaic mode is marked experimental. It supports:
 - Panel background extraction.
 - Maximize framing.
 - Normalize on overlaps.
-- Border feathering in pixels.
-- Optional link between overlap percentage and feathering.
+- Border feathering in pixels, with manual entry available as an override.
+- Automatic feathering from overlap percentage is enabled by default because capture plans such as N.I.N.A. express mosaic overlap as a percentage. The UI shows the derived pixel calculation, refreshes it when lights or overlap change, and validates it again before script generation.
+- The automatic value is half of the overlap band on the frame's short edge, clamped to `20-300 px` for non-zero overlaps; `0%` produces `0 px`.
+- Representative lights are checked across populated panels. Standard FITS and FPACK tile-compressed FITS headers are supported, and later lights are tried if an earlier file is missing or unreadable. Mixed frame sizes are reported and the smallest short edge is used conservatively.
 - Drizzle per panel.
 - Auto-manage panels by grid.
 - Panel name schemes: `A1`, `B2`, etc., or `R1C2`.

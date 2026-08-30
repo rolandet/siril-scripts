@@ -16,9 +16,12 @@ All notable user-facing changes to this project should be documented here.
 - Added a v3.0 `Final NB Framing` selector for final Ha/SII/OIII channel registration, defaulting to common-overlap framing.
 - Added a v3.0 `OIII Combine Policy` selector with the current merge-all behavior as the default, plus advanced auto-weighted and manual-weighted blends of separately stacked Ha/OIII-derived and SII/OIII-derived OIII masters.
 - Added a read-only `OIII Weights` display showing estimated Ha/OIII vs SII/OIII blend percentages from the project light lists.
+- Added `GESDT Rejection` as a global v3.0 stacking option, with dedicated outlier-fraction and significance controls that emit Siril 1.4.4 `stack ... rej generalized <outliers> <significance>` commands.
 
 ### Changed
 
+- Changed v3.0 mosaic feathering to default to `Auto-calculate feathering from Overlap %`, matching the overlap-based planning model used by N.I.N.A. The pixel field is read-only in automatic mode and now displays the calculation and source frame geometry.
+- Automatic mosaic feathering now reads representative light-frame FITS headers as soon as project data is available, without requiring `Prepare Working Directory`. Mixed frame sizes are reported and use the smallest short edge conservatively.
 - Clarified that `README.md` is user-maintained and must not be overwritten by Codex sessions.
 - Clarified that the active development script is `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`, and that v2.1/v2.2 scripts are locked historical versions.
 - Renamed the Drizzle UI group in the active v2.2 script to `Drizzle and Background Extraction`.
@@ -43,6 +46,11 @@ All notable user-facing changes to this project should be documented here.
 
 ### Fixed
 
+- Fixed `Remove Data (All Sessions)` leaving the status bar showing `Project has unsaved changes.` when the project was clean. The cleanup now restores both the dirty flag and its visible status.
+- Fixed v3.0 linked mosaic feathering silently retaining a stale pixel value after reopening a project. Script generation now recalculates automatic feathering and stops with a clear warning when no readable light-frame geometry is available.
+- Fixed automatic mosaic feathering for FPACK tile-compressed `.fit.fz`/`.fits.fz` lights by reading `ZNAXIS1/ZNAXIS2` from compressed-image extensions without decompressing image data.
+- Fixed automatic mosaic feathering stopping at an unreadable first light; geometry discovery now tries later configured lights for that panel or session.
+- Fixed GESDT command generation so it uses Siril's valid `0.3` outlier-fraction and `0.05` significance defaults instead of incorrectly passing the `3.0` Sigma Low/High defaults, which caused `stack` to fail with `invalid arguments`.
 - Refined v3.0 narrowband validation so explicit `HOO` output does not warn about missing SII/OIII data, while `SHO with HOO fallback` reports the fallback during script build without repeating the notice when the built script is run. Forced `SHO` and `HSO` still require SII/OIII lights.
 - Fixed v3.0 narrowband helper stacking so the `Sigma Rejection` UI selection emits Siril sigma rejection commands instead of falling back to winsorized rejection.
 - Fixed v3.0 HOO narrowband composition metadata by adding `rgbcomp -nosum` when OIII is reused for both green and blue, avoiding double-counted FITS exposure/stack keywords.

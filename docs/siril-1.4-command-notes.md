@@ -21,7 +21,8 @@ Before adding or changing generated Siril commands, verify the command exists in
 - Calibration: `calibrate flat`, `calibrate light`, `-dark=`, `-bias=`, `-flat=`, `$defbias`, `$defdark`, `$defflat`, `-cfa`, `-cc=dark`, `-equalize_cfa`, `-debayer`.
 - Registration: `register`, `-layer=0`, `-2pass`, `-disto=file`, drizzle args.
 - Sequence application: `seqapplyreg`, drizzle args, `-framing=min`, `-framing=current`, `-framing=max`, `-framing=cog`.
-- Stacking: `stack`, `rej`, `rej sigma`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
+- Stacking: `stack`, `rej`, `rej sigma`, `rej generalized`, `mean none`, `med`, `-norm=addscale`, `-nonorm`, `-output_norm`, `-rgb_equal`, `-32b`, `-maximize`, `-feather`, `-overlap_norm`, `-out=`.
+- GESDT is a special case within the generic `stack ... rej <type> <value1> <value2>` syntax: `rej generalized` expects an outlier fraction and significance, each strictly between 0 and 1, rather than sigma low/high values. Siril's defaults are `0.3` and `0.05`, producing `stack ... rej generalized 0.3 0.05`.
 - Sequence and image operations: `merge`, `load`, `save`, `mirrorx -bottomup`, `resample`, `split ... -lab`.
 - Background and mosaic WCS commands: `seqsubsky pp_light 1`, `parse $RA:ra$_$DEC:dec$`, `platesolve -force -disto=platesolve_data.wcs`, `seqplatesolve mosaic -force -nocache`.
 - v3.0 narrowband operations: `seqextract_HaOIII pp_light -resample=ha`, `setref <sequence> <image_number>`, `pm "expression"`, `rgbcomp red green blue -out=<name>`, and `rgbcomp -lum=image rgb_image -out=<name>`.
