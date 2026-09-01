@@ -19,6 +19,7 @@ The project model stores:
 - Global drizzle settings.
 - Global background extraction setting.
 - Global two-pass registration setting.
+- Global distortion-correction setting, using a plate-solved SIP model during registration.
 - Intermediate FITS compression setting.
 - Optional 32-bit final stack output.
 - Global stacking method and sigma rejection values.
@@ -80,8 +81,25 @@ For standard multi-session processing, the generated `.ssf` script:
 13. Supports optional two-pass registration.
 14. Supports drizzle through either direct registration or `seqapplyreg`, depending on drizzle and two-pass settings.
 15. Merges multiple sessions into `all_sessions`.
-16. Stacks the registered sequence.
-17. Loads the final stack, runs `mirrorx -bottomup`, and saves `<project_slug>_final.fit`.
+16. Optionally plate-solves the selected single-session sequence or merged `all_sessions` sequence and registers with `-disto=file platesolve_data.wcs`.
+17. Stacks the registered sequence.
+18. Loads the final stack, runs `mirrorx -bottomup`, and saves `<project_slug>_final.fit`.
+
+## Distortion correction behavior
+
+The `Registration and Stacking` tab includes a `Distortion Correction (plate solve + registration)` checkbox. When enabled, the generated script loads the first frame of the sequence that is about to be registered, parses its RA/Dec metadata, saves a SIP distortion model with `platesolve -force -disto=platesolve_data.wcs`, and passes that model to `register -disto=file platesolve_data.wcs`.
+
+Recommended defaults apply only until a project is saved or the user makes an explicit choice:
+
+- New single-session, non-mosaic projects default off.
+- New multi-session projects default on.
+- New mosaic projects default on.
+- Existing project files without the setting preserve the prior workflow: normal projects load off and mosaic projects load on.
+- A saved or user-selected on/off value is authoritative even if the session count or Mosaic Mode later changes.
+
+For normal multi-session OSC processing, distortion plate-solving happens after `merge ... all_sessions` and immediately before global registration. Mosaic OSC and narrowband processing applies the option during initial per-session/per-panel registration; later alignment of already-undistorted panel products remains ordinary registration. Narrowband non-mosaic channel and optional OSC broadband registration also honor the global option.
+
+Sequence packing is unavailable while distortion correction is enabled. The Siril 1.4 plate-solving path requires unpacked FITS sequences; generated scripts also defensively suppress FITSEQ/SER light conversion if a project model contains both settings.
 
 ## Drizzle behavior
 
@@ -168,7 +186,7 @@ Pack-sequence modes include:
 - SER.
 - Auto when above a threshold.
 
-Auto mode defaults to 2000 frames. Packing applies to light conversion in non-mosaic mode. Mosaic mode intentionally forces packing off because Siril 1.4 cannot plate-solve packed FITSEQ/SER sequences in this workflow.
+Auto mode defaults to 2000 frames. Packing applies to light conversion in non-mosaic mode when distortion correction is disabled. Mosaic mode and enabled distortion correction intentionally force packing off because Siril 1.4 cannot plate-solve packed FITSEQ/SER sequences in these workflows.
 
 ## Mosaic mode
 
@@ -187,6 +205,7 @@ Mosaic mode is marked experimental. It supports:
 - The automatic value is half of the overlap band on the frame's short edge, clamped to `20-300 px` for non-zero overlaps; `0%` produces `0 px`.
 - Representative lights are checked across populated panels. Standard FITS and FPACK tile-compressed FITS headers are supported, and later lights are tried if an earlier file is missing or unreadable. Mixed frame sizes are reported and the smallest short edge is used conservatively.
 - Drizzle per panel.
+- Distortion correction during per-panel registration, enabled by default and user-controllable.
 - Auto-manage panels by grid.
 - Panel name schemes: `A1`, `B2`, etc., or `R1C2`.
 - Preview mosaic layout dialog.
@@ -196,7 +215,7 @@ Mosaic mode is marked experimental. It supports:
 
 Mosaic processing is split into phases:
 
-1. Per-panel conversion, calibration, optional background extraction, WCS solving, and registration.
+1. Per-panel conversion, calibration, optional background extraction, optional SIP distortion solving, and registration.
 2. Per-panel cross-session merge and stack.
 3. Phase 2 stitching from panel final FITS files into a mosaic sequence.
 4. WCS plate solving of the mosaic sequence.

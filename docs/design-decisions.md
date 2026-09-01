@@ -40,6 +40,12 @@ This is especially important for:
 - Final `mirrorx -bottomup` before save.
 - Output filenames and working directories.
 
+## Distortion correction defaults
+
+Distortion correction is optional and persisted. New single-session projects default off, while new multi-session and mosaic projects default on. Once the user chooses a value or a project file supplies one, that explicit value is preserved. Legacy normal projects load with correction off; legacy mosaic projects load with correction on to preserve their previous generated behavior.
+
+Normal multi-session projects solve the merged registration target once, immediately before global registration. Mosaic projects correct each source panel sequence during its initial registration and do not undistort already-corrected panel products a second time during cross-session or final channel alignment.
+
 ## Windows-first path handling
 
 The user runs this workflow on Windows. Path handling should be checked with Windows-style paths, spaces, drive letters, and Siril's tolerance for POSIX-style slashes in generated scripts.

@@ -17,6 +17,8 @@ All notable user-facing changes to this project should be documented here.
 - Added a v3.0 `OIII Combine Policy` selector with the current merge-all behavior as the default, plus advanced auto-weighted and manual-weighted blends of separately stacked Ha/OIII-derived and SII/OIII-derived OIII masters.
 - Added a read-only `OIII Weights` display showing estimated Ha/OIII vs SII/OIII blend percentages from the project light lists.
 - Added `GESDT Rejection` as a global v3.0 stacking option, with dedicated outlier-fraction and significance controls that emit Siril 1.4.4 `stack ... rej generalized <outliers> <significance>` commands.
+- Added a persisted `Distortion Correction (plate solve + registration)` option for normal OSC, narrowband, and mosaic registration. New single-night projects default off; new multi-night and mosaic projects default on; an explicit user choice always wins.
+- Added generated-script coverage for enabled/disabled single-session, multi-session, and mosaic distortion-correction workflows, including legacy project migration and packed-sequence compatibility.
 
 ### Changed
 
@@ -43,6 +45,9 @@ All notable user-facing changes to this project should be documented here.
 - In v3.0, removing a session now renumbers remaining sessions to `Session 1..N`, remaps mosaic session references, and renames default session working folders when possible.
 - In v3.0, removing the final remaining session now runs the normal deletion flow, then recreates an empty `Session 1` with a clear dialog.
 - v3.0 mosaic sessions can again remove the final panel, leaving the session with no panels until a new one is added.
+- Normal multi-session distortion correction now plate-solves `all_sessions_00001` after merge and applies `register ... -disto=file platesolve_data.wcs`; single-session workflows solve their selected calibrated/background-extracted registration sequence.
+- Mosaic distortion correction remains enabled by default but can now be disabled for troubleshooting. Phase 2 WCS plate-solving for panel stitching remains independent and is still emitted when multiple panel finals are present.
+- Sequence packing is forced off while distortion correction is enabled because the Siril 1.4 plate-solving workflow requires unpacked FITS sequences.
 
 ### Fixed
 

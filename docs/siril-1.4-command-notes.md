@@ -54,6 +54,9 @@ Resolution: do not rely on guessed command parameters. Validate against Siril 1.
 ## Current gotchas
 
 - Mosaic mode intentionally disables pack sequences because Siril 1.4 cannot plate-solve packed FITSEQ/SER sequences in this workflow.
+- Enabling distortion correction also disables pack sequences. The script must load `<sequence>_00001` for `platesolve -force -disto=platesolve_data.wcs`, then applies the saved SIP model with `register <sequence> ... -disto=file platesolve_data.wcs`.
+- Normal multi-session distortion correction runs after `merge ... all_sessions`; the solve/register sequence is `load all_sessions_00001`, `parse $RA:ra$_$DEC:dec$`, `platesolve -force -disto=platesolve_data.wcs`, then `register all_sessions ... -disto=file platesolve_data.wcs`.
+- Mosaic Phase 2 `seqplatesolve mosaic -force -nocache` is required for panel stitching and is independent of the user-controllable per-panel distortion-correction setting.
 - Drizzle per panel intentionally forces two-pass registration and uses `seqapplyreg` for drizzle output.
 - Phase 2 mosaic drizzle is intentionally skipped because panel finals are RGB, not mono/CFA.
 - Non-mosaic background extraction uses `seqsubsky pp_light 1` after calibration and before alignment, then registers the resulting `bkg_pp_light` sequence.

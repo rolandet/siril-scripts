@@ -22,6 +22,7 @@ Use this checklist before considering code changes complete. For documentation-o
 
 - [ ] Generate `.ssf` output from representative non-mosaic project structures.
 - [ ] Generate `.ssf` output from representative mosaic project structures when mosaic behavior is touched.
+- [ ] Generate enabled and disabled distortion-correction variants for single-session, multi-session, and mosaic projects when registration behavior is touched.
 - [ ] Inspect generated Siril commands manually.
 - [ ] Confirm generated scripts contain no shell-only commands such as `echo`.
 - [ ] Confirm generated script comments use Siril-compatible comment syntax.
@@ -54,6 +55,10 @@ Use this checklist before considering code changes complete. For documentation-o
 - [ ] Multi-night behavior is preserved.
 - [ ] Non-mosaic registration behavior is unchanged unless intentionally modified.
 - [ ] Mosaic registration behavior is unchanged unless intentionally modified.
+- [ ] New single-session projects default distortion correction off; new multi-session and mosaic projects default it on; explicit and legacy saved values are preserved.
+- [ ] Enabled distortion correction emits `load`, `parse`, `platesolve -force -disto=platesolve_data.wcs`, and matching `register ... -disto=file platesolve_data.wcs` commands in that order.
+- [ ] Disabled distortion correction omits `platesolve -disto` and `register -disto=file` while retaining ordinary registration and mosaic Phase 2 WCS stitching.
+- [ ] Sequence packing is forced off for Mosaic Mode and while distortion correction is enabled.
 - [ ] Mosaic mode still disables pack sequences.
 - [ ] New mosaic projects default to automatic feathering from overlap percentage; existing saved manual/automatic choices are preserved.
 - [ ] Automatic feathering updates immediately when overlap or representative light frames change, without requiring preparation, and the pixel field is read-only while automatic mode is enabled.

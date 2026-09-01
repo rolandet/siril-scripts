@@ -356,7 +356,7 @@ FRAME_TAB_TOOLTIPS = {
     ),
 }
 LEFT_TAB_TOOLTIPS = {
-    "registration": "Controls global registration, stacking, background extraction, output bit depth, compression, and sequence packing.",
+    "registration": "Controls global registration, distortion correction, stacking, background extraction, output bit depth, compression, and sequence packing.",
     "mosaic": "Controls experimental mosaic layout, panel registration, overlap normalization, feathering, and mosaic preview options.",
     "nb": "Controls Ha/SII and OIII extraction, mono channel output, and narrowband composition behavior.",
 }
@@ -482,6 +482,22 @@ class Session:
             panels=[Panel.from_dict(x) for x in d.get("panels", [])],
         )
 
+
+def recommended_distortion_correction(project) -> bool:
+    """Return the recommended default for a new project configuration."""
+    return bool(
+        getattr(project, "mosaic_enabled", False)
+        or len(getattr(project, "sessions", []) or []) > 1
+    )
+
+
+def distortion_correction_is_enabled(project) -> bool:
+    """Resolve the stored setting, or its workflow-aware default when unset."""
+    configured = getattr(project, "distortion_correction_enabled", None)
+    if configured is None:
+        return recommended_distortion_correction(project)
+    return bool(configured)
+
 @dataclass
 class Project:
 
@@ -511,6 +527,8 @@ class Project:
 
     # 2-pass registration (default False)
     two_pass: bool = False
+    # None means use the recommended new-project default: multi-night/mosaic ON, single-night OFF.
+    distortion_correction_enabled: Optional[bool] = None
     compress_intermediates: bool = False  # lossless FITS tile compression for intermediates
     # 32-bit output for final light stack
     stack_32bit: bool = False
@@ -598,6 +616,7 @@ class Project:
             "background_extraction_enabled": bool(self.background_extraction_enabled),
 
             "two_pass": self.two_pass,
+            "distortion_correction_enabled": distortion_correction_is_enabled(self),
             "compress_intermediates": self.compress_intermediates,
 
             "stack_method": self.stack_method,
@@ -670,6 +689,12 @@ class Project:
         p.background_extraction_enabled = bool(d.get("background_extraction_enabled", False))
 
         p.two_pass = bool(d.get("two_pass", True))
+        if "distortion_correction_enabled" in d:
+            p.distortion_correction_enabled = bool(d.get("distortion_correction_enabled"))
+        else:
+            # Legacy normal projects did not use distortion correction, while legacy
+            # mosaic projects always did. Preserve both behaviors on first load.
+            p.distortion_correction_enabled = bool(d.get("mosaic_enabled", False))
         p.compress_intermediates = bool(d.get("compress_intermediates", False))
 
         p.stack_method = d.get("stack_method", "rej")
@@ -735,6 +760,14 @@ class Project:
 # -----------------------------
 # Utilities
 # -----------------------------
+
+def emit_distortion_plate_solve(lines: list[str], sequence_name: str) -> None:
+    """Emit the known-good Siril 1.4 sequence used to create a SIP distortion model."""
+    lines.append("# Plate-solve the reference frame for distortion-aware registration")
+    lines.append(f"load {sequence_name}_00001")
+    lines.append('parse $RA:ra$_$DEC:dec$')
+    lines.append("platesolve -force -disto=platesolve_data.wcs")
+    lines.append("")
 
 def set_comp_if_needed(L, comp_state_ref, desired):
     """
@@ -1389,7 +1422,12 @@ class SirilCommandBuilder:
             if already_registered:
                 stack_seq_name = seq_name
             else:
+                use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+                if use_disto:
+                    emit_distortion_plate_solve(L, seq_name)
                 reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+                if use_disto:
+                    reg_flags += " -disto=file platesolve_data.wcs"
                 L.append(f"register {seq_name}{reg_flags}")
                 if p.two_pass:
                     L.append(f"seqapplyreg {seq_name}")
@@ -1401,7 +1439,12 @@ class SirilCommandBuilder:
             merge_inputs = " ".join([f'"{folder}/{seq_name}"' for folder, seq_name in seqs])
             merged_name = f"{out_name}_all"
             L.append(f"merge {merge_inputs} {merged_name}")
+            use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+            if use_disto:
+                emit_distortion_plate_solve(L, merged_name)
             reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+            if use_disto:
+                reg_flags += " -disto=file platesolve_data.wcs"
             L.append(f"register {merged_name}{reg_flags}")
             if p.two_pass:
                 L.append(f"seqapplyreg {merged_name}")
@@ -1572,14 +1615,15 @@ class SirilCommandBuilder:
         mosaic_two_pass = str(getattr(p, "mosaic_registration_mode", "")).lower().startswith("two")
         reg_two_pass = bool(mosaic_two_pass) or bool(getattr(p, "two_pass", False))
         L.append(f"# Register NB channel {seq_name} for {label}")
-        L.append(f"load {seq_name}_00001")
-        L.append('parse $RA:ra$_$DEC:dec$')
-        L.append("platesolve -force -disto=platesolve_data.wcs")
+        use_disto = distortion_correction_is_enabled(p)
+        if use_disto:
+            emit_distortion_plate_solve(L, seq_name)
+        disto_flags = " -disto=file platesolve_data.wcs" if use_disto else ""
         if reg_two_pass:
-            L.append(f"register {seq_name} -disto=file platesolve_data.wcs -2pass")
+            L.append(f"register {seq_name}{disto_flags} -2pass")
             L.append(f"seqapplyreg {seq_name}")
         else:
-            L.append(f"register {seq_name} -disto=file platesolve_data.wcs")
+            L.append(f"register {seq_name}{disto_flags}")
         return f"r_{seq_name}"
 
     def _nb_stack_channel(
@@ -1602,7 +1646,12 @@ class SirilCommandBuilder:
         if len(seqs) == 1:
             folder, seq_name = seqs[0]
             L.append(f'cd "{folder}"')
+            use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+            if use_disto:
+                emit_distortion_plate_solve(L, seq_name)
             reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+            if use_disto:
+                reg_flags += " -disto=file platesolve_data.wcs"
             L.append(f"register {seq_name}{reg_flags}")
             if p.two_pass:
                 L.append(f"seqapplyreg {seq_name}")
@@ -1622,7 +1671,12 @@ class SirilCommandBuilder:
         merge_inputs = " ".join([f'"{folder}/{seq_name}"' for folder, seq_name in seqs])
         merged_name = f"{effective_out}_all"
         L.append(f"merge {merge_inputs} {merged_name}")
+        use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+        if use_disto:
+            emit_distortion_plate_solve(L, merged_name)
         reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+        if use_disto:
+            reg_flags += " -disto=file platesolve_data.wcs"
         L.append(f"register {merged_name}{reg_flags}")
         if p.two_pass:
             L.append(f"seqapplyreg {merged_name}")
@@ -1930,6 +1984,9 @@ class SirilCommandBuilder:
         L.append(f'cd "{work.as_posix()}"')
         L.append("# Narrowband extraction enabled: normal OSC final is skipped.")
         L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
+        L.append(
+            f"# Distortion correction: {'ON' if distortion_correction_is_enabled(p) else 'OFF'}"
+        )
         L.append(f"# OIII combine policy: {normalize_nb_oiii_combine_policy(getattr(p, 'nb_oiii_merge_policy', None))}.")
         L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
         L.append("")
@@ -2089,6 +2146,9 @@ class SirilCommandBuilder:
         L.append(f'cd "{work.as_posix()}"')
         L.append("# Narrowband extraction enabled: normal OSC mosaic final is skipped.")
         L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
+        L.append(
+            f"# Distortion correction: {'ON' if distortion_correction_is_enabled(p) else 'OFF'}"
+        )
         L.append(f"# OIII combine policy: {normalize_nb_oiii_combine_policy(getattr(p, 'nb_oiii_merge_policy', None))}.")
         L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
         L.append("")
@@ -2336,6 +2396,8 @@ class SirilCommandBuilder:
             L.append("# Drizzle: OFF")
         L.append(f"# Background Extraction: {'ON' if p.background_extraction_enabled else 'OFF'}")
         L.append(f"# 2-pass registration: {'ON' if p.two_pass else 'OFF'}")
+        distortion_enabled = distortion_correction_is_enabled(p)
+        L.append(f"# Distortion correction: {'ON' if distortion_enabled else 'OFF'}")
         if is_gesdt_stack_method(p.stack_method):
             outliers, significance = normalized_gesdt_parameters(
                 getattr(p, "gesdt_outliers", 0.3),
@@ -2361,6 +2423,12 @@ class SirilCommandBuilder:
 
         # Pack Sequence decisions (lights only)
         mode = (p.pack_sequences_mode or "off").lower()  # off|fitseq|ser|auto
+        if distortion_enabled and mode != "off":
+            _warn(
+                L,
+                "Pack sequences disabled because distortion plate-solving requires unpacked FITS sequences.",
+            )
+            mode = "off"
         pack_thresh = int(getattr(p, "pack_threshold", 2000))
 
         def _count_frames(dirpath: Path) -> int:
@@ -2579,6 +2647,8 @@ class SirilCommandBuilder:
         L.append(f'cd "{base_dir}"')
 
         reg_flags    = " -layer=0" + (" -2pass" if p.two_pass else "")
+        if distortion_enabled:
+            reg_flags += " -disto=file platesolve_data.wcs"
         drizzle_args = f" -drizzle -scale={p.drizzle_scaling:g} -pixfrac={p.drizzle_pixfrac:g} -kernel={p.drizzle_kernel}"
 
         L.append("setfindstar")
@@ -2588,6 +2658,9 @@ class SirilCommandBuilder:
             sess = p.sessions[0]
             reg_target = pp_seqs[0][1]
             stack_target = f"r_{reg_target}"
+
+            if distortion_enabled:
+                emit_distortion_plate_solve(L, reg_target)
 
             if p.drizzle_enabled and not p.two_pass:
                 # Drizzle fast-path (no seqapplyreg) – add -flat as weight if available
@@ -2622,6 +2695,9 @@ class SirilCommandBuilder:
             # Multi-session: merge -> register/stack
             inputs = " ".join([f'"{folder}/{seq}"' for (folder, seq) in pp_seqs])
             L.append(f"merge {inputs} all_sessions")
+
+            if distortion_enabled:
+                emit_distortion_plate_solve(L, "all_sessions")
 
             if p.drizzle_enabled and not p.two_pass:
                 L.append(f"register all_sessions{reg_flags}{drizzle_args}")
@@ -2703,6 +2779,8 @@ class SirilCommandBuilder:
         else:
             L.append("# Drizzle: OFF")
         L.append(f"# 2-pass registration: {'ON' if p.two_pass else 'OFF'}")
+        distortion_enabled = distortion_correction_is_enabled(p)
+        L.append(f"# Distortion correction: {'ON' if distortion_enabled else 'OFF'}")
         L.append("")
 
         # Compression control (avoid flapping)
@@ -2897,18 +2975,17 @@ class SirilCommandBuilder:
 
                 L.append("")
 
-                # --- Plate-solve first frame to produce a distortion WCS file ---
-                L.append("# Plate-solve to produce a distortion WCS for undistortion-aware registration")
-                L.append(f"load {seq_base}_00001")
-                L.append('parse $RA:ra$_$DEC:dec$')
-                L.append("platesolve -force -disto=platesolve_data.wcs")
-                L.append("")
+                # --- Optionally plate-solve the first frame for a distortion WCS file ---
+                if distortion_enabled:
+                    emit_distortion_plate_solve(L, seq_base)
 
-                # --- Register the chosen sequence (with WCS undistortion) ---
+                # --- Register the chosen sequence ---
                 # Mosaic Registration Mode governs whether we run 1-pass or 2-pass registration.
                 # Drizzle-per-panel ALWAYS forces 2-pass because drizzle output is generated via seqapplyreg.
                 mosaic_two_pass = str(getattr(p, "mosaic_registration_mode", "")).lower().startswith("two")
                 reg_two_pass = bool(mosaic_two_pass) or bool(getattr(p, "two_pass", False))
+                disto_flags = " -disto=file platesolve_data.wcs" if distortion_enabled else ""
+                disto_label = " with WCS undistortion" if distortion_enabled else ""
 
                 if drizzle_panel:
                     drizzle_args = (
@@ -2916,18 +2993,18 @@ class SirilCommandBuilder:
                         f" -pixfrac={p.drizzle_pixfrac:g}"
                         f" -kernel={p.drizzle_kernel}"
                     )
-                    L.append(f"# Register panel {pid} sequence with WCS undistortion (2-pass) + drizzle")
+                    L.append(f"# Register panel {pid} sequence{disto_label} (2-pass) + drizzle")
                     # Siril CLI/script syntax: -2pass computes transforms only (no transformed images are generated).
                     # There is no '-noout' option for the 'register' command in SSF scripts.
-                    L.append(f"register {seq_base} -disto=file platesolve_data.wcs -2pass")
+                    L.append(f"register {seq_base}{disto_flags} -2pass")
                     L.append(f"seqapplyreg {seq_base}{drizzle_args}")
                 elif reg_two_pass:
-                    L.append(f"# Register panel {pid} sequence with WCS undistortion (2-pass)")
-                    L.append(f"register {seq_base} -disto=file platesolve_data.wcs -2pass")
+                    L.append(f"# Register panel {pid} sequence{disto_label} (2-pass)")
+                    L.append(f"register {seq_base}{disto_flags} -2pass")
                     L.append(f"seqapplyreg {seq_base}")
                 else:
-                    L.append(f"# Register panel {pid} sequence with WCS undistortion")
-                    L.append(f"register {seq_base} -disto=file platesolve_data.wcs")
+                    L.append(f"# Register panel {pid} sequence{disto_label}")
+                    L.append(f"register {seq_base}{disto_flags}")
                 L.append("")
 
                 # Instead of stacking now, remember this session’s registered seq for cross-session merge
@@ -4211,6 +4288,15 @@ class ProjectWidget(QtWidgets.QWidget):
         self.cb_background_extraction.setToolTip(
             "Runs seqsubsky on the calibrated sequence before alignment."
         )
+        self.cb_distortion_correction = QtWidgets.QCheckBox(
+            "Distortion Correction (plate solve + registration)"
+        )
+        self.cb_distortion_correction.setToolTip(
+            "Plate-solves the registration reference and applies its SIP distortion model\n"
+            "with register -disto=file. Recommended for multi-night and mosaic projects.\n"
+            "Single-night projects default off; multi-night and mosaic projects default on.\n"
+            "Requires unpacked FITS sequences, so sequence packing is disabled when enabled."
+        )
 
         # Stacking controls (global)
         # Stacking controls (global)
@@ -4479,6 +4565,7 @@ class ProjectWidget(QtWidgets.QWidget):
         reg_bg_row.addWidget(self.cb_background_extraction)
         reg_bg_row.addStretch(1)
         stack_form.addRow("", reg_bg_row)
+        stack_form.addRow("", self.cb_distortion_correction)
         mrow = QtWidgets.QHBoxLayout()
         mrow.addWidget(QtWidgets.QLabel("Method"))
         mrow.addWidget(self.cb_stack_method)
@@ -4786,6 +4873,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.cb_kernel.currentIndexChanged.connect(self.mark_dirty)
         self.cb_two_pass.toggled.connect(self.mark_dirty)
         self.cb_background_extraction.toggled.connect(self.mark_dirty)
+        self.cb_distortion_correction.toggled.connect(self._on_distortion_correction_toggled)
 
         self.cb_stack_method.currentIndexChanged.connect(self._update_stack_parameter_controls)
         self.cb_stack_method.currentIndexChanged.connect(self.mark_dirty)
@@ -5035,6 +5123,29 @@ class ProjectWidget(QtWidgets.QWidget):
         for w in (self.lbl_scaling, self.spin_scaling, self.lbl_pixfrac, self.spin_pixfrac, self.lbl_kernel, self.cb_kernel):
             w.setEnabled(enabled)
 
+    def _apply_recommended_distortion_default(self) -> None:
+        """Update an unset new-project option without overriding an explicit choice."""
+        if getattr(self.project, "distortion_correction_enabled", None) is not None:
+            return
+        recommended = bool(
+            self.chk_mosaic_enabled.isChecked()
+            or len(getattr(self.project, "sessions", []) or []) > 1
+        )
+        self._setting_distortion_default = True
+        try:
+            self.cb_distortion_correction.setChecked(recommended)
+        finally:
+            self._setting_distortion_default = False
+        self._enforce_pack_compatibility()
+
+    def _on_distortion_correction_toggled(self, enabled: bool) -> None:
+        if not self._suspend_dirty and not getattr(self, "_setting_distortion_default", False):
+            # A concrete bool records the user's choice and stops automatic defaults
+            # from changing it when sessions or Mosaic Mode change later.
+            self.project.distortion_correction_enabled = bool(enabled)
+        self._enforce_pack_compatibility()
+        self.mark_dirty()
+
     def _on_nb_toggled(self, enabled: bool):
         self.chk_nb_save_mono.setEnabled(enabled)
         self.cmb_nb_channel_balance.setEnabled(enabled)
@@ -5212,6 +5323,8 @@ class ProjectWidget(QtWidgets.QWidget):
             w.setEnabled(enabled)
 
     def _on_mosaic_toggled(self, enabled: bool):
+        self._apply_recommended_distortion_default()
+
         # Left-side panels list + buttons
         for w in (self.lst_panels, self.btn_add_panel, self.btn_remove_panel):
             w.setEnabled(enabled)
@@ -5226,9 +5339,8 @@ class ProjectWidget(QtWidgets.QWidget):
         # Make the rest of the Mosaic box read-only when disabled
         self._set_mosaic_controls_enabled(enabled)
 
-        # Pack controls and constraints
-        self._set_pack_controls_enabled(not enabled)
-        self._enforce_pack_off_if_mosaic()
+        # Pack controls and plate-solving constraints
+        self._enforce_pack_compatibility()
         self.chk_link_feather.setEnabled(enabled)
 
         # Normalize drizzle scope without changing enabled state
@@ -5645,20 +5757,29 @@ class ProjectWidget(QtWidgets.QWidget):
         for w in (self.pack_label, self.pack_mode, self.pack_thresh):
             w.setEnabled(enabled)
 
-    def _enforce_pack_off_if_mosaic(self):
-        # If mosaic is ON, force pack mode Off in the UI (no dirty flip if already Off)
-        if self.chk_mosaic_enabled.isChecked():
+    def _enforce_pack_compatibility(self):
+        """Keep packed sequences off when direct FITS plate-solving is required."""
+        mosaic_on = self.chk_mosaic_enabled.isChecked()
+        distortion_on = self.cb_distortion_correction.isChecked()
+        if mosaic_on or distortion_on:
             if self.pack_mode.currentIndex() != 0:
                 self.pack_mode.setCurrentIndex(0)
-            self.pack_thresh.setEnabled(False)
-            # Optional: make the reason clear in tooltip
-            tip = ("Disabled in Mosaic Mode. Siril 1.4 cannot plate-solve FITSEQ/SER "
-                "sequences for mosaics; use unpacked FITS only.")
+            self._set_pack_controls_enabled(False)
+            if mosaic_on and distortion_on:
+                reason = "Mosaic Mode and distortion correction require"
+            elif mosaic_on:
+                reason = "Mosaic Mode requires"
+            else:
+                reason = "Distortion correction requires"
+            tip = (
+                f"Disabled because {reason} unpacked FITS sequences for plate-solving; "
+                "Siril 1.4 cannot use packed FITSEQ/SER sequences in this workflow."
+            )
             self.pack_label.setToolTip(tip)
             self.pack_mode.setToolTip(tip)
             self.pack_thresh.setToolTip(tip)
         else:
-            # Restore normal tooltip and enablement
+            self._set_pack_controls_enabled(True)
             self.pack_label.setToolTip("Use FITSEQ/SER to avoid open-file limits (non-mosaic only).")
             self.pack_mode.setToolTip("Pack sequences for very large projects (non-mosaic only).")
             self.pack_thresh.setToolTip("Threshold in Auto mode")
@@ -5907,6 +6028,7 @@ class ProjectWidget(QtWidgets.QWidget):
             self.cb_kernel.setCurrentIndex(max(0, kernels.index(p.drizzle_kernel) if p.drizzle_kernel in kernels else 0))
             self.cb_two_pass.setChecked(p.two_pass)
             self.cb_background_extraction.setChecked(bool(getattr(p, "background_extraction_enabled", False)))
+            self.cb_distortion_correction.setChecked(distortion_correction_is_enabled(p))
 
             sm_idx = self.cb_stack_method.findText(p.stack_method or "Winsorized Rejection")
             if sm_idx < 0:
@@ -5932,8 +6054,7 @@ class ProjectWidget(QtWidgets.QWidget):
             # --- Mosaic ---
             self.chk_mosaic_enabled.setChecked(p.mosaic_enabled)
             self.chk_link_feather.setEnabled(p.mosaic_enabled)
-            self._set_pack_controls_enabled(not p.mosaic_enabled)
-            self._enforce_pack_off_if_mosaic()
+            self._enforce_pack_compatibility()
 
             # Restore scheme and auto-grid first (prevents briefly using the wrong scheme)
             self.cmb_name_scheme.setCurrentIndex(int(getattr(p, "_ui_name_scheme", 0)))
@@ -6000,6 +6121,8 @@ class ProjectWidget(QtWidgets.QWidget):
         p.drizzle_kernel  = self.cb_kernel.currentText()
         p.background_extraction_enabled = self.cb_background_extraction.isChecked()
         p.two_pass        = self.cb_two_pass.isChecked()
+        if p.distortion_correction_enabled is not None:
+            p.distortion_correction_enabled = self.cb_distortion_correction.isChecked()
 
         # Store exactly what the user picked in the combobox
         p.stack_method = self.cb_stack_method.currentText()   # Winsorized | Sigma | GESDT | Mean | Median
@@ -6066,7 +6189,10 @@ class ProjectWidget(QtWidgets.QWidget):
         p.pack_threshold      = int(self.pack_thresh.value())
 
         # Mosaic mutual exclusion with packing
-        if p.mosaic_enabled and p.pack_sequences_mode != "off":
+        if (
+            (p.mosaic_enabled or distortion_correction_is_enabled(p))
+            and p.pack_sequences_mode != "off"
+        ):
             p.pack_sequences_mode = "off"
 
         p._ui_mosaic_auto_grid = self.chk_auto_grid.isChecked()
@@ -6213,6 +6339,7 @@ class ProjectWidget(QtWidgets.QWidget):
     def add_session(self):
         new_sess = Session(name=f"Session {len(self.project.sessions)+1}")
         self.project.sessions.append(new_sess)
+        self._apply_recommended_distortion_default()
         self.sessions_list.addItem(new_sess.name)
         self.sessions_list.setCurrentRow(self.sessions_list.count()-1)
 
@@ -6313,6 +6440,7 @@ class ProjectWidget(QtWidgets.QWidget):
             )
 
         self.mark_dirty()
+        self._apply_recommended_distortion_default()
         self._refresh_global_ref_choices(self.project.mosaic_global_reference)
         self._update_feather_from_overlap()
 
@@ -6323,6 +6451,7 @@ class ProjectWidget(QtWidgets.QWidget):
         copy = Session.from_dict(orig.to_dict())
         copy.name = f"{orig.name} (copy)"
         self.project.sessions.insert(row+1, copy)
+        self._apply_recommended_distortion_default()
         self.sessions_list.insertItem(row+1, copy.name)
         self.sessions_list.setCurrentRow(row+1)
         self._loading_session = True
@@ -7413,8 +7542,13 @@ class ProjectWidget(QtWidgets.QWidget):
             return self.save_project_as()
         self.push_to_model()
         try:
+            project_data = self.project.to_dict()
             Path(self.project.project_file).write_text(
-                json.dumps(self.project.to_dict(), indent=2), encoding="utf-8"
+                json.dumps(project_data, indent=2), encoding="utf-8"
+            )
+            # Once saved, the resolved default becomes an explicit project choice.
+            self.project.distortion_correction_enabled = bool(
+                project_data["distortion_correction_enabled"]
             )
             self._dirty = False
             return True
