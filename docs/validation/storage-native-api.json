@@ -1,0 +1,29 @@
+{
+  "success": {
+    "status": "complete",
+    "error": null,
+    "prerequisite_frames_retained": 0
+  },
+  "early_cancel": {
+    "status": "cancelled",
+    "error": "Run cancelled; completed panel stacks have been retained",
+    "prerequisite_frames_retained": 0
+  },
+  "resume_after_early_cancel": {
+    "status": "complete"
+  },
+  "cancel": {
+    "status": "cancelled",
+    "error": "Run cancelled; completed panel stacks have been retained",
+    "prerequisite_frames_retained": 4
+  },
+  "resume_after_cancel": {
+    "status": "complete"
+  },
+  "failure": {
+    "status": "failed",
+    "error": "Command 'register storage_sequence_that_does_not_exist' failed: Sequence not found",
+    "prerequisite_frames_retained": 4
+  },
+  "passed": true
+}

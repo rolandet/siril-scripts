@@ -1,0 +1,119 @@
+{
+  "runs": {
+    "baseline": {
+      "exit_code": 0,
+      "seconds": 97.39210677146912,
+      "sampled_peak_bytes": 16917781539,
+      "retained_bytes": 16917781539
+    },
+    "managed": {
+      "exit_code": 1,
+      "seconds": 100.72026658058167,
+      "sampled_peak_bytes": 5175022399,
+      "retained_bytes": 2269625697,
+      "state": {
+        "status": "failed",
+        "error": "\nFITS WCS distortion paper lookup tables and SIP distortions only work\nin 2 dimensions.  However, WCSLIB has detected 3 dimensions in the\ncore WCS keywords.  To use core WCS in conjunction with FITS WCS\ndistortion paper lookup tables or SIP distortion, you must select or\nreduce these to 2 dimensions using the naxis kwarg.\n",
+        "peak_bytes": 4601502957,
+        "bytes_deleted": 12916491732
+      },
+      "estimate": 4974392012,
+      "resumed_status": "complete",
+      "resumed_peak_owned_bytes": 4601502957,
+      "resumed_retained_bytes": 3626569697
+    }
+  },
+  "comparisons": {
+    "Veil_Nebula_Mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 114975864,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C1\\process\\mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 114975864,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C1\\process\\R1C1_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 60543936,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C2\\process\\R1C2_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 60543936,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 2\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 2\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    }
+  },
+  "compression": "off",
+  "background": "off",
+  "note": "Development comparison: initial WCS budget check stopped; corrected to a 2-D celestial WCS, then completed using retained panels. Pixel comparisons are against the completed result. Sampled peak belongs to the initial processing attempt."
+}

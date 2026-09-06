@@ -12,7 +12,7 @@ Use this checklist before considering code changes complete. For documentation-o
 
 ## Python checks for code changes
 
-- [ ] Run Python syntax checks, for example `python -m py_compile osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`.
+- [ ] Run Python syntax checks, for example `python -m py_compile osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py`.
 - [ ] Run `python -B -m unittest discover -s tests -p "test_*.py" -v`.
 - [ ] Confirm no hard-coded local-only paths were introduced.
 - [ ] Confirm Windows path handling still works.
@@ -83,3 +83,18 @@ Use this checklist before considering code changes complete. For documentation-o
 - [ ] Does `docs/siril-1.4-command-notes.md` need to be updated?
 - [ ] Does `docs/current-features.md` need to be updated?
 - [ ] Does `CHANGELOG.md` need to be updated?
+
+## Managed storage validation
+
+Run `python -B -m unittest discover -s tests -p "test_*.py" -v` using an environment with PyQt6, NumPy and Astropy (the Siril Python environment is suitable). Storage tests cover migration, scheduling, command options, flat-key identity, corrupted caches, changed inputs/settings, partial FITS, membership checks, unowned/replaced paths, symlinks, locked files, concurrent-run rejection, cancellation, recovery and UI state.
+
+For opt-in native comparisons use `tests/integration_storage.py --project <project.json> --output <new-test-directory> --siril <siril-cli.exe> --config <config.1.4.ini>`. It uses two nights, two panels, four lights and eight flats per unit by default, writes separate baseline/managed outputs and private config copies, and records image differences and sampled physical storage. `--background on --compression gzip2 --repeat-baseline` measures background-extraction repeatability as well. `--baseline-script` can point to an unchanged source snapshot. The output directory must be new. These are real processing runs, not part of ordinary unit tests.
+
+Verify decoded pixel arrays, nonfinite masks, FITS precision, scientific headers, selection/reference records and transforms. Treat compression container metadata and byte order separately from scientific differences. Do not change tolerances merely to pass a storage optimization. See `storage-validation-results.md` for recorded native results and limits.
+
+Also run exported SSF failure/receipt tests and the `_StorageThread` API path against isolated data. Confirm successful completion, Stop/Abort, retained prerequisites and recovery. Repeatedly updating `state.json` must remain atomic under temporary Windows sharing violations. No cleanup may occur on a failed checkpoint.
+
+
+`--controlled-no-dither` is a test-only comparison switch: with `--background on`, it appends `-nodither` to both baseline and managed `seqsubsky` commands. It is never enabled by the application. Use this to investigate random background dithering, not to change production image settings.
+
+For the native API/Abort/recovery check, launch `pyscript "<repo>/tests/integration_storage_api.py" "<small-project.json>" "<new-output-directory>"` inside Siril. Read the resulting `report.json` and require `passed: true`, because Siril 1.4.4 ignores Python exit status. Supply absolute paths when launching CLI scripts; Siril starts in its configured working directory.

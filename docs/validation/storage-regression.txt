@@ -1,0 +1,6 @@
+Siril Python 3.12 / Windows / v3.0.1
+Python syntax: passed
+Ran 43 tests in 45.972s
+OK
+Original v3.0 source restored byte-for-byte to the pre-change snapshot.
+Source review: existing image emitter functions are unchanged. Legacy mosaic collection guards and builder dispatch select the opt-in storage path.

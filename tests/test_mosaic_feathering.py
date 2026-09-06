@@ -7,7 +7,7 @@ from pathlib import Path
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
-    / "osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py"
+    / "osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py"
 )
 SPEC = importlib.util.spec_from_file_location("siril_v3_mosaic_tests", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)

@@ -7,7 +7,7 @@ This repository contains Siril scripts and helper tooling for OSC astrophotograp
 The current active development script is:
 
 ```text
-osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py
+osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py
 ```
 
 `osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.

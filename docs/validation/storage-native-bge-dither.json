@@ -1,0 +1,442 @@
+{
+  "runs": {
+    "baseline": {
+      "exit_code": 0,
+      "seconds": 114.54389810562134,
+      "sampled_peak_bytes": 20792681216,
+      "retained_bytes": 20792681216
+    },
+    "baseline_repeat": {
+      "exit_code": 0,
+      "seconds": 283.1664848327637,
+      "sampled_peak_bytes": 20792683905,
+      "retained_bytes": 20792683905
+    },
+    "managed": {
+      "exit_code": 0,
+      "seconds": 339.73610496520996,
+      "sampled_peak_bytes": 4187472590,
+      "retained_bytes": 3406219934,
+      "state": {
+        "status": "complete",
+        "error": null,
+        "peak_bytes": 4179200023,
+        "bytes_deleted": 14116677151
+      },
+      "estimate": 4974392012
+    }
+  },
+  "comparisons": {
+    "managed/Veil_Nebula_Mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 113828027,
+      "pixels": 114975864,
+      "max_abs": 0.04843956232070923,
+      "rms": 6.503974731364281e-05,
+      "header_differences": {
+        "CRVAL1": [
+          "311.89809257232",
+          "311.898092536003"
+        ],
+        "PC1_2": [
+          "-0.964969585260955",
+          "-0.964968346013625"
+        ],
+        "PC1_1": [
+          "0.26236177221787",
+          "0.262366330141139"
+        ],
+        "FOCALLEN": [
+          "306.813928239504",
+          "306.813568108941"
+        ],
+        "CDELT2": [
+          "0.000448186533187813",
+          "0.000448187059258644"
+        ],
+        "CDELT1": [
+          "-0.000448186533187813",
+          "-0.000448187059258644"
+        ],
+        "OBJCTDEC": [
+          "+30 49 1.287",
+          "+30 49 1.283"
+        ],
+        "PC2_1": [
+          "-0.964969585260955",
+          "-0.964968346013625"
+        ],
+        "RA": [
+          "311.900361054106",
+          "311.900361003463"
+        ],
+        "DEC": [
+          "30.8170241998146",
+          "30.8170231023038"
+        ],
+        "CRVAL2": [
+          "30.8201084166999",
+          "30.820107332011"
+        ],
+        "PC2_2": [
+          "-0.26236177221787",
+          "-0.262366330141139"
+        ]
+      }
+    },
+    "baseline_repeat/Veil_Nebula_Mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 113814948,
+      "pixels": 114975864,
+      "max_abs": 0.058874890208244324,
+      "rms": 4.0072361912870636e-05,
+      "header_differences": {
+        "CRVAL1": [
+          "311.89809257232",
+          "311.89809237678"
+        ],
+        "PC1_2": [
+          "-0.964969585260955",
+          "-0.964969532486957"
+        ],
+        "PC1_1": [
+          "0.26236177221787",
+          "0.262361966321157"
+        ],
+        "FOCALLEN": [
+          "306.813928239504",
+          "306.813882233198"
+        ],
+        "CDELT2": [
+          "0.000448186533187813",
+          "0.000448186600392747"
+        ],
+        "CDELT1": [
+          "-0.000448186533187813",
+          "-0.000448186600392747"
+        ],
+        "OBJCTDEC": [
+          "+30 49 1.287",
+          "+30 49 1.289"
+        ],
+        "PC2_1": [
+          "-0.964969585260955",
+          "-0.964969532486957"
+        ],
+        "RA": [
+          "311.900361054106",
+          "311.900360858198"
+        ],
+        "DEC": [
+          "30.8170241998146",
+          "30.817024798723"
+        ],
+        "CRVAL2": [
+          "30.8201084166999",
+          "30.8201090164626"
+        ],
+        "PC2_2": [
+          "-0.26236177221787",
+          "-0.262361966321157"
+        ]
+      }
+    },
+    "managed/Session 1\\R1C1\\process\\mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 113828027,
+      "pixels": 114975864,
+      "max_abs": 0.04843956232070923,
+      "rms": 6.503974731364281e-05,
+      "header_differences": {
+        "CRVAL1": [
+          "311.89809257232",
+          "311.898092536003"
+        ],
+        "PC1_2": [
+          "0.964969585260955",
+          "0.964968346013625"
+        ],
+        "PC1_1": [
+          "0.26236177221787",
+          "0.262366330141139"
+        ],
+        "FOCALLEN": [
+          "306.813928239504",
+          "306.813568108941"
+        ],
+        "CDELT2": [
+          "0.000448186533187813",
+          "0.000448187059258644"
+        ],
+        "CDELT1": [
+          "-0.000448186533187813",
+          "-0.000448187059258644"
+        ],
+        "OBJCTDEC": [
+          "+30 49 1.287",
+          "+30 49 1.283"
+        ],
+        "PC2_1": [
+          "-0.964969585260955",
+          "-0.964968346013625"
+        ],
+        "RA": [
+          "311.900361054106",
+          "311.900361003463"
+        ],
+        "DEC": [
+          "30.8170241998146",
+          "30.8170231023038"
+        ],
+        "CRVAL2": [
+          "30.8201084166999",
+          "30.820107332011"
+        ],
+        "PC2_2": [
+          "0.26236177221787",
+          "0.262366330141139"
+        ]
+      }
+    },
+    "baseline_repeat/Session 1\\R1C1\\process\\mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 113814948,
+      "pixels": 114975864,
+      "max_abs": 0.058874890208244324,
+      "rms": 4.0072361912870636e-05,
+      "header_differences": {
+        "CRVAL1": [
+          "311.89809257232",
+          "311.89809237678"
+        ],
+        "PC1_2": [
+          "0.964969585260955",
+          "0.964969532486957"
+        ],
+        "PC1_1": [
+          "0.26236177221787",
+          "0.262361966321157"
+        ],
+        "FOCALLEN": [
+          "306.813928239504",
+          "306.813882233198"
+        ],
+        "CDELT2": [
+          "0.000448186533187813",
+          "0.000448186600392747"
+        ],
+        "CDELT1": [
+          "-0.000448186533187813",
+          "-0.000448186600392747"
+        ],
+        "OBJCTDEC": [
+          "+30 49 1.287",
+          "+30 49 1.289"
+        ],
+        "PC2_1": [
+          "-0.964969585260955",
+          "-0.964969532486957"
+        ],
+        "RA": [
+          "311.900361054106",
+          "311.900360858198"
+        ],
+        "DEC": [
+          "30.8170241998146",
+          "30.817024798723"
+        ],
+        "CRVAL2": [
+          "30.8201084166999",
+          "30.8201090164626"
+        ],
+        "PC2_2": [
+          "0.26236177221787",
+          "0.262361966321157"
+        ]
+      }
+    },
+    "managed/Session 1\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    },
+    "baseline_repeat/Session 1\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "managed/Session 1\\R1C1\\process\\R1C1_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 60437287,
+      "pixels": 60543936,
+      "max_abs": 0.041282713413238525,
+      "rms": 4.745553614787265e-05,
+      "header_differences": {}
+    },
+    "baseline_repeat/Session 1\\R1C1\\process\\R1C1_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 60430770,
+      "pixels": 60543936,
+      "max_abs": 0.069591224193573,
+      "rms": 3.862378509967854e-05,
+      "header_differences": {}
+    },
+    "managed/Session 1\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    },
+    "baseline_repeat/Session 1\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "managed/Session 1\\R1C2\\process\\R1C2_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 60420552,
+      "pixels": 60543936,
+      "max_abs": 0.02308577299118042,
+      "rms": 6.124268785665191e-05,
+      "header_differences": {}
+    },
+    "baseline_repeat/Session 1\\R1C2\\process\\R1C2_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": false,
+      "different_pixels": 60409688,
+      "pixels": 60543936,
+      "max_abs": 0.043628618121147156,
+      "rms": 8.034849247623259e-05,
+      "header_differences": {}
+    },
+    "managed/Session 2\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    },
+    "baseline_repeat/Session 2\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "managed/Session 2\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    },
+    "baseline_repeat/Session 2\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    }
+  },
+  "compression": "gzip2",
+  "background": "on",
+  "inputs_unchanged": true
+}

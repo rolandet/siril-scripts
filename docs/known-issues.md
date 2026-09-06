@@ -34,3 +34,11 @@ These areas have caused problems or confusion in previous development and should
 - Add command-syntax validation notes for Siril 1.4.x as commands are verified.
 - Add path containment checks around destructive working-directory cleanup.
 - Consider splitting the single-file app only if the user asks for a refactor.
+
+## Low-disk mode limits
+
+- Low-disk processing currently supports normal OSC mosaics on Siril 1.4.4. Keep intermediates is required for other modes. This does not fix or diagnose a native Siril heap-corruption crash.
+- The peak estimate uses uncompressed sizes and an explicit reserve. WCS canvas estimates remain provisional until solving; large gaps, drizzle, copied aliases, locked files and other applications' disk use can increase requirements. Guards check free space before each allocating stage; they cannot reserve the filesystem against other processes.
+- Recovery retains completed panels, not every intermediate stage. Changed sources, masters or relevant Siril settings require a new run. Unsupported library expressions disable reuse and recovery rather than assuming equivalence.
+- Deleting temporary sequences removes the ability to immediately re-stack them. Raw inputs can recreate them. Existing unrelated working folders and older run bundles are never automatically adopted or cleared.
+- Final files and per-panel generated masters are kept at the legacy user-facing locations. Shared flat caches and diagnostic files remain in each run bundle; completed scratch duplicates are released after promotion.

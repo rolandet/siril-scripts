@@ -1,12 +1,12 @@
-# Current Features - osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py
+# Current Features - osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py
 
-Source reviewed: `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`
+Source reviewed: `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py`
 
 `osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
 ## Summary
 
-`osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, experimental mosaic processing, and optional Ha/OIII and SII/OIII narrowband extraction. When narrowband extraction is enabled, it generates the narrowband final instead of the normal OSC RGB final.
+`osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, experimental mosaic processing, and optional Ha/OIII and SII/OIII narrowband extraction. When narrowband extraction is enabled, it generates the narrowband final instead of the normal OSC RGB final.
 
 ## Core project model
 
@@ -128,7 +128,7 @@ In v3.0 narrowband mode, the same background extraction controls are reused afte
 
 ## Narrowband extraction behavior in v3.0
 
-When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`, generated scripts:
+When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py`, generated scripts:
 
 - Calibrate narrowband lights as CFA and do not emit `-debayer`.
 - Run `seqextract_HaOIII pp_light -resample=ha` for Ha/OIII and SII/OIII filter groups.
@@ -267,3 +267,17 @@ Abort behavior is intended for CLI runs. On Windows it sends `CTRL_BREAK_EVENT`;
 - Current mosaic canvas scaling saves `mosaic_final_scaled.fit`, but final promotion still loads `mosaic_final.fit`; treat this as existing behavior unless changing it explicitly.
 - The About dialog text appears to contain a typo: `winorized` instead of `winsorized`.
 - There is duplicated initial window sizing/centering code in `MainWindow.__init__`; this is harmless but could be cleaned later.
+
+## Low disk usage for OSC mosaics
+
+The Mosaic Processing tab offers **Keep intermediates** (the default for existing projects) and **Low disk usage (OSC mosaic)**. Low disk usage requires Siril 1.4.4 and individual FITS inputs. Non-mosaic and narrowband projects must use Keep intermediates.
+
+Low disk usage finishes all nights for one panel before starting the next. It retains calibration, background extraction, both registration stages, distortion correction, drizzle, rejection, normalization and final orientation. Successful consumers release their temporary prerequisites. Raw files, supplied masters, generated master copies, completed panel stacks and final mosaic products are retained.
+
+Choose **Uncompressed** or **Lossless GZIP2 (no quantization)** separately from the legacy compression checkbox. GZIP2 intermediates use `.fit.fz`; panel finals and the final mosaic use `.fit`. No precision-reduction command is added.
+
+`Prepare Working Directory` creates the project folder only in this mode. `Build Siril Script` creates a new `.osc_low_disk/<run-id>` bundle containing a manifest, standalone worker and command review. Input aliases are created when needed. Running the exported SSF requires that bundle and the original input paths.
+
+Use **Run / Resume in Siril** to retry the same bundle. Completed panels are reused only when their hashes and input/settings signatures match. Incomplete panels restart from raw inputs; Build starts a new run. Unknown library expressions disable flat reuse and require a new build for a retry. Keep intermediates remains useful for experimenting with already registered subframes.
+
+`state.json`, `run.log`, `python.log` and small sequence/WCS checkpoint records remain in each bundle. Abort requests stop at a command boundary; Siril's Stop button can interrupt an active API command. A failure never triggers an automatic retry through another execution mode.

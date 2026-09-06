@@ -57,3 +57,11 @@ Update `CHANGELOG.md` for user-facing behavior changes. Update docs when a Siril
 ## Prefer small changes
 
 Codex should make small, reviewable changes with clear explanations. Large refactors should be avoided unless the user explicitly asks for them.
+
+## Managed OSC mosaic storage
+
+The low-disk builder compiles image commands from the existing mosaic generator instead of maintaining a separate calibration/registration algorithm. A collection-only switch bypasses legacy prepared-folder discovery and its mutating geometry preflight; the managed builder validates the selected FITS inputs and rejects mixed geometry without moving source files. Independent panels are then scheduled sequentially. The original per-night distortion registration and cross-night registration are both retained.
+
+Cleanup is an explicit dependency operation. A run has a unique scratch directory and an ownership manifest; successful Siril commands, valid FITS payload extents, expected membership, retained output copies and atomic checkpoints precede release. Merge aliases are removed before their backing registered images. Directory reparse points and unowned/replaced entries are refused. Persistent file locks leave files in the live-space budget. Small selection/transform/WCS records are archived before image cleanup.
+
+Generated workers use source captured when the application module loaded. Editing the script while its UI is open therefore cannot combine stale Python line numbers with newer source text during export. Siril 1.4.4's Python-exit-status and buffered-output behavior require one command controller, file-based Python diagnostics and a completion receipt in a unique directory for each invocation for exported SSF. The application runs the same controller in an API worker thread or through the CLI launcher, with no automatic fallback after managed processing starts.

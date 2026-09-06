@@ -1,0 +1,153 @@
+{
+  "runs": {
+    "baseline": {
+      "exit_code": 0,
+      "seconds": 116.62213778495789,
+      "sampled_peak_bytes": 20792699778,
+      "retained_bytes": 20792699778
+    },
+    "managed": {
+      "exit_code": 0,
+      "seconds": 280.20383167266846,
+      "sampled_peak_bytes": 3827917633,
+      "retained_bytes": 1767196753,
+      "state": {
+        "status": "complete",
+        "error": null,
+        "peak_bytes": 3819623294,
+        "bytes_deleted": 15756770458
+      },
+      "estimate": 4231593011
+    }
+  },
+  "comparisons": {
+    "Veil_Nebula_Mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 114975864,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C1\\process\\mosaic_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 114975864,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    },
+    "Session 1\\R1C1\\process\\R1C1_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 60543936,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 1\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    },
+    "Session 1\\R1C2\\process\\R1C2_final.fit": {
+      "shape_equal": true,
+      "dtype_equal": true,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 60543936,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {}
+    },
+    "Session 2\\R1C1\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    },
+    "Session 2\\R1C2\\process\\pp_flat_stacked.fit": {
+      "shape_equal": true,
+      "dtype_equal": false,
+      "finite_mask_equal": true,
+      "pixels_equal": true,
+      "different_pixels": 0,
+      "pixels": 20181312,
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "header_differences": {
+        "BZERO": [
+          "0.0",
+          "None"
+        ],
+        "EXTEND": [
+          "True",
+          "None"
+        ]
+      }
+    }
+  },
+  "compression": "gzip2",
+  "background": "on",
+  "controlled_no_dither": true,
+  "inputs_unchanged": true
+}

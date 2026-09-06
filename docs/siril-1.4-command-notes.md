@@ -103,3 +103,22 @@ The following areas should be revalidated before major changes:
 - Compression toggling.
 - Normalization options such as `addscale`.
 - Stacking flags and output naming.
+
+## Managed low-disk OSC mosaics (Siril 1.4.4)
+
+- Explicit lossless tile compression is `setcompress 1 -type=gzip2 0`. Zero disables floating-point quantization. File extension remains `.fit.fz`. `setcompress 0` precedes final uncompressed stacks. The legacy `setcompress 1` behavior remains preference-driven.
+- Quote an entire option containing a path: `calibrate flat "-bias=C:/Calibration Files/bias.fit"`. Quoting only the portion after `=` does not work for general Siril arguments. Managed input folders retain `convert ... -out=../process`.
+- `close` releases Siril's open image and sequence before cleanup. Siril has no general file-deletion command; the Python runtime deletes only explicitly recorded, validated run artifacts.
+- A `pyscript` call waits, but Siril 1.4.4 does not propagate Python failure as an SSF failure. Therefore a single Python controller owns all image commands and checks synchronous `SirilInterface.cmd` responses. The exported launcher requires a FITS receipt in a unique directory for that invocation before displaying the final. API/CLI app execution also checks fresh completion state. A missing receipt makes the launcher fail.
+- Verbose child Python stdout/stderr can fill the pipes while Siril waits for `pyscript`. Runtime diagnostics and third-party Python warnings go to run files; native Siril command logging remains available.
+- Library `%s` expansion trims leading/trailing spaces and replaces internal spaces with underscores. Common numeric/header substitutions and documented aliases are fingerprinted. Unsupported expressions are never guessed for reuse or recovery.
+- Mosaic canvas budgeting uses the solved RGB images' **two-dimensional** celestial WCS (`WCS(..., naxis=2)`), with allowance for uncertainty. It does not modify registration geometry.
+
+Sources: [commands and argument quoting](https://siril.readthedocs.io/en/stable/Commands.html), [FITS compression](https://siril.readthedocs.io/en/stable/file-formats/FITS.html#compression), [path parsing](https://siril.readthedocs.io/en/stable/Pathparsing.html), [Python API](https://siril.readthedocs.io/en/stable/Python-API.html). Failure propagation and buffered-pipe behavior were verified with the installed Windows Siril 1.4.4.
+
+
+The exported launcher first enters an empty failure directory. Only a successful controller changes to its new receipt directory; the following `load completed.fit` is relative. Old receipts cannot satisfy a failed launch. Native checks covered failure before connecting and after image commands.
+
+Siril/CFITSIO on Windows rejected a staged FITS path at the long-path boundary during validation. Managed run/session names are short; building rejects staged input paths of 260 or more characters and asks for a shorter working directory.
+
+`seqsubsky` adds dithering by default. The validation harness can add the documented `-nodither` option to **both test paths** to isolate storage/compression behavior; production commands keep the existing dithering behavior.

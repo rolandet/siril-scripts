@@ -6,6 +6,12 @@ All notable user-facing changes to this project should be documented here.
 
 ### Added
 
+- Created `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py` for the storage improvements; preserved v3.0 unchanged.
+- Added opt-in `Low disk usage` for normal OSC mosaics on Siril 1.4.4: finish each panel across its nights, validate outputs, then remove run-owned temporary sequences. Both registration stages and all image-processing settings are retained.
+- Added within-run, within-session reuse of identical flat calculations, isolated scratch bundles, source/master fingerprints, atomic checkpoints, completed-panel recovery, and free-space checks with a configurable reserve (20 GiB by default).
+- Added explicit uncompressed / lossless GZIP2 intermediate choices for low-disk runs. GZIP2 uses quantization zero and `.fit.fz` files; final stacks remain uncompressed `.fit`.
+- Added managed API/CLI execution with checked command completion, cancellation, persistent logs, and standalone exported workers. Old projects retain `Keep intermediates`; non-mosaic and narrowband processing retain their existing builders.
+
 - Added Codex-facing documentation updates for the current `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` architecture, features, Siril command assumptions, risks, and testing expectations.
 - Added a non-mosaic `Background Extraction` option that emits `seqsubsky pp_light 1` after calibration and before alignment, then processes the resulting `bkg_pp_light` sequence.
 - Added v3.0 narrowband extraction support in `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` for Ha/OIII and SII/OIII dual-band OSC data, including mono Ha/SII/OIII stacks and SHO output with HOO fallback.
@@ -21,6 +27,8 @@ All notable user-facing changes to this project should be documented here.
 - Added generated-script coverage for enabled/disabled single-session, multi-session, and mosaic distortion-correction workflows, including legacy project migration and packed-sequence compatibility.
 
 ### Changed
+
+- Renamed the legacy compression checkbox to `Compress Intermediates (Siril settings)`: its existing behavior uses Siril preferences and does not itself guarantee lossless floating-point compression.
 
 - Changed v3.0 mosaic feathering to default to `Auto-calculate feathering from Overlap %`, matching the overlap-based planning model used by N.I.N.A. The pixel field is read-only in automatic mode and now displays the calculation and source frame geometry.
 - Automatic mosaic feathering now reads representative light-frame FITS headers as soon as project data is available, without requiring `Prepare Working Directory`. Mixed frame sizes are reported and use the smallest short edge conservatively.
