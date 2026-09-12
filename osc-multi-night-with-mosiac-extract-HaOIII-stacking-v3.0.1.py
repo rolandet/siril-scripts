@@ -1123,6 +1123,21 @@ class StorageRuntime:
 
     SCHEMA = 1
 
+    @staticmethod
+    def format_elapsed(seconds):
+        try:
+            total = max(0, int(float(seconds)))
+        except (TypeError, ValueError, OverflowError):
+            return "n/a"
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        remaining = total % 60
+        if hours:
+            return f"{hours}h {minutes}m {remaining}s"
+        if minutes:
+            return f"{minutes}m {remaining}s"
+        return f"{remaining}s"
+
     def __init__(self, manifest_path, iface, *, reserve_bytes=None, started_ns=None):
         from astropy.io import fits as fits_io
         self.fits = fits_io
@@ -1754,11 +1769,17 @@ class StorageRuntime:
             import numpy as np
             self.fits.PrimaryHDU(np.zeros((1, 1), dtype=np.uint16)).writeto(self.receipt, overwrite=False)
             self.command('cd "' + self.receipt.parent.as_posix() + '"')
+            finished_ns = time.time_ns()
             self.state["status"] = "complete"
-            self.state["finished_ns"] = time.time_ns()
+            self.state["finished_ns"] = finished_ns
+            self.state["elapsed_seconds"] = max(
+                0.0, (finished_ns - int(self.state["started_ns"])) / 1_000_000_000
+            )
             self.state["receipt"] = str(self.receipt)
             self.write_state()
-            self.log(f"COMPLETE peak_owned_bytes={self.state['peak_bytes']} "
+            self.log(f"COMPLETE elapsed={self.format_elapsed(self.state['elapsed_seconds'])} "
+                     f"elapsed_seconds={self.state['elapsed_seconds']:.3f} "
+                     f"peak_owned_bytes={self.state['peak_bytes']} "
                      f"deleted_bytes={self.state['bytes_deleted']}")
         except BaseException as exc:
             if self.receipt.exists():
@@ -2141,6 +2162,7 @@ class LowDiskMosaicPlan:
                           "pyscript " + self.quote(self.folder / "worker.py") + " " + self.quote(self.manifest_path),
                           "# Only this invocation's successful controller enters its receipt folder.",
                           "load completed.fit",
+                          "cd " + self.quote(self.work),
                           "load " + self.quote(self.work / final_name), ""])
 
     def write(self):
@@ -8232,6 +8254,20 @@ class ProjectWidget(QtWidgets.QWidget):
         self.sp_storage_reserve.setEnabled(managed and supported)
         self.cb_compress.setEnabled(not managed)
         self.btn_run_siril.setText("Run / Resume in Siril" if managed else "Run in Siril")
+        if managed:
+            self.btn_prepare.setToolTip(
+                "Creates or validates the project working directory.\n"
+                "Low-disk mosaic input aliases and scratch folders are created on demand "
+                "as each processing stage runs.\n"
+                "Build a new Siril script after preparation."
+            )
+        else:
+            self.btn_prepare.setToolTip(
+                "Creates the required temporary directory structure for the project.\n"
+                "Copies or links image files into per-session folders and initializes "
+                "the preparation log.\n"
+                "Run this before building the Siril script."
+            )
 
     def _set_storage_busy(self, busy):
         if busy:
@@ -8264,17 +8300,33 @@ class ProjectWidget(QtWidgets.QWidget):
         self._storage_thread.status.connect(lambda text: self.lbl_run_mode.setText(text) if text.startswith("STAGE ") else None)
         def finished():
             error = self._storage_thread.error
+            plan = None
             self._set_storage_busy(False)
             try:
                 if error:
                     raise RuntimeError(error)
-                state = check_storage_completion(manifest, self._managed_started_ns)
                 plan = json.loads(manifest.read_text(encoding="utf-8"))
+                state = check_storage_completion(manifest, self._managed_started_ns)
+                self.siril.iface.cmd("cd " + LowDiskMosaicPlan.quote(plan["work"]))
                 self.siril.iface.cmd("load " + LowDiskMosaicPlan.quote(plan["final"]))
+                elapsed_seconds = state.get("elapsed_seconds")
+                if elapsed_seconds is None:
+                    started_ns = int(state.get("started_ns", self._managed_started_ns))
+                    finished_ns = int(state.get("finished_ns", time.time_ns()))
+                    elapsed_seconds = max(0.0, (finished_ns - started_ns) / 1_000_000_000)
+                elapsed_txt = StorageRuntime.format_elapsed(elapsed_seconds)
+                self.siril.log(f"[low-disk] Processing completed in {elapsed_txt}.")
                 self.lbl_run_mode.setText("Low-disk run completed")
                 QtWidgets.QMessageBox.information(self, "Run complete",
-                    f"Processing completed. Measured peak owned files: {state.get('peak_bytes', 0) / 2**30:.1f} GiB.\n\nLog: {manifest.parent / 'run.log'}")
+                    f"Processing completed in {elapsed_txt}.\n"
+                    f"Measured peak owned files: {state.get('peak_bytes', 0) / 2**30:.1f} GiB.\n\n"
+                    f"Log: {manifest.parent / 'run.log'}")
             except Exception as exc:
+                if plan:
+                    try:
+                        self.siril.iface.cmd("cd " + LowDiskMosaicPlan.quote(plan["work"]))
+                    except Exception:
+                        pass
                 self.lbl_run_mode.setText("Low-disk run stopped")
                 QtWidgets.QMessageBox.critical(self, "Run stopped",
                     f"{exc}\n\nCompleted panels are retained. Run again to resume the same bundle.\nLog: {manifest.parent / 'run.log'}")

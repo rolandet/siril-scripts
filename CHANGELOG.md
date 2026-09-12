@@ -59,6 +59,9 @@ All notable user-facing changes to this project should be documented here.
 
 ### Fixed
 
+- Restored Siril's current working directory to the project root after low-disk managed runs instead of leaving the receipt directory active.
+- Added total elapsed-time reporting to low-disk Siril API runs. The duration is now persisted in `state.json` and `run.log`, written to the Siril log, and shown in the completion dialog.
+- Updated the `Prepare Working Directory` tooltip to describe on-demand input aliases and scratch folders when `Low disk usage` is selected, while retaining the immediate per-session preparation description for `Keep intermediates`.
 - Fixed `Remove Data (All Sessions)` leaving the status bar showing `Project has unsaved changes.` when the project was clean. The cleanup now restores both the dirty flag and its visible status.
 - Fixed v3.0 linked mosaic feathering silently retaining a stale pixel value after reopening a project. Script generation now recalculates automatic feathering and stops with a clear warning when no readable light-frame geometry is available.
 - Fixed automatic mosaic feathering for FPACK tile-compressed `.fit.fz`/`.fits.fz` lights by reading `ZNAXIS1/ZNAXIS2` from compressed-image extensions without decompressing image data.
