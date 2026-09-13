@@ -28,6 +28,7 @@ All notable user-facing changes to this project should be documented here.
 
 ### Changed
 
+- `Remove Data (All Sessions)` now offers a checked-by-default option to delete completed `.osc_low_disk` run bundles, reports their size, removes the empty managed container, and protects unfinished, invalid, or unsafe bundles.
 - Renamed the legacy compression checkbox to `Compress Intermediates (Siril settings)`: its existing behavior uses Siril preferences and does not itself guarantee lossless floating-point compression.
 
 - Changed v3.0 mosaic feathering to default to `Auto-calculate feathering from Overlap %`, matching the overlap-based planning model used by N.I.N.A. The pixel field is read-only in automatic mode and now displays the calculation and source frame geometry.

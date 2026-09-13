@@ -2238,6 +2238,68 @@ def check_storage_completion(manifest, started_ns):
     return state
 
 
+def _format_storage_size(size):
+    value = float(max(0, size))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024.0
+
+
+def _low_disk_tree_size(path):
+    """Measure a managed run without following aliases or directory reparse points."""
+    total = 0
+    pending = [Path(path)]
+    while pending:
+        directory = pending.pop()
+        st = directory.lstat()
+        if directory.is_symlink() or getattr(st, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"Refusing a reparse-point run directory: {directory}")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                entry_stat = entry.stat(follow_symlinks=False)
+                if entry.is_symlink():
+                    total += entry_stat.st_size
+                elif getattr(entry_stat, "st_file_attributes", 0) & 0x400:
+                    raise ValueError(f"Refusing a reparse point in a run bundle: {entry.path}")
+                elif entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                else:
+                    total += entry_stat.st_size
+    return total
+
+
+def _completed_low_disk_runs(work):
+    """Return (root, completed [(path, bytes)], protected names) for explicit cleanup."""
+    project_root = Path(work).resolve()
+    low_disk_root = project_root / ".osc_low_disk"
+    if not low_disk_root.exists():
+        return low_disk_root, [], []
+
+    root_stat = low_disk_root.lstat()
+    if low_disk_root.is_symlink() or getattr(root_stat, "st_file_attributes", 0) & 0x400:
+        return low_disk_root, [], [".osc_low_disk (reparse point)"]
+
+    completed = []
+    protected = []
+    for run_dir in sorted((p for p in low_disk_root.iterdir() if p.name != "active.lock"),
+                          key=lambda p: p.name.lower()):
+        try:
+            run_stat = run_dir.lstat()
+            if (not run_dir.is_dir() or run_dir.is_symlink()
+                    or getattr(run_stat, "st_file_attributes", 0) & 0x400):
+                protected.append(run_dir.name)
+                continue
+            state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+            if state.get("status") != "complete":
+                protected.append(run_dir.name)
+                continue
+            completed.append((run_dir, _low_disk_tree_size(run_dir)))
+        except Exception:
+            protected.append(run_dir.name)
+    return low_disk_root, completed, protected
+
+
 class SirilCommandBuilder:
     def __init__(self, project: Project): self.project = project
 
@@ -5621,6 +5683,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.btn_remove_data_all = QtWidgets.QPushButton("Remove Data (All Sessions)")
         self.btn_remove_data_all.setToolTip(
             "Delete all on-disk temporary data for every session in this project.\n"
+            "The confirmation can also remove completed low-disk run bundles.\n"
             "Keeps the project configuration and session definitions in the UI.\n"
             "Use when you want to re-run processing from scratch without losing setup."
         )
@@ -7652,15 +7715,40 @@ class ProjectWidget(QtWidgets.QWidget):
 
             work = Path(p.working_dir).resolve()
             targets = [work / (s.work_subdir or s.name) for s in p.sessions]
+            low_disk_root, completed_runs, protected_runs = _completed_low_disk_runs(work)
+            completed_bytes = sum(size for _path, size in completed_runs)
 
-            resp = QtWidgets.QMessageBox.question(
-                self,
-                "Remove Data (All Sessions)",
-                "Delete on-disk data for ALL sessions (configs kept)?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No,
+            dialog = QtWidgets.QMessageBox(self)
+            dialog.setIcon(QtWidgets.QMessageBox.Icon.Question)
+            dialog.setWindowTitle("Remove Data (All Sessions)")
+            dialog.setText("Delete on-disk data for ALL sessions (configs kept)?")
+            run_word = "run" if len(completed_runs) == 1 else "runs"
+            details = (
+                f"{len(completed_runs)} completed low-disk {run_word} can also be removed "
+                f"({_format_storage_size(completed_bytes)}).\n"
+                "This includes logs, checkpoints, worker files, and cached flats. "
+                "Final images and configured source subs are preserved."
             )
-            if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            if protected_runs:
+                protected_word = "bundle" if len(protected_runs) == 1 else "bundles"
+                details += (
+                    f"\n\n{len(protected_runs)} unfinished, invalid, or unsafe low-disk "
+                    f"{protected_word} will be kept."
+                )
+            dialog.setInformativeText(details)
+            dialog.setStandardButtons(
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            )
+            dialog.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
+            remove_low_disk = QtWidgets.QCheckBox(
+                f"Also remove completed low-disk run data ({_format_storage_size(completed_bytes)})"
+            )
+            remove_low_disk.setChecked(bool(completed_runs))
+            remove_low_disk.setEnabled(bool(completed_runs))
+            if not completed_runs:
+                remove_low_disk.setText("No completed low-disk run data found")
+            dialog.setCheckBox(remove_low_disk)
+            if dialog.exec() != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
 
             ok = fail = 0
@@ -7672,7 +7760,41 @@ class ProjectWidget(QtWidgets.QWidget):
                 except Exception:
                     fail += 1
 
-            QtWidgets.QMessageBox.information(self, "Remove Data", f"Done.\nOK: {ok}\nFailed: {fail}")
+            low_disk_ok = low_disk_fail = 0
+            if remove_low_disk.isChecked():
+                for run_dir, _size in completed_runs:
+                    try:
+                        # Recheck status and path shape immediately before destructive cleanup.
+                        current_root, current_runs, _protected = _completed_low_disk_runs(work)
+                        current_paths = {path for path, _bytes in current_runs}
+                        if current_root != low_disk_root or run_dir not in current_paths:
+                            raise ValueError("Run is no longer eligible for completed-run cleanup")
+                        shutil.rmtree(run_dir)
+                        low_disk_ok += 1
+                    except Exception:
+                        low_disk_fail += 1
+
+                # Remove the managed container when its persistent lock file is
+                # the only entry left. A live Windows lock safely makes this fail.
+                try:
+                    remaining = list(low_disk_root.iterdir()) if low_disk_root.exists() else []
+                    if remaining and all(path.name == "active.lock" and path.is_file() for path in remaining):
+                        remaining[0].unlink()
+                        low_disk_root.rmdir()
+                    elif not remaining and low_disk_root.exists():
+                        low_disk_root.rmdir()
+                except Exception:
+                    low_disk_fail += 1
+
+            result = f"Done.\nSession folders OK: {ok}\nSession folders failed: {fail}"
+            if remove_low_disk.isChecked():
+                result += (
+                    f"\nCompleted low-disk runs removed: {low_disk_ok}"
+                    f"\nLow-disk cleanup failures: {low_disk_fail}"
+                )
+            if protected_runs:
+                result += f"\nProtected low-disk runs kept: {len(protected_runs)}"
+            QtWidgets.QMessageBox.information(self, "Remove Data", result)
         finally:
             self._suspend_dirty = was_suspended
             self._dirty = was_dirty
