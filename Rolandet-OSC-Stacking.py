@@ -1,0 +1,9274 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, 
+# or (at your option) any later version. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+# PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# See <https://www.gnu.org/licenses/>.
+"""
+Multi-Night Stacking for Siril 1.4 (PyQt6) - with Siril console integration (sirilpy) - version 3.0.1
+
+What's inside:
+- JSON projects (persist drizzle options + 2-pass flag); new project starts with one session.
+- Prepare Working Directory (symlink→hardlink→copy) with logs + Siril console progress.
+- Master Library or per-session master overrides (bias/dark/flat); OSC-first pipeline.
+- Drizzle workflow per Siril 1.4 docs:
+    * Drizzle ON: NO -debayer during calibrate; register (-layer=0 [+ -2pass]); seqapplyreg (-scale, -drizzle, -pixfrac, -kernel); stack r_*.
+    * Drizzle OFF: include -debayer in calibrate; register (-layer=0 [+ -2pass]); stack r_*.
+- Global stack options (Winsorized / Sigma / GESDT rejection, Mean, or Median) with method-specific rejection parameters.
+- SSF: requires 1.4.0, setcompress 0, setfindstar reset (start & end), final close.
+- Final save to <project_slug>_final.fit, or <project_slug>_<palette>_final.fit in narrowband mode, and auto-open in Siril.
+- Remove Session (config+name+data) and Remove Data (All Sessions) (data only).
+- Guarded session switching to prevent file list cross-contamination.
+- NEW: Abort Run (graceful stop of siril-cli).
+- Compression support
+- 32-bit output
+- Pack Sequence feature for > 2048 open files
+- Mosaic feature
+- Ha/OIII and SII/OIII narrowband extraction feature
+"""
+from __future__ import annotations
+
+import json, os, platform, re, shutil, subprocess, sys, signal, time
+import copy
+import hashlib
+import ast
+import math
+import shlex
+import stat
+import uuid
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from collections import Counter
+
+# Freeze worker source with the loaded app, so editing this file while its UI is
+# open cannot mix a new worker body with old live Python function line numbers.
+_STORAGE_LOADED_SOURCE = Path(__file__).read_text(encoding="utf-8-sig")
+try:
+    from astropy.io import fits
+except Exception:
+    fits = None  # We'll skip preflight if astropy isn't available
+
+from pathlib import Path
+
+# ---------- Quick Start (embedded markdown + dialog) ----------
+QUICK_START_MD = r"""
+### Setup Steps
+
+1. **Create or Load a Project**
+   - Click **New Project** → choose your target root folder
+   - Check or uncheck features and options
+   - Add Sessions and Panels (for mosaic) as needed
+   - Add LIGHTS, FLATS, DARKS, BIAS frames to Sessions or Panels as needed
+   - The app auto-detects all session folders (Session 1, Session 2, …) if they were previously created.  
+   - Check or uncheck features and options as needed
+2. **Prepare Working Directory (Symlink/copy Files)**
+   - Inside each `Session X` folder.    
+   - **Why:** Siril reads and writes intermediate calibrated and registered FITS frames inside this directory.  
+   - Each session will therefore have:
+
+        ```
+        Session 1/process/
+        Session 2/process/
+       ...
+       ```
+3. **Generate Siril Script**  
+   - Confirm features and option settings.
+   - Click **Build Siril Script**
+   - The application writes its `.ssf` script file into the *working directory*   
+
+4. **Run Siril Script**
+
+   - Click the **Run Siril Script** button in the main window.  
+   - The application automatically executes the configured **`run_project.ssf`** Siril script via the Siril Python API or uses the **`siril-cli`** as a backup
+   - Progress and script output appear in the console log panel in Siril and in a log file in the *working directory*
+   - When finished, your combined stack is saved automatically as **`[ProjectName]_final.fit`** and loaded into Siril; narrowband mode adds the palette, for example **`[ProjectName]_SHO_final.fit`**
+"""
+
+class QuickStartDialog(QtWidgets.QDialog):
+    """Dismissible, laptop-friendly dialog that renders the embedded Markdown."""
+    def __init__(self, markdown_text: str, parent=None):
+        super().__init__(parent)
+        font = self.font()
+        font.setPointSizeF(font.pointSizeF() * 1.2)  # 1.2x → ~20 % larger text
+        self.setFont(font)
+        self.setWindowTitle("Quick Start Instructions")
+        self.setModal(True)
+        self.setSizeGripEnabled(True)
+
+        # Size tuned for 1080p; scrollable for smaller screens
+        avail = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        w = min(1000, int(avail.width() * 0.75))
+        h = min(720,  int(avail.height() * 0.72))
+        self.resize(max(720, w), max(540, h))
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.viewer = QtWidgets.QTextBrowser(self)
+        self.viewer.setOpenExternalLinks(True)
+        self.viewer.setReadOnly(True)
+        # Slightly larger headings and comfy spacing
+        self.viewer.document().setDefaultStyleSheet("""
+            h1,h2,h3 { margin: 0.4em 0 0.3em; }
+            p, li { line-height: 1.35; }
+            ul, ol { margin: 0.3em 0 0.8em 1.2em; }
+            code, pre { font-family: Consolas, 'Courier New', monospace; }
+        """)
+        # Use Markdown if available (Qt 6 supports it)
+        try:
+            self.viewer.setMarkdown(markdown_text)
+        except Exception:
+            self.viewer.setPlainText(markdown_text)
+        layout.addWidget(self.viewer, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        # Keyboard shortcuts
+        QtGui.QShortcut(QtGui.QKeySequence("Escape"), self, activated=self.reject)
+
+def to_path_or_none(s):
+    """Return Path(s) if s is a non-empty string, else None."""
+    return Path(s) if s else None
+
+def _resolve_cal_paths(project, sess, panel=None):
+    """
+    Decide which calibration frames (bias, dark-flat, dark, flat) to use
+    for a given session/panel combination.
+    Returns (md, mf, mb, mdf) as Optional[Path].
+    Priority: panel override → session override → master library → None.
+    """
+    def P(x):
+        """Return Path(x) if non-empty string/path-like, else None."""
+        return Path(x) if x else None
+
+    use_lib = bool(getattr(project, "use_master_library", False))
+
+    # Session-level overrides
+    s_dark     = getattr(sess, "master_dark", None)
+    s_flat     = getattr(sess, "master_flat", None)
+    s_bias     = getattr(sess, "master_bias", None)
+    # accept both spellings
+    s_darkflat = getattr(sess, "master_dark_flat", None)
+    if not s_darkflat:
+        s_darkflat = getattr(sess, "master_darkflat", None)
+
+    # Panel-level overrides (if mosaic)
+    p_dark = p_flat = p_bias = p_darkflat = None
+    if panel is not None:
+        p_dark     = getattr(panel, "master_dark", None)
+        p_flat     = getattr(panel, "master_flat", None)
+        p_bias     = getattr(panel, "master_bias", None)
+        p_darkflat = getattr(panel, "master_darkflat", None)
+
+    # Library masters
+    lib_dark      = getattr(project, "lib_master_dark", None)
+    lib_flat      = getattr(project, "lib_master_flat", None)
+    lib_bias      = getattr(project, "lib_master_bias", None)
+    lib_darkflat  = getattr(project, "lib_master_darkflat", None)
+
+    def choose(one, two, three):
+        # order: panel → session → library (only if library use enabled)
+        if one: return P(one)
+        if two: return P(two)
+        if use_lib and three: return P(three)
+        return None
+
+    md  = choose(p_dark,     s_dark,     lib_dark)
+    mf  = choose(p_flat,     s_flat,     lib_flat)
+    mb  = choose(p_bias,     s_bias,     lib_bias)
+    mdf = choose(p_darkflat, s_darkflat, lib_darkflat)
+
+    return md, mf, mb, mdf
+
+def _warn(L, msg: str):
+    L.append(f"# WARN: {msg}")
+
+def modal_geometry(filepaths):
+    sizes = []
+    for fp in filepaths:
+        try:
+            with fits.open(fp, memmap=False) as hdul:
+                h = hdul[0].header
+                sizes.append((int(h.get("NAXIS1", 0)), int(h.get("NAXIS2", 0))))
+        except Exception:
+            continue
+    if not sizes:
+        return None, Counter()
+    c = Counter(sizes)
+    return c.most_common(1)[0][0], c
+
+def preflight_geometry(lights_dir: Path, process_dir: Path,
+                       master_dark: Optional[Path], master_flat: Optional[Path],
+                       logger=print):
+    """Move non-matching geometry lights out of the way and warn on master mismatches."""
+    if fits is None:
+        logger("Geometry preflight skipped (astropy not available).")
+        return
+
+    # We convert with -out=../process, so check in process_dir
+    light_files = sorted((process_dir).glob("light_*.fit"))
+    if not light_files:
+        logger("No converted lights found for geometry preflight.")
+        return
+
+    (W, H), counts = modal_geometry(light_files)
+    if W is None:
+        logger("Could not read geometry from lights.")
+        return
+
+    # Park outliers
+    reject_dir = process_dir / "_mismatch_geometry"
+    moved = 0
+    for fp in light_files:
+        try:
+            with fits.open(fp, memmap=False) as hdul:
+                w = int(hdul[0].header.get("NAXIS1", 0))
+                h = int(hdul[0].header.get("NAXIS2", 0))
+            if (w, h) != (W, H):
+                reject_dir.mkdir(exist_ok=True)
+                fp.rename(reject_dir / fp.name)
+                moved += 1
+        except Exception:
+            continue
+
+    if moved:
+        logger(f"[preflight] Moved {moved} outlier light(s) to {reject_dir} "
+               f"(kept modal geometry {W}x{H}; counts={dict(counts)})")
+    else:
+        logger(f"[preflight] All lights share geometry {W}x{H} (counts={dict(counts)})")
+
+    # Check masters vs modal geometry
+    def geom_of(fp: Optional[Path]):
+        if not fp or not fp.exists():
+            return None
+        try:
+            with fits.open(fp, memmap=False) as hdul:
+                return (int(hdul[0].header.get("NAXIS1", 0)),
+                        int(hdul[0].header.get("NAXIS2", 0)))
+        except Exception:
+            return None
+
+    md_g = geom_of(master_dark)
+    mf_g = geom_of(master_flat)
+    if md_g and md_g != (W, H):
+        logger(f"[preflight] WARNING: master dark {master_dark.name} is {md_g[0]}x{md_g[1]} "
+               f"but lights are {W}x{H}")
+    if mf_g and mf_g != (W, H):
+        logger(f"[preflight] WARNING: master flat {master_flat.name} is {mf_g[0]}x{mf_g[1]} "
+               f"but lights are {W}x{H}")
+
+# Optional: Siril Python API
+try:
+    import sirilpy as s
+except Exception:
+    s = None
+
+FRAME_TYPES = ["lights", "bias", "darks", "flats", "dark_flats"]
+NB_FRAME_TYPES = list(FRAME_TYPES)
+NB_GROUP_KEYS = ("ha_oiii", "sii_oiii")
+NB_GROUP_FOLDERS = {"ha_oiii": "ha_oiii", "sii_oiii": "sii_oiii"}
+NB_GROUP_LABELS = {"ha_oiii": "Ha/OIII", "sii_oiii": "SII/OIII"}
+NB_PALETTE_OPTIONS = [
+    ("SHO with HOO fallback", "SHO_WITH_HOO_FALLBACK"),
+    ("SHO", "SHO"),
+    ("HSO", "HSO"),
+    ("HOO", "HOO"),
+]
+NB_CHANNEL_BALANCE_OPTIONS = [
+    ("Median/MAD Match", "MEDIAN_MAD"),
+    ("Background Match Only", "BACKGROUND"),
+    ("None", "NONE"),
+]
+NB_FINAL_FRAMING_OPTIONS = [
+    ("Common overlap (recommended)", "MIN"),
+    ("Reference frame", "CURRENT"),
+    ("Maximum extent", "MAX"),
+    ("Center of gravity", "COG"),
+]
+NB_OIII_COMBINE_OPTIONS = [
+    ("Merge all OIII subs before stacking (recommended)", "MERGE_ALL"),
+    ("Stack filter OIII separately, auto weighted blend", "WEIGHTED_AUTO"),
+    ("Stack filter OIII separately, manual weighted blend", "WEIGHTED_MANUAL"),
+]
+
+
+def normalize_nb_channel_balance_mode(value, legacy_normalize=True) -> str:
+    token = str(value or "").upper()
+    valid_tokens = {mode_token for _label, mode_token in NB_CHANNEL_BALANCE_OPTIONS}
+    if token in valid_tokens:
+        return token
+    return "MEDIAN_MAD" if bool(legacy_normalize) else "NONE"
+
+
+def normalize_nb_final_framing_mode(value) -> str:
+    token = str(value or "").upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "COMMON": "MIN",
+        "COMMON_OVERLAP": "MIN",
+        "REFERENCE": "CURRENT",
+        "REFERENCE_FRAME": "CURRENT",
+        "MAXIMUM": "MAX",
+        "MAXIMUM_EXTENT": "MAX",
+        "CENTER": "COG",
+        "CENTER_OF_GRAVITY": "COG",
+    }
+    token = aliases.get(token, token)
+    valid_tokens = {mode_token for _label, mode_token in NB_FINAL_FRAMING_OPTIONS}
+    return token if token in valid_tokens else "MIN"
+
+
+def normalize_nb_oiii_combine_policy(value) -> str:
+    token = str(value or "").upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": "MERGE_ALL",
+        "MERGE": "MERGE_ALL",
+        "MERGE_ALL_OIII": "MERGE_ALL",
+        "MERGE_ALL_SUBS": "MERGE_ALL",
+        "AUTO": "WEIGHTED_AUTO",
+        "AUTO_WEIGHTED": "WEIGHTED_AUTO",
+        "WEIGHTED": "WEIGHTED_AUTO",
+        "MANUAL": "WEIGHTED_MANUAL",
+        "MANUAL_WEIGHTED": "WEIGHTED_MANUAL",
+    }
+    token = aliases.get(token, token)
+    valid_tokens = {mode_token for _label, mode_token in NB_OIII_COMBINE_OPTIONS}
+    return token if token in valid_tokens else "MERGE_ALL"
+
+
+def clamp_percent(value, default=50) -> int:
+    try:
+        ivalue = int(value)
+    except Exception:
+        ivalue = int(default)
+    return max(0, min(100, ivalue))
+
+
+FRAME_TAB_TOOLTIPS = {
+    "osc": (
+        "Use for normal OSC broadband data, no-filter data, UV/IR-cut data, or a "
+        "single dataset processed without Ha/SII/OIII extraction. When narrowband "
+        "extraction is enabled, OSC data can also be used as broadband RGB or luminance."
+    ),
+    "ha_oiii": (
+        "Use for dual-band Ha/OIII data. In extraction mode, Siril's Ha output becomes "
+        "the Ha channel and OIII output contributes to the merged OIII channel."
+    ),
+    "sii_oiii": (
+        "Use for dual-band SII/OIII data. In extraction mode, Siril's Ha output is "
+        "treated as SII and OIII output contributes to the merged OIII channel."
+    ),
+}
+LEFT_TAB_TOOLTIPS = {
+    "registration": "Controls global registration, distortion correction, stacking, background extraction, output bit depth, compression, and sequence packing.",
+    "mosaic": "Controls experimental mosaic layout, panel registration, overlap normalization, feathering, and mosaic preview options.",
+    "nb": "Controls Ha/SII and OIII extraction, mono channel output, and narrowband composition behavior.",
+}
+
+
+@dataclass
+class NarrowbandFrameSet:
+    lights: List[str] = field(default_factory=list)
+    bias: List[str] = field(default_factory=list)
+    darks: List[str] = field(default_factory=list)
+    flats: List[str] = field(default_factory=list)
+    dark_flats: List[str] = field(default_factory=list)
+    master_bias: Optional[str] = None
+    master_dark: Optional[str] = None
+    master_flat: Optional[str] = None
+    master_dark_flat: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d) -> "NarrowbandFrameSet":
+        if isinstance(d, NarrowbandFrameSet):
+            return d
+        d = d or {}
+        return NarrowbandFrameSet(
+            lights=list(d.get("lights", []) or []),
+            bias=list(d.get("bias", []) or d.get("biases", []) or []),
+            darks=list(d.get("darks", []) or d.get("dark", []) or []),
+            flats=list(d.get("flats", []) or []),
+            dark_flats=list(d.get("dark_flats", []) or d.get("dark_flat", []) or []),
+            master_bias=d.get("master_bias"),
+            master_dark=d.get("master_dark"),
+            master_flat=d.get("master_flat"),
+            master_dark_flat=d.get("master_dark_flat") or d.get("master_darkflat"),
+        )
+
+# =========================
+# New: Panel dataclass
+# =========================
+@dataclass
+class Panel:
+    panel_id: str = "A1"
+    description: str = ""
+    lights: List[str] = field(default_factory=list)
+    bias: List[str] = field(default_factory=list)
+    darks: List[str] = field(default_factory=list)
+    flats: List[str] = field(default_factory=list)
+    dark_flats: List[str] = field(default_factory=list)
+    ha_oiii: NarrowbandFrameSet = field(default_factory=NarrowbandFrameSet)
+    sii_oiii: NarrowbandFrameSet = field(default_factory=NarrowbandFrameSet)
+
+    def to_dict(self) -> Dict:
+        d = asdict(self)
+        d["ha_oiii"] = self.ha_oiii.to_dict()
+        d["sii_oiii"] = self.sii_oiii.to_dict()
+        return d
+
+    @staticmethod
+    def from_dict(d: Dict) -> "Panel":
+        d = dict(d or {})
+        return Panel(
+            panel_id=d.get("panel_id", "A1"),
+            description=d.get("description", ""),
+            lights=list(d.get("lights", []) or []),
+            bias=list(d.get("bias", []) or d.get("biases", []) or []),
+            darks=list(d.get("darks", []) or d.get("dark", []) or []),
+            flats=list(d.get("flats", []) or d.get("flat", []) or []),
+            dark_flats=list(d.get("dark_flats", []) or d.get("dark_flat", []) or []),
+            ha_oiii=NarrowbandFrameSet.from_dict(d.get("ha_oiii")),
+            sii_oiii=NarrowbandFrameSet.from_dict(d.get("sii_oiii")),
+        )
+
+# -----------------------------
+# Data Models
+# -----------------------------
+
+@dataclass
+class Session:
+    name: str
+    lights: List[str] = field(default_factory=list)
+    bias: List[str] = field(default_factory=list)
+    darks: List[str] = field(default_factory=list)
+    flats: List[str] = field(default_factory=list)
+    dark_flats: List[str] = field(default_factory=list)
+    ha_oiii: NarrowbandFrameSet = field(default_factory=NarrowbandFrameSet)
+    sii_oiii: NarrowbandFrameSet = field(default_factory=NarrowbandFrameSet)
+
+    master_bias: Optional[str] = None
+    master_dark: Optional[str] = None
+    master_flat: Optional[str] = None
+    master_dark_flat: Optional[str] = None
+
+    work_subdir: Optional[str] = None
+
+    # Panels belonging to this session
+    panels: List[Panel] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        d = asdict(self)
+        d["panels"] = [p.to_dict() for p in self.panels]
+        d["ha_oiii"] = self.ha_oiii.to_dict()
+        d["sii_oiii"] = self.sii_oiii.to_dict()
+        return d
+
+    @staticmethod
+    def from_dict(d: Dict) -> "Session":
+        d = dict(d or {})
+        return Session(
+            name=d.get("name", "Session"),
+            lights=list(d.get("lights", []) or []),
+            bias=list(d.get("bias", []) or d.get("biases", []) or []),
+            darks=list(d.get("darks", []) or d.get("dark", []) or []),
+            flats=list(d.get("flats", []) or d.get("flat", []) or []),
+            dark_flats=list(d.get("dark_flats", []) or d.get("dark_flat", []) or []),
+            ha_oiii=NarrowbandFrameSet.from_dict(d.get("ha_oiii")),
+            sii_oiii=NarrowbandFrameSet.from_dict(d.get("sii_oiii")),
+            master_bias=d.get("master_bias"),
+            master_dark=d.get("master_dark"),
+            master_flat=d.get("master_flat"),
+            master_dark_flat=d.get("master_dark_flat") or d.get("master_darkflat"),
+            work_subdir=d.get("work_subdir"),
+            panels=[Panel.from_dict(x) for x in d.get("panels", [])],
+        )
+
+
+def recommended_distortion_correction(project) -> bool:
+    """Return the recommended default for a new project configuration."""
+    return bool(
+        getattr(project, "mosaic_enabled", False)
+        or len(getattr(project, "sessions", []) or []) > 1
+    )
+
+
+def distortion_correction_is_enabled(project) -> bool:
+    """Resolve the stored setting, or its workflow-aware default when unset."""
+    configured = getattr(project, "distortion_correction_enabled", None)
+    if configured is None:
+        return recommended_distortion_correction(project)
+    return bool(configured)
+
+@dataclass
+class Project:
+
+    name: str = "Untitled Project"
+    project_file: Optional[str] = None
+    working_dir: Optional[str] = None
+
+    use_master_library: bool = True
+    siril_cli_path: Optional[str] = None
+    force_cli: bool = False
+
+    # UI prefs
+    remember_window_size: bool = False
+    window_w: Optional[int] = None
+    window_h: Optional[int] = None
+
+    # Image metadata (inferred)
+    frame_width: int = 0
+    frame_height: int = 0
+
+    # Drizzle (global)
+    drizzle_enabled: bool = False
+    drizzle_scaling: float = 1.0      # 0.1 – 3.0
+    drizzle_pixfrac: float = 1.0      # 0.0 – 1.0
+    drizzle_kernel: str = "square"    # point|turbo|square|gaussian|lanczos2|lanczos3
+    background_extraction_enabled: bool = False
+
+    # 2-pass registration (default False)
+    two_pass: bool = False
+    # None means use the recommended new-project default: multi-night/mosaic ON, single-night OFF.
+    distortion_correction_enabled: Optional[bool] = None
+    compress_intermediates: bool = False  # legacy Siril preference-driven compression
+    storage_policy: str = "keep_all"  # keep_all | min_disk (normal OSC mosaics only)
+    low_disk_compression: str = "off"  # off | gzip2 (quantization disabled)
+    storage_reserve_gib: int = 20
+    # 32-bit output for final light stack
+    stack_32bit: bool = False
+
+    # Global stacking options
+    stack_method: str = "rej"     # UI label or legacy token; "rej" defaults to Winsorized
+    reject_sigma_low: float = 3.0
+    reject_sigma_high: float = 3.0
+    gesdt_outliers: float = 0.3
+    gesdt_significance: float = 0.05
+
+    # Pack sequences
+    pack_sequences_mode: str = "off"  # off | fitseq | ser | auto
+    pack_threshold: int = 2000        # used only when mode == "auto"
+
+    sessions: List[Session] = field(default_factory=list)
+
+    # --- Mosaic (project-level) ---
+    mosaic_enabled: bool = False
+    mosaic_grid_rows: int = 1
+    mosaic_grid_cols: int = 1
+    mosaic_overlap_percent: int = 5
+
+    # Reference & geometry
+    mosaic_global_reference: Optional[str] = None   # e.g. "Session 1 / Frame 45" or a path
+    mosaic_canvas_scale: float = 1.0                # 0.25–4.0
+    mosaic_registration_mode: str = "Two-pass"      # "Two-pass" | "One-pass"
+
+    # Legacy mosaic-stage field retained for project-file compatibility; follows the global method.
+    mosaic_stack_method: str = "mean"               # mirrors the global stack method
+
+    # Normalization / blending
+    panel_background_extraction: bool = True
+    mosaic_maximize_framing: bool = True          # apply max framing in Phase 2 (seqapplyreg) and stack -maximize
+    mosaic_overlap_norm: bool = True              # normalize on overlaps during mosaic stacking
+    mosaic_feather_px: int = 50
+    # Most capture applications describe mosaic geometry as an overlap percentage.
+    # Derive Siril's pixel feathering from that value unless the user opts into manual mode.
+    link_feather_to_overlap: bool = True
+    # Drizzle scope (mosaic): apply drizzle during per-panel registration (Phase 1)
+    mosaic_drizzle_per_panel: bool = False
+
+    # Panels: simple links of { "session": "Session 1", "panel_id": "A1", "description": "" }
+    panels: List[Dict[str, str]] = field(default_factory=list)
+
+    # Narrowband extraction (Ha/OIII and SII/OIII dual-band OSC filters)
+    nb_extraction_enabled: bool = False
+    nb_save_mono_outputs: bool = True
+    nb_output_palette: str = "SHO_WITH_HOO_FALLBACK"
+    nb_final_framing_mode: str = "MIN"
+    nb_channel_balance_mode: str = "MEDIAN_MAD"
+    nb_normalize_channels: bool = True
+    nb_resample_mode: str = "ha"
+    nb_oiii_merge_policy: str = "merge_all"
+    nb_oiii_manual_ha_weight: int = 50
+    nb_drizzle_policy: str = "disabled"
+    nb_use_osc_broadband: bool = False
+    nb_luminance_combine: bool = False
+
+    allow_uncalibrated: bool = False  # NEW: allow building/running with no cals (warn)
+
+    def to_dict(self) -> Dict:
+        nb_channel_balance_mode = normalize_nb_channel_balance_mode(
+            getattr(self, "nb_channel_balance_mode", None),
+            getattr(self, "nb_normalize_channels", True),
+        )
+        nb_final_framing_mode = normalize_nb_final_framing_mode(
+            getattr(self, "nb_final_framing_mode", None)
+        )
+        nb_oiii_merge_policy = normalize_nb_oiii_combine_policy(
+            getattr(self, "nb_oiii_merge_policy", None)
+        )
+        return {
+            "name": self.name,
+            "project_file": self.project_file,
+            "working_dir": self.working_dir,
+            "use_master_library": self.use_master_library,
+            "siril_cli_path": self.siril_cli_path,
+            "force_cli": bool(getattr(self, "force_cli", False)),
+
+            "drizzle_enabled": self.drizzle_enabled,
+            "drizzle_scaling": self.drizzle_scaling,
+            "drizzle_pixfrac": self.drizzle_pixfrac,
+            "drizzle_kernel": self.drizzle_kernel,
+            "background_extraction_enabled": bool(self.background_extraction_enabled),
+
+            "two_pass": self.two_pass,
+            "distortion_correction_enabled": distortion_correction_is_enabled(self),
+            "compress_intermediates": self.compress_intermediates,
+            "storage_policy": self.storage_policy,
+            "low_disk_compression": self.low_disk_compression,
+            "storage_reserve_gib": self.storage_reserve_gib,
+
+            "stack_method": self.stack_method,
+            "reject_sigma_low": self.reject_sigma_low,
+            "reject_sigma_high": self.reject_sigma_high,
+            "gesdt_outliers": self.gesdt_outliers,
+            "gesdt_significance": self.gesdt_significance,
+            "stack_32bit": self.stack_32bit,  # <-- add
+            "pack_sequences_mode": self.pack_sequences_mode,
+            "pack_threshold": int(self.pack_threshold),            
+            "sessions": [s.to_dict() for s in self.sessions],
+            # --- Mosaic ---
+            "mosaic_enabled": self.mosaic_enabled,
+            "mosaic_grid_rows": int(self.mosaic_grid_rows),
+            "mosaic_grid_cols": int(self.mosaic_grid_cols),
+            "mosaic_overlap_percent": int(self.mosaic_overlap_percent),
+
+            "mosaic_global_reference": self.mosaic_global_reference,
+            "mosaic_canvas_scale": float(self.mosaic_canvas_scale),
+            "mosaic_registration_mode": self.mosaic_registration_mode,
+            "mosaic_stack_method": self.mosaic_stack_method,
+
+            "panel_background_extraction": self.panel_background_extraction,
+            "mosaic_maximize_framing": self.mosaic_maximize_framing,
+            "mosaic_overlap_norm": self.mosaic_overlap_norm,
+            "mosaic_feather_px": int(self.mosaic_feather_px),
+            "link_feather_to_overlap": bool(self.link_feather_to_overlap),
+
+            "mosaic_drizzle_per_panel": self.mosaic_drizzle_per_panel,
+            "_ui_mosaic_auto_grid": bool(getattr(self, "_ui_mosaic_auto_grid", False)),
+            "_ui_name_scheme": int(getattr(self, "_ui_name_scheme", 0)),
+            "_ui_grid_scope": int(getattr(self, "_ui_grid_scope", 0)),
+
+            "panels": list(self.panels),
+
+            "nb_extraction_enabled": bool(self.nb_extraction_enabled),
+            "nb_save_mono_outputs": bool(self.nb_save_mono_outputs),
+            "nb_output_palette": self.nb_output_palette,
+            "nb_final_framing_mode": nb_final_framing_mode,
+            "nb_channel_balance_mode": nb_channel_balance_mode,
+            "nb_normalize_channels": nb_channel_balance_mode != "NONE",
+            "nb_resample_mode": self.nb_resample_mode,
+            "nb_oiii_merge_policy": nb_oiii_merge_policy,
+            "nb_oiii_manual_ha_weight": clamp_percent(getattr(self, "nb_oiii_manual_ha_weight", 50)),
+            "nb_drizzle_policy": self.nb_drizzle_policy,
+            "nb_use_osc_broadband": bool(self.nb_use_osc_broadband),
+            "nb_luminance_combine": bool(self.nb_luminance_combine),
+
+            "remember_window_size": bool(self.remember_window_size),
+            "window_w": int(self.window_w) if self.window_w else None,
+            "window_h": int(self.window_h) if self.window_h else None,
+            "allow_uncalibrated": bool(self.allow_uncalibrated),  # NEW
+        }
+
+    @staticmethod
+    def from_dict(d: Dict) -> "Project":
+        p = Project()
+        p.name = d.get("name", "Untitled Project")
+        p.project_file = d.get("project_file")
+        p.working_dir = d.get("working_dir")
+        p.use_master_library = d.get("use_master_library", True)
+        p.allow_uncalibrated = bool(d.get("allow_uncalibrated", False))  # NEW
+        p.siril_cli_path = d.get("siril_cli_path")
+        p.force_cli = bool(d.get("force_cli", False))
+
+        p.drizzle_enabled = d.get("drizzle_enabled", False)
+        p.drizzle_scaling = float(d.get("drizzle_scaling", 1.0))
+        p.drizzle_pixfrac = float(d.get("drizzle_pixfrac", 1.0))
+        p.drizzle_kernel = d.get("drizzle_kernel", "square")
+        p.background_extraction_enabled = bool(d.get("background_extraction_enabled", False))
+
+        p.two_pass = bool(d.get("two_pass", True))
+        if "distortion_correction_enabled" in d:
+            p.distortion_correction_enabled = bool(d.get("distortion_correction_enabled"))
+        else:
+            # Legacy normal projects did not use distortion correction, while legacy
+            # mosaic projects always did. Preserve both behaviors on first load.
+            p.distortion_correction_enabled = bool(d.get("mosaic_enabled", False))
+        p.compress_intermediates = bool(d.get("compress_intermediates", False))
+        p.storage_policy = d.get("storage_policy", "keep_all")
+        p.low_disk_compression = d.get("low_disk_compression", "off")
+        p.storage_reserve_gib = int(d.get("storage_reserve_gib", 20))
+
+        p.stack_method = d.get("stack_method", "rej")
+        p.reject_sigma_low = float(d.get("reject_sigma_low", 3.0))
+        p.reject_sigma_high = float(d.get("reject_sigma_high", 3.0))
+        p.gesdt_outliers = float(d.get("gesdt_outliers", 0.3))
+        p.gesdt_significance = float(d.get("gesdt_significance", 0.05))
+        p.stack_32bit = bool(d.get("stack_32bit", False))  # <-- add
+        p.pack_sequences_mode = (d.get("pack_sequences_mode") or "off").lower()
+        p.pack_threshold = int(d.get("pack_threshold", 2000))
+        p.sessions = [Session.from_dict(x) for x in d.get("sessions", [])]
+
+        # --- Mosaic ---
+        p.mosaic_enabled          = bool(d.get("mosaic_enabled", False))
+        p.mosaic_grid_rows        = int(d.get("mosaic_grid_rows", 1))
+        p.mosaic_grid_cols        = int(d.get("mosaic_grid_cols", 1))
+        p.mosaic_overlap_percent  = int(d.get("mosaic_overlap_percent", 5))
+
+        p.mosaic_global_reference = d.get("mosaic_global_reference") or None
+        p.mosaic_canvas_scale     = float(d.get("mosaic_canvas_scale", 1.0))
+        p.mosaic_registration_mode= d.get("mosaic_registration_mode", "Two-pass")
+        p.mosaic_stack_method     = p.stack_method
+
+        p.panel_background_extraction = bool(d.get("panel_background_extraction", False))
+        p.mosaic_maximize_framing = bool(d.get("mosaic_maximize_framing", True))
+        p.mosaic_overlap_norm     = bool(d.get("mosaic_overlap_norm", False))
+        p.mosaic_feather_px       = int(d.get("mosaic_feather_px", 50))
+        p.link_feather_to_overlap = bool(d.get("link_feather_to_overlap", True))
+
+        p.mosaic_drizzle_per_panel= bool(d.get("mosaic_drizzle_per_panel", False))
+
+        # UI-only state for Mosaic grid naming and auto-manage toggle
+        p._ui_mosaic_auto_grid = bool(d.get("_ui_mosaic_auto_grid", False))
+        p._ui_name_scheme = int(d.get("_ui_name_scheme", 0))
+        p._ui_grid_scope = int(d.get("_ui_grid_scope", 0))
+
+        p.panels = list(d.get("panels", []))
+
+        p.nb_extraction_enabled = bool(d.get("nb_extraction_enabled", False))
+        p.nb_save_mono_outputs = bool(d.get("nb_save_mono_outputs", True))
+        p.nb_output_palette = d.get("nb_output_palette", "SHO_WITH_HOO_FALLBACK")
+        p.nb_final_framing_mode = normalize_nb_final_framing_mode(d.get("nb_final_framing_mode"))
+        p.nb_channel_balance_mode = normalize_nb_channel_balance_mode(
+            d.get("nb_channel_balance_mode"),
+            d.get("nb_normalize_channels", True),
+        )
+        p.nb_normalize_channels = p.nb_channel_balance_mode != "NONE"
+        p.nb_resample_mode = d.get("nb_resample_mode", "ha")
+        p.nb_oiii_merge_policy = normalize_nb_oiii_combine_policy(d.get("nb_oiii_merge_policy"))
+        p.nb_oiii_manual_ha_weight = clamp_percent(d.get("nb_oiii_manual_ha_weight", 50))
+        p.nb_drizzle_policy = d.get("nb_drizzle_policy", "disabled")
+        p.nb_use_osc_broadband = bool(d.get("nb_use_osc_broadband", False))
+        p.nb_luminance_combine = bool(d.get("nb_luminance_combine", False))
+
+        p.remember_window_size = bool(d.get("remember_window_size", False))
+        p.window_w = d.get("window_w")
+        p.window_h = d.get("window_h")
+        if p.window_w is not None: p.window_w = int(p.window_w)
+        if p.window_h is not None: p.window_h = int(p.window_h)
+
+        return p
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def emit_distortion_plate_solve(lines: list[str], sequence_name: str) -> None:
+    """Emit the known-good Siril 1.4 sequence used to create a SIP distortion model."""
+    lines.append("# Plate-solve the reference frame for distortion-aware registration")
+    lines.append(f"load {sequence_name}_00001")
+    lines.append('parse $RA:ra$_$DEC:dec$')
+    lines.append("platesolve -force -disto=platesolve_data.wcs")
+    lines.append("")
+
+def set_comp_if_needed(L, comp_state_ref, desired):
+    """
+    Keep Siril compression state consistent.
+    comp_state_ref is an int you keep in your generator (0/1).
+    """
+    try:
+        current = comp_state_ref[0]
+    except TypeError:
+        # allow passing an int by value (no mutation), we still emit correct setcompress
+        current = comp_state_ref
+    if current != desired:
+        L.append(f"setcompress {int(desired)}")
+        try:
+            comp_state_ref[0] = desired
+        except Exception:
+            pass
+
+def safe_slug(name: str) -> str:
+    import re
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name or "project")).strip("_") or "project"
+
+def siril_arg(p: str) -> str:
+    """Return a Siril-friendly path (POSIX slashes), no quotes, keep extension."""
+    return Path(p).as_posix()
+
+def safe_link_or_copy(src: Path, dst: Path) -> Tuple[bool, str]:
+    """Try symlink -> hardlink -> copy."""
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            return True, f"[prepare] Exists: {dst}"
+        # Try symlink
+        if platform.system() == "Windows":
+            os.symlink(src, dst)  # may require admin/dev mode
+        else:
+            dst.symlink_to(src)
+        return True, f"[prepare] Symlinked: {dst} -> {src}"
+    except Exception:
+        try:
+            os.link(src, dst)
+            return True, f"[prepare] Hardlinked: {dst} -> {src}"
+        except Exception:
+            try:
+                shutil.copy2(src, dst)
+                return True, f"[prepare] Copied: {dst} from {src}"
+            except Exception as e_copy:
+                return False, f"[prepare] Failed: {src} -> {dst}: {e_copy}"
+
+def find_siril_cli(explicit: Optional[str]) -> Optional[str]:
+    if explicit and Path(explicit).exists():
+        return explicit
+    from shutil import which
+    for c in ("siril-cli", "siril-cli.exe", "siril", "siril.exe"):
+        p = which(c)
+        if p: return p
+    if platform.system() == "Windows":
+        for p in (r"C:\Program Files\Siril\bin\siril-cli.exe",
+                  r"C:\Program Files\Siril\siril-cli.exe",
+                  r"C:\Program Files (x86)\Siril\bin\siril-cli.exe",
+                  r"C:\Program Files (x86)\Siril\siril-cli.exe"):
+            if Path(p).exists(): return p
+    return None
+
+def get_siril_version(siril_path: str) -> Optional[Tuple[int, int, int]]:
+    """
+    Return (major, minor, patch) for siril-cli, or None on failure.
+
+    This is used only for the drizzle version guard and for logging – it does
+    NOT try to compare siril-cli against the Siril GUI version.
+    """
+    try:
+        out = subprocess.check_output(
+            [siril_path, "-v"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except Exception:
+        return None
+
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+    if not m:
+        return None
+
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+def _read_fits_size_quick(path: str) -> tuple[int, int] | tuple[None, None]:
+    """Read image dimensions from standard or tile-compressed FITS headers.
+
+    This dependency-free reader walks FITS HDUs, accepts NAXIS1/NAXIS2 from
+    primary/image HDUs, and accepts ZNAXIS1/ZNAXIS2 from FPACK compressed-image
+    table extensions. It never reads or decompresses pixel data.
+    """
+
+    def parse_card_value(card: str):
+        eq = card.find("=")
+        if eq < 0:
+            return None
+        value = card[eq + 1:].split("/", 1)[0].strip()
+        if value.startswith("'") and "'" in value[1:]:
+            return value[1:value.find("'", 1)].strip()
+        if value in ("T", "F"):
+            return value == "T"
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
+    def read_header(stream) -> dict | None:
+        header: dict = {}
+        # Protect the UI from malformed files with an unterminated header.
+        for _block_index in range(256):
+            block = stream.read(2880)
+            if len(block) != 2880:
+                return None
+            for offset in range(0, 2880, 80):
+                card = block[offset:offset + 80].decode("ascii", "ignore")
+                key = card[:8].strip()
+                if key == "END":
+                    return header
+                if key:
+                    header[key] = parse_card_value(card)
+        return None
+
+    def positive_int(header: dict, key: str) -> int | None:
+        try:
+            value = int(header.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    try:
+        with open(path, "rb") as stream:
+            for _hdu_index in range(32):
+                header = read_header(stream)
+                if header is None:
+                    break
+
+                zwidth = positive_int(header, "ZNAXIS1")
+                zheight = positive_int(header, "ZNAXIS2")
+                if bool(header.get("ZIMAGE", False)) and zwidth and zheight:
+                    return (zwidth, zheight)
+
+                xtension = str(header.get("XTENSION", "") or "").strip().upper()
+                width = positive_int(header, "NAXIS1")
+                height = positive_int(header, "NAXIS2")
+                # NAXIS1/NAXIS2 describe table layout for TABLE/BINTABLE HDUs,
+                # not image geometry. Accept them only for image-like HDUs.
+                if width and height and xtension not in ("TABLE", "BINTABLE"):
+                    return (width, height)
+
+                try:
+                    naxis = max(0, int(header.get("NAXIS", 0) or 0))
+                    bitpix = abs(int(header.get("BITPIX", 0) or 0))
+                    pcount = max(0, int(header.get("PCOUNT", 0) or 0))
+                    gcount = max(1, int(header.get("GCOUNT", 1) or 1))
+                except (TypeError, ValueError):
+                    break
+
+                element_count = 0
+                if naxis > 0:
+                    element_count = 1
+                    for axis in range(1, naxis + 1):
+                        try:
+                            axis_size = max(0, int(header.get(f"NAXIS{axis}", 0) or 0))
+                        except (TypeError, ValueError):
+                            axis_size = 0
+                        element_count *= axis_size
+                data_bytes = (bitpix // 8) * gcount * (pcount + element_count)
+                padded_bytes = ((data_bytes + 2879) // 2880) * 2880
+                if padded_bytes:
+                    stream.seek(padded_bytes, os.SEEK_CUR)
+    except (OSError, ValueError):
+        pass
+    return (None, None)
+
+
+def _light_path_candidates(owner) -> list[str]:
+    """Return configured OSC and narrowband light paths in priority order."""
+    candidates = [str(fp) for fp in (getattr(owner, "lights", []) or []) if fp]
+    for key in NB_GROUP_KEYS:
+        group = NarrowbandFrameSet.from_dict(getattr(owner, key, None))
+        candidates.extend(str(fp) for fp in (getattr(group, "lights", []) or []) if fp)
+    return candidates
+
+
+def _first_readable_light_geometry(paths) -> tuple[str, int, int] | None:
+    """Return the first existing light with readable FITS image geometry."""
+    for fp in paths:
+        if not fp or not Path(fp).is_file():
+            continue
+        width, height = _read_fits_size_quick(str(fp))
+        if width and height:
+            return (str(fp), int(width), int(height))
+    return None
+
+
+def _mosaic_light_path_candidates(p) -> list[tuple[str, list[str]]]:
+    """Return candidate light paths for every populated mosaic panel/session."""
+    candidates_by_owner: list[tuple[str, list[str]]] = []
+    for sess in getattr(p, "sessions", []) or []:
+        panels = getattr(sess, "panels", []) or []
+        if panels:
+            for panel in panels:
+                paths = _light_path_candidates(panel)
+                if paths:
+                    label = f"{getattr(sess, 'name', 'Session')} / {getattr(panel, 'panel_id', 'Panel')}"
+                    candidates_by_owner.append((label, paths))
+        else:
+            paths = _light_path_candidates(sess)
+            if paths:
+                candidates_by_owner.append((getattr(sess, "name", "Session"), paths))
+    return candidates_by_owner
+
+
+def calculate_mosaic_feather_px(width: int, height: int, overlap_percent: float) -> int:
+    """Convert capture-plan overlap into Siril feathering pixels.
+
+    Feather half of the overlap band, preserving the historical 20-300 px clamp
+    for non-zero overlaps. A zero-percent overlap produces zero feathering.
+    """
+    short_edge = min(max(0, int(width)), max(0, int(height)))
+    overlap_percent = max(0.0, float(overlap_percent))
+    if short_edge <= 0 or overlap_percent <= 0:
+        return 0
+    overlap_px = round(short_edge * overlap_percent / 100.0)
+    return max(20, min(300, round(overlap_px * 0.5)))
+
+# -----------------------------
+# Siril console bridge
+# -----------------------------
+
+class SirilConsoleBridge:
+    """Wrapper to log & update progress in Siril UI via sirilpy (if available)."""
+    def __init__(self):
+        self.iface = None
+        if s is not None:
+            try:
+                self.iface = s.SirilInterface(); self.iface.connect()
+            except Exception:
+                self.iface = None
+    @property
+    def connected(self) -> bool: return self.iface is not None
+    def log(self, text: str, color=None):
+        try:
+            if self.iface:
+                if color is not None:
+                    self.iface.log(text, color)
+                else:
+                    self.iface.log(text)
+        except Exception:
+            pass
+    def progress(self, message: str, fraction: float):
+        try:
+            if self.iface: self.iface.update_progress(message, max(0.0, min(1.0, float(fraction))))
+        except Exception: pass
+    def progress_reset(self):
+        try:
+            if self.iface: self.iface.reset_progress()
+        except Exception: pass
+
+class _ProcReader(QtCore.QThread):
+    """
+    Reads a subprocess stdout line-by-line on a background thread and
+    streams batched lines via a signal, while writing to a single log file handle.
+    """
+    got_lines = QtCore.pyqtSignal(list)       # emits List[str]
+    finished_ok = QtCore.pyqtSignal(int)      # emits returncode
+
+    def __init__(self, proc: subprocess.Popen, log_path: Path, siril_bridge=None, parent=None):
+        super().__init__(parent)
+        self.proc = proc
+        self.log_path = log_path
+        self.siril = siril_bridge
+        self._stop = False
+        self._last_progress_emit = 0.0
+        self._last_pct = -1.0
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        buf = []
+        t0 = time.monotonic()
+        try:
+            with open(self.log_path, "a", encoding="utf-8", newline="") as lf:
+                while not self._stop:
+                    line = self.proc.stdout.readline()
+                    if not line:
+                        # EOF or process ended; flush any remaining buffer
+                        if buf:
+                            self.got_lines.emit(buf)
+                            for ln in buf:
+                                lf.write(ln)
+                            buf.clear()
+                        break
+
+                    buf.append(line)
+
+                    # Batch flush every ~120ms or if buffer grows large
+                    now = time.monotonic()
+                    if (now - t0) >= 0.12 or len(buf) >= 128:
+                        self.got_lines.emit(buf)
+                        for ln in buf:
+                            lf.write(ln)
+                        buf.clear()
+                        t0 = now
+        finally:
+            # ensure any remaining buffered lines are emitted/written
+            if buf:
+                try:
+                    self.got_lines.emit(buf)
+                    with open(self.log_path, "a", encoding="utf-8", newline="") as lf2:
+                        for ln in buf:
+                            lf2.write(ln)
+                except Exception:
+                    pass
+
+        # Wait on process and emit final code
+        self.proc.wait()
+        try:
+            self.finished_ok.emit(self.proc.returncode)
+        except Exception:
+            pass
+
+# -----------------------------
+# Siril Script Builder (Siril 1.4)
+# -----------------------------
+
+class StorageRuntime:
+    """Execute a generated mosaic plan, keeping cleanup behind successful commands."""
+
+    SCHEMA = 1
+
+    @staticmethod
+    def format_elapsed(seconds):
+        try:
+            total = max(0, int(float(seconds)))
+        except (TypeError, ValueError, OverflowError):
+            return "n/a"
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        remaining = total % 60
+        if hours:
+            return f"{hours}h {minutes}m {remaining}s"
+        if minutes:
+            return f"{minutes}m {remaining}s"
+        return f"{remaining}s"
+
+    def __init__(self, manifest_path, iface, *, reserve_bytes=None, started_ns=None):
+        from astropy.io import fits as fits_io
+        self.fits = fits_io
+        self.iface = iface
+        self.manifest_path = Path(manifest_path).absolute()
+        self.plan = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        if self.plan.get("schema") != self.SCHEMA:
+            raise ValueError("Unsupported storage manifest")
+        self.work = Path(self.plan["work"]).absolute()
+        self.root = Path(self.plan["scratch"]).absolute()
+        if self.root.parent != self.manifest_path.parent or self.root.name != "scratch":
+            raise ValueError("Invalid scratch directory")
+        if self.manifest_path.parent.parent != self.work / ".osc_low_disk":
+            raise ValueError("Run bundle is outside the project's managed directory")
+        self.run_dir = self.manifest_path.parent
+        self.state_path = self.run_dir / "state.json"
+        self.log_path = self.run_dir / "run.log"
+        self.cancel_path = self.run_dir / "cancel.request"
+        self.request_started_ns = time.time_ns() if started_ns is None else int(started_ns)
+        self.receipt = self.run_dir / "receipts" / f"{time.time_ns()}-{os.getpid()}" / "completed.fit"
+        self.reserve = int(self.plan["reserve_bytes"] if reserve_bytes is None else reserve_bytes)
+        self.state = {"schema": self.SCHEMA, "status": "starting", "owned": {}, "panels": {},
+                      "flats": {}, "peak_bytes": 0, "bytes_deleted": 0}
+        self.protected = set()
+        self.lock_file = None
+        self.last_log = ""
+        self.current = None
+
+    @staticmethod
+    def fingerprint(path):
+        p = Path(path)
+        st = p.stat()
+        h = hashlib.sha256()
+        with p.open("rb") as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                h.update(block)
+        return {"path": str(p.resolve()), "size": st.st_size, "sha256": h.hexdigest()}
+
+    def safe_path(self, path, *, leaf_link=False, inside=True):
+        """Validate every parent; never follow a directory junction during cleanup."""
+        p = Path(os.path.abspath(path))
+        if inside and not p.is_relative_to(self.root):
+            raise ValueError(f"Path is outside this run: {p}")
+        if not p.is_relative_to(self.work):
+            raise ValueError(f"Path is outside this project: {p}")
+        stop = Path(p.anchor)
+        q = p.parent if leaf_link else p
+        while q != stop:
+            if q.exists() or q.is_symlink():
+                st = q.lstat()
+                if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:
+                    raise ValueError(f"Refusing a reparse point in a managed path: {q}")
+            if q == q.parent:
+                raise ValueError("Invalid project ancestry")
+            q = q.parent
+        return p
+
+    def archive_checkpoint(self, stage):
+        # Retain small selection/transform/WCS records even when image sequences are retired.
+        number = self.plan["stages"].index(stage)
+        destination = self.run_dir / "checkpoints" / f"{number:03d}"
+        artifacts = list(stage.get("created", stage["outputs"]))
+        artifacts += [self.plan["artifacts"][name] for name in stage.get("retire", []) if name in self.plan["artifacts"]]
+        files = set()
+        for artifact in artifacts:
+            files.update(p for p in self.metadata(artifact) if p.suffix == ".seq")
+            wcs = Path(artifact["path"]).parent / "platesolve_data.wcs"
+            if wcs.is_file():
+                files.add(wcs)
+        for source in files:
+            self.safe_path(source)
+            target = self.safe_path(destination / source.relative_to(self.root), inside=False)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+
+    def validate_owned(self, name, record):
+        """A checkpoint cannot grant deletion rights to arbitrary scratch files."""
+        p = self.safe_path(name, leaf_link=True)
+        artifact_name = record.get("artifact")
+        for group in self.plan["inputs"]:
+            if artifact_name == group["directory"]:
+                if p.parent == Path(artifact_name) and p.name in {Path(f).name for f in group["files"]}:
+                    return
+                raise ValueError(f"Invalid input alias ownership: {p}")
+        artifact = self.plan.get("artifacts", {}).get(artifact_name)
+        if artifact:
+            base = Path(artifact_name)
+            if artifact["kind"] == "file" and p == base:
+                return
+            stem = re.escape(base.name.rstrip("_"))
+            if artifact["kind"] == "sequence" and p.parent == base.parent and re.fullmatch(
+                    stem + r"_(?:\d+\.(?:fit|fits)(?:\.fz)?|\d+\.lst|\.seq|conversion\.txt)", p.name, re.I):
+                return
+        keys = {s.get("flat_key") for s in self.plan["stages"] if s.get("flat_key")}
+        if record.get("panel") == "__shared__" and p.parent == self.root / "masters" and p.stem in keys and p.suffix == ".fit":
+            return
+        raise ValueError(f"Checkpoint names an undeclared artifact: {p}")
+
+    def ensure_new_outputs(self, stage):
+        for artifact in stage.get("created", stage["outputs"]):
+            for p in self.inventory(artifact) + self.metadata(artifact):
+                if str(p) not in self.state["owned"]:
+                    raise ValueError(f"Refusing to overwrite an unowned output: {p}")
+
+    def check_dependencies(self):
+        if self.configuration() != self.state["configuration"]:
+            raise ValueError("Siril calibration or numeric settings changed during processing")
+        for name, expected in self.dependency_stats.items():
+            st = Path(name).stat()
+            if (st.st_size, st.st_mtime_ns) != expected:
+                raise ValueError(f"An input or calibration master changed during processing: {name}")
+
+    def library_dependencies(self, settings):
+        """Fingerprint simple, exact library expansions; never guess expressions."""
+        found, unresolved = set(), []
+        groups = {g["directory"]: g for g in self.plan["inputs"]}
+        token = re.compile(r"\$([A-Za-z0-9_-]+):(%(?:0?\d+)?(?:\.\d+)?[sdf])\$")
+        for stage in self.plan["stages"]:
+            commands = "\n".join(stage["commands"])
+            for variable, key in (("$defbias", "bias_lib"), ("$defdark", "dark_lib"), ("$defflat", "flat_lib")):
+                if variable not in commands:
+                    continue
+                template = str(settings.get("gui_prepro." + key, ""))
+                for directory in stage.get("input_groups", []):
+                    for source in groups[directory]["files"]:
+                        try:
+                            with self.fits.open(source, memmap=True) as hdus:
+                                header = next(h.header for h in hdus if h.header.get("NAXIS", 0) >= 2)
+                                def expand(match):
+                                    aliases = {"EXPTIME": ("EXPOSURE",), "FILTER": ("FILT-1",),
+                                               "XBINNING": ("BINX",), "YBINNING": ("BINY",),
+                                               "OFFSET": ("BLKLEVEL",), "CCD-TEMP": ("CCD_TEMP", "CCDTEMP", "TEMPERAT", "CAMTCCD")}
+                                    key = match[1]
+                                    value = next(header[k] for k in (key,) + aliases.get(key, ()) if k in header)
+                                    if match[2].endswith("s"):
+                                        if match[2] != "%s":
+                                            raise ValueError("Unsupported padded string format")
+                                        value = str(value).strip().replace(" ", "_")
+                                    rendered = match[2] % value
+                                    if any(c in rendered for c in ('/', '\\', '\n', '\r', '"')):
+                                        raise ValueError("Unsafe header substitution")
+                                    return rendered
+                                path = token.sub(expand, template)
+                            if "$" in path or not Path(path).is_absolute():
+                                raise ValueError("Unsupported library expression")
+                            path = str(Path(path).absolute())
+                            if not Path(path).is_file():
+                                raise ValueError(f"Library expansion could not be verified: {path}")
+                            found.add(path)
+                        except FileNotFoundError:
+                            raise
+                        except (KeyError, TypeError, ValueError, StopIteration):
+                            unresolved.append(template)
+        return found, unresolved
+
+    def probe_symlinks(self):
+        target = self.safe_path(self.root / ".link_probe_target")
+        link = self.safe_path(self.root / ".link_probe", leaf_link=True)
+        if target.exists() or link.exists() or link.is_symlink():
+            return False
+        target.touch(exist_ok=False)
+        try:
+            try:
+                link.symlink_to(target)
+                return True
+            except OSError:
+                return False
+        finally:
+            if link.is_symlink():
+                link.unlink()
+            target.unlink()
+
+    def image_bytes(self, path):
+        with self.fits.open(path, memmap=True) as hdus:
+            h = next(h.header for h in hdus if h.header.get("NAXIS", 0) >= 2)
+            return int(h["NAXIS1"]) * int(h["NAXIS2"]) * int(h.get("NAXIS3", 1)) * 4 + 28800
+
+    def mosaic_bytes(self, prefix):
+        """Use solved WCS geometry to catch unexpectedly large/gapped canvases."""
+        import numpy as np
+        from astropy.wcs import WCS
+        frames = self.inventory({"path": prefix, "kind": "sequence"})
+        headers = []
+        for path in frames:
+            with self.fits.open(path, memmap=True) as hdus:
+                headers.append(next(h.header.copy() for h in hdus if h.header.get("NAXIS", 0) >= 2))
+        reference = WCS(headers[0], naxis=2).celestial
+        if not reference.has_celestial:
+            raise ValueError("Cannot budget mosaic canvas: solved WCS is missing")
+        corners = []
+        for h in headers:
+            wcs = WCS(h, naxis=2).celestial
+            if not wcs.has_celestial:
+                raise ValueError("Cannot budget mosaic canvas: a panel has no solved WCS")
+            # Sample edges as well as corners for nonlinear WCS projections.
+            x, y = np.linspace(0, h["NAXIS1"], 33), np.linspace(0, h["NAXIS2"], 33)
+            points = np.concatenate([np.column_stack([x, x*0]), np.column_stack([x, x*0+h["NAXIS2"]]),
+                                     np.column_stack([y*0, y]), np.column_stack([y*0+h["NAXIS1"], y])])
+            corners.extend(reference.all_world2pix(wcs.all_pix2world(points, 0), 0))
+        coords = np.asarray(corners)
+        if not np.isfinite(coords).all():
+            raise ValueError("Invalid mosaic WCS footprint")
+        width, height = np.ceil(np.ptp(coords, axis=0) * 1.25 + 64).astype(object)
+        estimate = int(width) * int(height) * 3 * 4 * len(frames)
+        self.log(f"WCS canvas budget {int(width)} x {int(height)}, {estimate} bytes")
+        return estimate
+
+
+    @staticmethod
+    def atomic_replace(source, destination):
+        # Antivirus/indexers can briefly deny FILE_SHARE_DELETE on Windows.
+        # A bounded retry keeps the checkpoint atomic; persistent locks still stop cleanup.
+        for attempt in range(12):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError:
+                if attempt == 11:
+                    raise
+                time.sleep(min(0.02 * (attempt + 1), 0.2))
+
+    def write_state(self):
+        self.safe_path(self.state_path, inside=False)
+        tmp = self.state_path.with_suffix(".new")
+        self.safe_path(tmp, inside=False)
+        tmp.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+        self.atomic_replace(tmp, self.state_path)
+
+    def log(self, message):
+        self.safe_path(self.log_path, inside=False)
+        with self.log_path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        # Siril 1.4.4 buffers pyscript stdout; verbose printing here can fill its pipe.
+        callback = getattr(self, "on_log", None)
+        if callback:
+            callback(message)
+
+    def capture_log(self):
+        try:
+            current = self.iface.get_siril_log()
+            if current and current != self.last_log:
+                addition = current[len(self.last_log):] if current.startswith(self.last_log) else current
+                with self.log_path.open("a", encoding="utf-8") as stream:
+                    stream.write(addition + "\n")
+                self.last_log = current
+        except Exception:
+            pass
+
+    def lock(self):
+        self.safe_path(self.run_dir, inside=False)
+        base = self.run_dir.parent
+        self.safe_path(base, inside=False)
+        base.mkdir(exist_ok=True)
+        path = base / "active.lock"
+        self.safe_path(path, inside=False)
+        self.lock_file = path.open("a+b")
+        if path.stat().st_size == 0:
+            self.lock_file.write(b"0")
+            self.lock_file.flush()
+        self.lock_file.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.lock_file.close()
+            self.lock_file = None
+            raise RuntimeError("Another managed run is using this project") from exc
+
+    def cancelled(self):
+        if self.cancel_path.exists():
+            raise InterruptedError("Run cancelled; completed panel stacks have been retained")
+
+    def command(self, line):
+        self.cancelled()
+        if not line.strip() or line.lstrip().startswith("#"):
+            return
+        self.log("COMMAND " + line)
+        try:
+            self.iface.cmd(line)
+        finally:
+            self.capture_log()
+        self.cancelled()
+
+    def inventory(self, artifact):
+        """Enumerate exact sequence members for a declared output, never arbitrary files."""
+        base = self.safe_path(artifact["path"], leaf_link=True)
+        if artifact["kind"] == "file":
+            return [base] if base.exists() or base.is_symlink() else []
+        self.safe_path(base.parent)
+        if not base.parent.exists():
+            return []
+        pattern = re.compile(re.escape(base.name.rstrip("_")) + r"_\d+\.(?:fit|fits)(?:\.fz)?$", re.I)
+        return sorted((p for p in base.parent.iterdir() if pattern.fullmatch(p.name)), key=lambda p: p.name)
+
+    def metadata(self, artifact):
+        if artifact["kind"] != "sequence":
+            return []
+        base = Path(artifact["path"])
+        paths = [base.with_name(base.name.rstrip("_") + "_.seq"),
+                 base.with_name(base.name.rstrip("_") + "_conversion.txt")]
+        pattern = re.compile(re.escape(base.name.rstrip("_")) + r"_\d+\.lst$", re.I)
+        if base.parent.exists():
+            paths += [p for p in base.parent.iterdir() if pattern.fullmatch(p.name)]
+        return [p for p in paths if p.exists()]
+
+    def remember(self, stage):
+        for artifact in stage.get("created", stage.get("outputs", [])):
+            for p in self.inventory(artifact) + self.metadata(artifact):
+                self.safe_path(p, leaf_link=True)
+                st = p.lstat()
+                self.state["owned"][str(p)] = {
+                    "device": st.st_dev, "inode": st.st_ino, "size": st.st_size,
+                    "mtime_ns": st.st_mtime_ns, "link": p.is_symlink(),
+                    "panel": stage.get("panel"), "artifact": artifact["path"],
+                }
+        # Consumers update selection/statistics in .seq files; refresh only declared metadata.
+        for name in stage.get("retire", []):
+            artifact = self.plan.get("artifacts", {}).get(name)
+            if artifact:
+                for p in self.metadata(artifact):
+                    if str(p) in self.state["owned"]:
+                        st = p.lstat()
+                        self.state["owned"][str(p)].update(size=st.st_size, mtime_ns=st.st_mtime_ns)
+        self.measure()
+
+    def measure(self):
+        total = 0
+        identities = set()
+        for name, record in self.state["owned"].items():
+            if record.get("external_link"):
+                continue
+            p = self.safe_path(name, leaf_link=True)
+            if p.exists() and not p.is_symlink():
+                st = p.stat()
+                identity = (st.st_dev, st.st_ino)
+                if identity not in identities:
+                    total += st.st_size
+                    identities.add(identity)
+        for name in self.state.get("retained", {}):
+            p = self.safe_path(name, inside=False)
+            if p.is_file():
+                st = p.stat()
+                identity = (st.st_dev, st.st_ino)
+                if identity not in identities:
+                    total += st.st_size
+                    identities.add(identity)
+        self.state["live_bytes"] = total
+        self.state["peak_bytes"] = max(total, self.state.get("peak_bytes", 0))
+
+    def validate_fits(self, path):
+        with self.fits.open(path, mode="readonly", memmap=True, lazy_load_hdus=False) as hdus:
+            hdus.verify("exception")
+            images = [h for h in hdus if h.header.get("NAXIS", 0) >= 2]
+            if not images:
+                raise ValueError(f"No FITS image in {path}")
+            # Check on-disk HDU extents, including compressed binary-table payloads.
+            for h in hdus:
+                info = h.fileinfo()
+                if info and info["datLoc"] + info["datSpan"] > Path(path).stat().st_size:
+                    raise ValueError(f"Truncated FITS image: {path}")
+            h = images[0].header
+            if int(h.get("NAXIS1", 0)) <= 0 or int(h.get("NAXIS2", 0)) <= 0:
+                raise ValueError(f"Invalid image geometry: {path}")
+
+    def validate(self, stage):
+        for artifact in stage.get("outputs", []):
+            files = self.inventory(artifact)
+            minimum = artifact.get("min_count", artifact.get("count", 1))
+            maximum = artifact.get("max_count", artifact.get("count", 1))
+            if not minimum <= len(files) <= maximum:
+                raise ValueError(f"Unexpected output count for {artifact['path']}: {len(files)}")
+            if artifact.get("selected_from"):
+                seq = Path(artifact["selected_from"].rstrip("_") + "_.seq")
+                if not seq.exists():
+                    raise ValueError(f"Missing registration metadata: {seq}")
+                records = [l.split() for l in seq.read_text().splitlines() if l.startswith("I ")]
+                expected = sum(int(r[-1]) != 0 for r in records)
+                if not records or expected != len(files):
+                    raise ValueError(f"Registration membership/output mismatch: {seq}")
+            for p in files:
+                self.validate_fits(p)
+
+    def remove(self, names):
+        """Unlink only recorded, unchanged entries; source/link targets are never deleted."""
+        for name in names:
+            record = self.state["owned"].get(name)
+            if record is None:
+                raise ValueError(f"Refusing unowned file: {name}")
+            self.validate_owned(name, record)
+            p = self.safe_path(name, leaf_link=True)
+            if not (p.exists() or p.is_symlink()):
+                self.state["owned"].pop(name, None)
+                continue
+            st = p.lstat()
+            if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != (
+                    record["device"], record["inode"], record["size"], record["mtime_ns"]):
+                raise ValueError(f"Managed file changed outside the runner: {p}")
+            if str(p) in self.protected or (not p.is_symlink() and str(p.resolve()) in self.protected):
+                raise ValueError(f"Refusing to delete a protected input: {p}")
+            try:
+                p.unlink()
+            except OSError as exc:
+                self.log(f"Cleanup deferred for {p}: {exc}")
+                continue
+            if not record["link"] and not record.get("external_link"):
+                self.state["bytes_deleted"] += st.st_size
+            self.state["owned"].pop(name, None)
+        self.measure()
+        self.write_state()
+
+    def retire(self, artifacts):
+        names = [name for name, record in self.state["owned"].items()
+                 if record["artifact"] in artifacts]
+        # Remove merged aliases before the registered images they reference.
+        names.sort(key=lambda name: not self.state["owned"][name]["link"])
+        self.remove(names)
+
+    def prepare_inputs(self, directories):
+        for group in self.plan["inputs"]:
+            if group["directory"] not in directories:
+                continue
+            folder = self.safe_path(group["directory"])
+            folder.mkdir(parents=True, exist_ok=True)
+            for source in group["files"]:
+                src = Path(source).resolve(strict=True)
+                dst = self.safe_path(folder / Path(source).name, leaf_link=True)
+                if dst.exists() or dst.is_symlink():
+                    if str(dst) not in self.state["owned"]:
+                        raise ValueError(f"Unowned input alias: {dst}")
+                    continue
+                external_link = True
+                try:
+                    dst.symlink_to(src)
+                except OSError:
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        self.space_check({"label": "Input copy", "bytes_needed": src.stat().st_size})
+                        shutil.copy2(src, dst)
+                        external_link = False
+                st = dst.lstat()
+                self.state["owned"][str(dst)] = {
+                    "device": st.st_dev, "inode": st.st_ino, "size": st.st_size,
+                    "mtime_ns": st.st_mtime_ns, "link": dst.is_symlink(),
+                    "panel": group["panel"], "artifact": str(folder), "external_link": external_link,
+                }
+
+    def configuration(self):
+        keys = self.plan.get("config_keys", {})
+        result = {}
+        for group, names in keys.items():
+            for key in names:
+                value = self.iface.get_siril_config(group, key)
+                if value is None:
+                    raise ValueError(f"Cannot read Siril setting {group}.{key}")
+                result[group + "." + key] = value
+        return result
+
+    def output_valid(self, saved):
+        try:
+            return bool(saved) and all(self.fingerprint(p) == fingerprint for p, fingerprint in saved.items())
+        except (OSError, ValueError):
+            return False
+
+    def space_check(self, stage):
+        estimate = int(stage.get("bytes_needed", 0))
+        if stage.get("merge_copy_bytes") and not getattr(self, "symlinks_available", False):
+            estimate += int(stage["merge_copy_bytes"])
+        if stage.get("mosaic_geometry"):
+            estimate = max(estimate, self.mosaic_bytes(stage["mosaic_geometry"]))
+        if stage.get("actual_stack_geometry"):
+            frames = self.inventory({"kind": "sequence", "path": stage["actual_stack_geometry"]})
+            estimate = max(estimate, max((self.image_bytes(p) for p in frames), default=0) * 4)
+        need = estimate + self.reserve
+        free = shutil.disk_usage(self.root).free
+        self.log(f"SPACE free={free} next_stage={need - self.reserve} reserve={self.reserve}")
+        if free < need:
+            raise OSError(f"Not enough disk space for {stage['label']}: "
+                          f"need {need / 2**30:.1f} GiB including reserve; "
+                          f"{free / 2**30:.1f} GiB available")
+
+    def promote(self, stage):
+        for source, destination in stage.get("promote", []):
+            src = self.safe_path(source)
+            dst = self.safe_path(destination, inside=False)
+            if str(dst) in self.protected:
+                raise ValueError(f"Output would overwrite an input: {dst}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + "." + self.plan["id"] + ".tmp")
+            self.safe_path(tmp, inside=False)
+            shutil.copyfile(src, tmp)
+            self.validate_fits(tmp)
+            self.atomic_replace(tmp, dst)
+            self.state.setdefault("retained", {})[str(dst)] = {"panel": stage["panel"]}
+        self.measure()
+
+    def run(self):
+        # Include third-party warnings in a file too: a long pyscript can otherwise
+        # fill Siril 1.4.4's buffered stdout/stderr pipes and deadlock.
+        import contextlib
+        diagnostic = self.safe_path(self.run_dir / "python.log", inside=False)
+        with diagnostic.open("a", encoding="utf-8") as stream:
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                return self._run()
+
+    def _run(self):
+        self.lock()
+        try:
+            self.safe_path(self.receipt, inside=False)
+            self.safe_path(self.cancel_path, inside=False)
+            if self.cancel_path.exists():
+                # Retain Abort requests made after launch, even before Python connected.
+                request = self.cancel_path.read_text(encoding="utf-8").strip()
+                if not request.isdigit() or int(request) < self.request_started_ns:
+                    self.cancel_path.unlink()
+            if self.state_path.exists():
+                self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+                if self.state.get("schema") != self.SCHEMA or self.state.get("run_id") != self.plan["id"]:
+                    raise ValueError("Checkpoint belongs to another run")
+            self.state["run_id"] = self.plan["id"]
+            self.state["status"] = "running"
+            self.state["started_ns"] = time.time_ns()
+            self.state.pop("error", None)
+            self.write_state()
+            self.root.mkdir(parents=True, exist_ok=True)
+            for folder in self.plan["directories"]:
+                self.safe_path(folder).mkdir(parents=True, exist_ok=True)
+            self.log("BEGIN " + self.plan["id"])
+            self.command("requires 1.4.4")
+            dependencies = {}
+            for name in self.plan["protected"]:
+                self.protected.add(str(Path(name).absolute()))
+                self.protected.add(str(Path(name).resolve(strict=True)))
+                if Path(name).resolve().is_relative_to(self.root):
+                    raise ValueError("An input/master cannot be inside this run's scratch directory")
+                dependencies[name] = self.fingerprint(name)
+            settings = self.configuration()
+            library, unresolved = self.library_dependencies(settings)
+            for name in library:
+                self.protected.add(name)
+                self.protected.add(str(Path(name).resolve()))
+                dependencies[name] = self.fingerprint(name)
+            self.library_resolved = not unresolved
+            if unresolved:
+                self.log("Library expression cannot be fingerprinted: flat reuse and panel resume disabled")
+                if self.state.get("signature"):
+                    raise ValueError("Build a new run: a library expression cannot be verified for resume")
+            signature = hashlib.sha256(json.dumps(
+                [self.plan, dependencies, settings], sort_keys=True).encode()).hexdigest()
+            if self.state.get("signature") and self.state["signature"] != signature:
+                raise ValueError("Inputs or Siril settings changed. Build a new run before continuing.")
+            self.state["signature"] = signature
+            self.state["dependencies"] = dependencies
+            self.dependency_stats = {n: (Path(n).stat().st_size, Path(n).stat().st_mtime_ns) for n in dependencies}
+            self.state["configuration"] = settings
+            self.write_state()
+            complete = {key for key, value in self.state["panels"].items() if self.output_valid(value)}
+            # Restart incomplete panels from raw inputs, preserving completed panel products.
+            incomplete = [name for name, rec in self.state["owned"].items()
+                          if rec["panel"] not in complete and rec["panel"] != "__shared__"]
+            self.command("close")
+            self.remove(incomplete)
+            self.symlinks_available = self.probe_symlinks()
+            self.write_state()
+            for stage in self.plan["stages"]:
+                if stage.get("panel") in complete:
+                    # A crash can occur between committing a panel and cleaning its inputs.
+                    self.retire(stage.get("retire", []))
+                    continue
+                self.current = stage
+                self.cancelled()
+                self.check_dependencies()
+                self.space_check(stage)
+                self.ensure_new_outputs(stage)
+                self.state["stage"] = stage["label"]
+                self.write_state()
+                self.log("STAGE " + stage["label"])
+                reused = False
+                key = stage.get("flat_key")
+                if stage.get("flat_library") and not self.library_resolved:
+                    key = None
+                if key and self.state["flats"].get(key):
+                    cached = self.state["flats"][key]
+                    if self.output_valid(cached):
+                        target = self.safe_path(stage["outputs"][0]["path"])
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(next(iter(cached)), target)
+                        reused = True
+                        self.log("Reused identical flat calculation")
+                    elif any(Path(name).exists() for name in cached):
+                        raise ValueError("A cached flat changed or is corrupt. Build a new run before continuing.")
+                if not reused:
+                    self.prepare_inputs(stage.get("input_groups", []))
+                    self.write_state()
+                    for command in stage["commands"]:
+                        self.command(command)
+                self.remember(stage)
+                self.validate(stage)
+                self.archive_checkpoint(stage)
+                self.promote(stage)
+                self.cancelled()
+                if key:
+                    source = stage["outputs"][0]["path"]
+                    cache = self.safe_path(self.root / "masters" / (key + ".fit"))
+                    cache.parent.mkdir(exist_ok=True)
+                    if not cache.exists():
+                        shutil.copyfile(source, cache)
+                    self.state["flats"][key] = {str(cache): self.fingerprint(cache)}
+                    self.remember({"panel": "__shared__", "created": [{"kind": "file", "path": str(cache)}]})
+                if stage.get("panel_complete"):
+                    saved = {dst: self.fingerprint(dst) for src, dst in stage.get("promote", [])}
+                    self.state["panels"][stage["panel"]] = saved
+                self.state["last_completed"] = stage["label"]
+                self.write_state()
+                # Explicitly release Siril's open sequence before any deletion.
+                if stage.get("retire"):
+                    self.command("close")
+                    self.retire(stage["retire"])
+                self.current = None
+            self.check_dependencies()
+            # SSF ignores Python exit status in 1.4.4. Only success moves Siril into
+            # this invocation's unique receipt folder; the launcher's load is relative.
+            self.safe_path(self.receipt, inside=False)
+            self.receipt.parent.mkdir(parents=True, exist_ok=False)
+            import numpy as np
+            self.fits.PrimaryHDU(np.zeros((1, 1), dtype=np.uint16)).writeto(self.receipt, overwrite=False)
+            self.command('cd "' + self.receipt.parent.as_posix() + '"')
+            finished_ns = time.time_ns()
+            self.state["status"] = "complete"
+            self.state["finished_ns"] = finished_ns
+            self.state["elapsed_seconds"] = max(
+                0.0, (finished_ns - int(self.state["started_ns"])) / 1_000_000_000
+            )
+            self.state["receipt"] = str(self.receipt)
+            self.write_state()
+            self.log(f"COMPLETE elapsed={self.format_elapsed(self.state['elapsed_seconds'])} "
+                     f"elapsed_seconds={self.state['elapsed_seconds']:.3f} "
+                     f"peak_owned_bytes={self.state['peak_bytes']} "
+                     f"deleted_bytes={self.state['bytes_deleted']}")
+        except BaseException as exc:
+            if self.receipt.exists():
+                self.receipt.unlink()
+            if self.current:
+                try:
+                    self.remember(self.current)
+                except Exception:
+                    pass
+            self.state["status"] = "cancelled" if isinstance(exc, (InterruptedError, KeyboardInterrupt)) else "failed"
+            self.state["error"] = str(exc)
+            self.write_state()
+            self.log("STOP " + str(exc))
+            raise
+        finally:
+            self.capture_log()
+            if self.lock_file:
+                self.lock_file.close()
+                self.lock_file = None
+
+
+def storage_runtime_entry():
+    """Exported SSF entrypoint; failure never enters a previous receipt folder."""
+    manifest = Path(sys.argv[1]).absolute()
+    started = next((int(arg.split("=", 1)[1]) for arg in sys.argv[2:] if arg.startswith("--started=")), None)
+    runtime = StorageRuntime(manifest, None, started_ns=started)
+    import sirilpy
+    iface = sirilpy.SirilInterface()
+    iface.connect()
+    try:
+        runtime.iface = iface
+        runtime.run()
+    finally:
+        iface.disconnect()
+
+
+class LowDiskMosaicPlan:
+    """Compile the existing OSC mosaic commands into dependency-checked stages.
+
+    Image commands still come from _build_mosaic_phase1 / emit_phase2_mosaic.
+    This compiler changes paths and independent-panel scheduling, not algorithms.
+    """
+
+    MARKER = "# ---- Phase 2: Stitching panels into a mosaic ----"
+
+    def __init__(self, project):
+        self.project = project
+        if not project.mosaic_enabled or project.nb_extraction_enabled:
+            raise ValueError("Low disk usage is available for normal OSC mosaics only. Select Keep intermediates for this mode.")
+        if project.low_disk_compression not in ("off", "gzip2"):
+            raise ValueError("Unknown low-disk compression policy")
+        if not 1 <= project.storage_reserve_gib <= 1024:
+            raise ValueError("Disk reserve must be between 1 and 1024 GiB")
+        self.work = Path(project.working_dir).absolute()
+        self.id = uuid.uuid4().hex[:16]
+        self.folder = self.work / ".osc_low_disk" / self.id
+        self.root = self.folder / "scratch"
+        self.manifest_path = self.folder / "manifest.json"
+        self.stages = []
+        self.inputs = []
+        self.protected = set()
+        self.units = {}
+        self.finals = []
+        self.artifacts = {}
+        self.comp = "setcompress 1 -type=gzip2 0" if project.low_disk_compression == "gzip2" else "setcompress 0"
+        self.extension = ".fit.fz" if project.low_disk_compression == "gzip2" else ".fit"
+        self.plan = None
+
+    @staticmethod
+    def quote(path):
+        text = Path(path).as_posix()
+        if any(c in text for c in ('"', '\n', '\r')):
+            raise ValueError("A Siril path cannot contain quotes or line breaks")
+        return '"' + text + '"'
+
+    @staticmethod
+    def project_signature(project):
+        settings = project.to_dict()
+        for key in ("project_file", "siril_cli_path", "force_cli", "remember_window_size", "window_w", "window_h"):
+            settings.pop(key, None)
+        settings["effective_masters"] = [
+            [index, panel.panel_id, [str(value) if value else None for value in _resolve_cal_paths(project, session, panel)]]
+            for index, session in enumerate(project.sessions) for panel in session.panels
+        ]
+        return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+
+    def artifact(self, path, kind="sequence", **options):
+        item = {"path": str(Path(path).absolute()), "kind": kind, **options}
+        self.artifacts[item["path"]] = item
+        return item
+
+    def source_group(self, paths, folder, panel):
+        files = [str(Path(f).absolute()) for f in paths]
+        names = [Path(f).name.casefold() for f in files]
+        if len(names) != len(set(names)):
+            raise ValueError(f"Duplicate input filenames in {panel}: aliases would lose frames")
+        shapes = set()
+        pixels = 0
+        for name in files:
+            self.quote(name)
+            # CFITSIO on Windows can reject otherwise valid Python long paths.
+            # Keep original basenames/order, and fail before staging or processing.
+            if os.name == "nt" and len(str(folder / Path(name).name)) >= 260:
+                raise ValueError("A staged FITS path exceeds Siril's Windows path limit. Choose a shorter working directory.")
+            if not Path(name).is_file():
+                raise ValueError(f"Missing input: {name}")
+            if not name.lower().endswith((".fit", ".fits", ".fit.fz", ".fits.fz")):
+                raise ValueError(f"Low disk usage requires individual FITS inputs: {name}")
+            with fits.open(name, memmap=True) as hdus:
+                h = next((h.header for h in hdus if h.header.get("NAXIS", 0) >= 2), None)
+                if h is None:
+                    raise ValueError(f"No FITS image in {name}")
+                shape = (int(h["NAXIS1"]), int(h["NAXIS2"]), int(h.get("NAXIS3", 1)))
+                shapes.add(shape)
+                pixels = max(pixels, math.prod(shape))
+            self.protected.add(name)
+        if len(shapes) != 1:
+            raise ValueError(f"Mixed or missing input geometry in {folder}. Review frame selection before building.")
+        group = {"directory": str(folder), "files": files, "panel": panel,
+                 "copy_bytes": sum(Path(f).stat().st_size for f in files)}
+        self.inputs.append(group)
+        return group, pixels
+
+    def stage(self, label, panel, commands, outputs, *, created=(), retire=(), size=0, **extra):
+        result = {"label": label, "panel": panel, "commands": commands, "outputs": outputs,
+                  "created": list(created) + outputs, "retire": list(dict.fromkeys(retire)),
+                  "bytes_needed": int(size * 1.10) + 1024**2, **extra}
+        self.stages.append(result)
+        return result
+
+    def compile_panel(self, pid, contributions):
+        shadow = copy.deepcopy(self.project)
+        shadow.storage_policy = "keep_all"
+        shadow.compress_intermediates = self.project.low_disk_compression == "gzip2"
+        shadow.working_dir = str(self.root)
+        shadow.sessions = []
+        panel_artifacts = []
+        registered = []
+        count_total = 0
+        max_rgb = 0
+        for index, original, pan in contributions:
+            sess = copy.deepcopy(original)
+            clone = copy.deepcopy(pan)
+            clone.name = pid
+            clone.flats_dir = ""
+            sess.work_subdir = f"s{index:03d}"
+            sess.panels = [clone]
+            original_proc = (self.work / (original.work_subdir or original.name) /
+                             (getattr(pan, "name", None) or pid) / "process").absolute()
+            if not original_proc.is_relative_to(self.work):
+                raise ValueError(f"Panel output directory escapes the project: {original_proc}")
+            masters = _resolve_cal_paths(self.project, original, panel=pan)
+            for field, master in zip(("master_dark", "master_flat", "master_bias", "master_darkflat"), masters):
+                if master:
+                    master = master if master.is_absolute() else original_proc / master
+                    setattr(clone, field, str(master.absolute()))
+            proc = self.root / sess.work_subdir / pid / "process"
+            light_group, pixels = self.source_group(pan.lights, proc.parent / "lights", pid)
+            flat_group = None
+            flat_pixels = 0
+            if pan.flats:
+                flat_group, flat_pixels = self.source_group(pan.flats, proc.parent / "flats", pid)
+            scale = shadow.drizzle_scaling if (shadow.drizzle_enabled or shadow.mosaic_drizzle_per_panel) else 1.0
+            raw_frame = pixels * 4 + 28800
+            rgb_frame = int(pixels * 3 * 4 * max(1.0, scale**2)) + 28800
+            self.units[str(proc)] = {"lights": light_group, "flats": flat_group, "n": len(pan.lights),
+                                     "flat_pixels": flat_pixels, "raw_frame": raw_frame, "rgb_frame": rgb_frame,
+                                     "destination": original_proc, "session": index, "masters": masters}
+            count_total += len(pan.lights)
+            max_rgb = max(max_rgb, rgb_frame)
+            shadow.sessions.append(sess)
+        builder = SirilCommandBuilder(shadow)
+        builder._storage_collect = True
+        script = builder._build_mosaic_phase1()
+        if self.MARKER not in script:
+            raise ValueError(f"No processing commands were generated for {pid}")
+        lines = script.split(self.MARKER, 1)[0].splitlines()
+        cwd = self.root
+        pending = []
+        unit = None
+        flat_created = []
+        merged = None
+        for line in lines:
+            if not line.strip() or line.lstrip().startswith("#") or line.startswith("requires "):
+                continue
+            # Quote explicit calibration paths before tokenizing the legacy command.
+            if line.startswith("calibrate "):
+                masters_to_quote = {Path(getattr(sess.panels[0], field)).as_posix()
+                    for sess in shadow.sessions
+                    for field in ("master_dark", "master_flat", "master_bias", "master_darkflat")
+                    if getattr(sess.panels[0], field, None)}
+                for value in sorted(masters_to_quote, key=len, reverse=True):
+                    for flag in ("-dark=", "-bias=", "-flat="):
+                        pattern = r'(?<!\S)' + re.escape(flag + value) + r'(?=\s|$)'
+                        line = re.sub(pattern, lambda match: '"' + match[0] + '"', line)
+                for arg in shlex.split(line):
+                    if arg.startswith(("-dark=", "-bias=", "-flat=")):
+                        value = arg.split("=", 1)[1]
+                        if Path(value).is_absolute():
+                            if not Path(value).is_file():
+                                raise ValueError(f"Missing calibration master: {value}")
+                            self.protected.add(str(Path(value).absolute()))
+            if line.startswith("setcompress "):
+                line = self.comp if line != "setcompress 0" else line
+            args = shlex.split(line)
+            cmd = args[0]
+            if cmd == "cd":
+                cwd = Path(os.path.abspath(cwd / args[1]))
+                line = "cd " + self.quote(cwd)
+                unit = self.units.get(str(cwd)) or self.units.get(str(cwd.parent / "process")) or unit
+            pending.append(line)
+            if cmd in ("setcompress", "setfindstar", "setext", "cd", "load", "parse", "platesolve"):
+                continue
+            if not unit:
+                raise ValueError(f"Missing unit context for {line}")
+            if cmd == "convert":
+                if args[1] == "flat":
+                    flat_created = [self.artifact(cwd.parent / "process" / "flat"),
+                                    self.artifact(cwd.parent / "process" / "pp_flat")]
+                continue
+            if cmd == "calibrate" and args[1] == "flat":
+                continue
+            kwargs = {}
+            retire = []
+            created = []
+            if cmd == "stack" and args[1] == "pp_flat":
+                master = self.artifact(cwd / ("pp_flat_stacked" + self.extension), "file", estimated_bytes=unit["raw_frame"])
+                outputs = [master]
+                panel_artifacts.append(master["path"])
+                created = flat_created
+                group = unit["flats"]
+                retire = [a["path"] for a in created] + [group["directory"]]
+                size = len(group["files"]) * (unit["flat_pixels"] * 4 + 28800) + group["copy_bytes"] + unit["raw_frame"] * 3
+                # Runtime adds immutable source, effective library and configuration fingerprints.
+                calculation = [s for s in pending if s.startswith(("calibrate flat", "stack pp_flat"))]
+                key = hashlib.sha256(json.dumps([unit["session"], group["files"], calculation, self.comp], sort_keys=True).encode()).hexdigest()
+                kwargs = {"flat_key": key, "input_groups": [group["directory"]],
+                          "flat_library": any("$defbias" in s for s in calculation),
+                          "promote": [[master["path"], str(unit["destination"] / ("pp_flat_stacked" + self.extension))]]}
+                label = "flat master"
+            elif cmd == "calibrate" and args[1] == "light":
+                outputs = [self.artifact(cwd / "pp_light", count=unit["n"], estimated_bytes=unit["n"] * unit["rgb_frame"])]
+                converted = self.artifact(cwd / "light")
+                created = [converted]
+                retire = [converted["path"], unit["lights"]["directory"]]
+                size = unit["n"] * unit["rgb_frame"] + unit["lights"]["copy_bytes"]
+                kwargs = {"input_groups": [unit["lights"]["directory"]]}
+                label = "light calibration"
+            elif cmd == "seqsubsky":
+                outputs = [self.artifact(cwd / "bkg_pp_light", count=unit["n"], estimated_bytes=unit["n"] * unit["rgb_frame"])]
+                retire = [str(cwd / "pp_light")]
+                size = unit["n"] * unit["rgb_frame"]
+                label = "background extraction"
+            elif cmd == "merge":
+                merged = self.artifact(cwd / args[-1])
+                continue  # A merge's aliases stay alive through the following registration.
+            elif cmd == "register" and "-2pass" in args:
+                continue
+            elif cmd in ("register", "seqapplyreg"):
+                source = cwd / args[1].rstrip("_")
+                cross_night = args[1].startswith("ALL_")
+                n = count_total if cross_night else unit["n"]
+                outputs = [self.artifact(cwd / ("r_" + args[1].rstrip("_")), min_count=1, max_count=n,
+                                         selected_from=str(source), estimated_bytes=n * (max_rgb if cross_night else unit["rgb_frame"]))]
+                created = [merged] if cross_night else []
+                retire = [str(source)] + ([a["path"] for a in registered] if cross_night else [])
+                size = n * (max_rgb if cross_night else unit["rgb_frame"])
+                if cross_night:
+                    kwargs["merge_copy_bytes"] = size
+                else:
+                    registered += outputs
+                label = "cross-night registration" if cross_night else "night registration"
+            elif cmd == "stack" and args[1].startswith("r_"):
+                final = self.artifact(cwd / (safe_slug(pid) + "_final.fit"), "file", estimated_bytes=max_rgb)
+                outputs = [final]
+                destination = str(unit["destination"] / Path(final["path"]).name)
+                kwargs = {"panel_complete": True, "promote": [[final["path"], destination]]}
+                self.finals.append(destination)
+                # Per-panel masters and final have safe user-facing copies; shared flat
+                # cache remains available. Their scratch duplicates are now disposable.
+                retire = list(panel_artifacts) + [final["path"]]
+                size = max_rgb * 3
+                label = "panel stack"
+            else:
+                raise ValueError(f"Unsupported command in managed mosaic compiler: {line}")
+            for a in created + outputs:
+                if a["kind"] == "sequence":
+                    panel_artifacts.append(a["path"])
+            self.stage(f"{pid} / {cwd.parent.parent.name} / {label}", pid, pending, outputs,
+                       created=created, retire=retire, size=size, **kwargs)
+            # Every stage is self-contained even if an identical flat is supplied from cache.
+            pending = ["cd " + self.quote(cwd), self.comp]
+        if any(not s.startswith(("cd ", "setcompress ")) for s in pending):
+            raise ValueError("Unconsumed panel commands in managed compiler")
+        return max_rgb
+
+    def build(self):
+        if fits is None:
+            raise ValueError("Low disk usage requires astropy for FITS validation")
+        panels = {}
+        used_destinations = set()
+        for index, sess in enumerate(self.project.sessions):
+            seen = set()
+            for pan in sess.panels:
+                if not pan.lights:
+                    continue
+                pid = pan.panel_id
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", pid or "") or pid in (".", ".."):
+                    raise ValueError(f"Use a simple panel ID such as R1C1 for low disk usage: {pid!r}")
+                if pid.casefold() in seen:
+                    raise ValueError(f"Duplicate panel ID in {sess.name}: {pid}")
+                seen.add(pid.casefold())
+                panels.setdefault(pid, []).append((index, sess, pan))
+        if not panels:
+            raise ValueError("No panel light inputs are selected")
+        if len({k.casefold() for k in panels}) != len(panels):
+            raise ValueError("Panel IDs must be distinct on Windows")
+        max_rgb = max(self.compile_panel(pid, units) for pid, units in panels.items())
+        for destination in self.finals:
+            if destination.casefold() in used_destinations:
+                raise ValueError("Panel final output paths overlap")
+            used_destinations.add(destination.casefold())
+        mosaic = self.root / "mosaic"
+        final_name = safe_slug(self.project.name) + "_final.fit"
+        lines = []
+        emit_phase2_mosaic(work=mosaic, produced=self.finals, p=self.project, L=lines, comp_state=0,
+                           set_comp_if_needed=set_comp_if_needed, safe_slug=safe_slug,
+                           feather_px=self.project.mosaic_feather_px, overlap_norm=self.project.mosaic_overlap_norm)
+        commands = [s for s in lines if s.strip() and not s.startswith("#")]
+        commands = ["cd " + self.quote(mosaic) if s.startswith("cd ") else s for s in commands]
+        if len(self.finals) > 1:
+            split = next(i for i,s in enumerate(commands) if s.startswith("seqapplyreg "))
+            source = self.artifact(mosaic / "mosaic", count=len(self.finals), estimated_bytes=max_rgb * len(self.finals))
+            self.stage("Mosaic / plate solving", "__mosaic__", commands[:split], [source],
+                       size=max_rgb * len(self.finals))
+            split2 = next(i for i,s in enumerate(commands) if s.startswith("stack "))
+            aligned = self.artifact(mosaic / "r_mosaic", count=len(self.finals), estimated_bytes=max_rgb * len(self.finals)**2)
+            self.stage("Mosaic / registration", "__mosaic__", ["cd " + self.quote(mosaic), "setcompress 0"] + commands[split:split2],
+                       [aligned], retire=[source["path"]], size=max_rgb * len(self.finals)**2,
+                       mosaic_geometry=source["path"])
+            commands = ["cd " + self.quote(mosaic), "setcompress 0"] + commands[split2:]
+        outputs = [self.artifact(mosaic / "mosaic_final.fit", "file"),
+                   self.artifact(mosaic / final_name, "file")]
+        if len(self.finals) > 1 and abs(self.project.mosaic_canvas_scale - 1) > 1e-6:
+            outputs.append(self.artifact(mosaic / "mosaic_final_scaled.fit", "file"))
+        destinations = [str(Path(self.finals[0]).parent / "mosaic_final.fit"), str(self.work / final_name)]
+        if len(outputs) > 2:
+            destinations.append(str(Path(self.finals[0]).parent / "mosaic_final_scaled.fit"))
+        self.stage("Mosaic / final stack", "__mosaic__", commands, outputs,
+                   retire=[str(mosaic / "r_mosaic"), str(mosaic / "mosaic")] + [a["path"] for a in outputs],
+                   size=max_rgb * len(self.finals)**2 * max(3, self.project.mosaic_canvas_scale**2 + 2),
+                   promote=[[a["path"], dst] for a,dst in zip(outputs, destinations)], panel_complete=True,
+                   actual_stack_geometry=str(mosaic / "r_mosaic") if len(self.finals) > 1 else None)
+        self.plan = {"schema": 1, "id": self.id, "work": str(self.work), "scratch": str(self.root),
+                     "project_signature": self.project_signature(self.project),
+                     "inputs": self.inputs, "protected": sorted(self.protected), "stages": self.stages,
+                     "artifacts": self.artifacts,
+                     "directories": sorted({str(Path(g["directory"]).parent / "process") for g in self.inputs} | {str(mosaic)}),
+                     "reserve_bytes": self.project.storage_reserve_gib * 2**30,
+                     "final": str(self.work / final_name), "compression": self.project.low_disk_compression,
+                     "config_keys": {"core": ["force_16bit", "fits_save_icc"],
+                                     "debayer": ["use_bayer_header", "pattern", "interpolation", "orientation", "offset_x", "offset_y", "xtrans_passes"],
+                                     "gui_prepro": ["bias_lib", "dark_lib", "flat_lib", "fix_xtrans", "equalize_cfa", "cfa",
+                                                    "xtrans_af_x", "xtrans_af_y", "xtrans_af_w", "xtrans_af_h",
+                                                    "xtrans_sample_x", "xtrans_sample_y", "xtrans_sample_w", "xtrans_sample_h"],
+                                     "gui": ["working_gamut", "icc_autoconversion", "icc_autoassignment", "icc_rendering_bpc", "icc_pedantic_linear"]}}
+        # Simulate live artifacts. Compression never earns speculative budget savings.
+        live = {}
+        peak = 0
+        for stage in self.stages:
+            peak = max(peak, sum(live.values()) + stage["bytes_needed"])
+            for artifact in stage["outputs"]:
+                live[artifact["path"]] = artifact.get("estimated_bytes", stage["bytes_needed"] // max(1, len(stage["outputs"])))
+            for key in stage["retire"]:
+                live.pop(key, None)
+        self.plan["estimated_peak_bytes"] = peak
+        return '\n'.join(["# Managed OSC mosaic: keep this SSF and its .osc_low_disk run bundle together.",
+                          "# OSC_STORAGE_MANIFEST " + str(self.manifest_path), "requires 1.4.4",
+                          "cd " + self.quote(self.folder / "failure_gate"),
+                          "pyscript " + self.quote(self.folder / "worker.py") + " " + self.quote(self.manifest_path),
+                          "# Only this invocation's successful controller enters its receipt folder.",
+                          "load completed.fit",
+                          "cd " + self.quote(self.work),
+                          "load " + self.quote(self.work / final_name), ""])
+
+    def write(self):
+        if self.plan is None:
+            raise ValueError("Build the run plan before writing it")
+        # Unique bundle; never adopt or clear an existing run directory.
+        candidate = self.folder
+        while candidate != candidate.parent:
+            if candidate.exists() and (candidate.is_symlink() or getattr(candidate.lstat(), "st_file_attributes", 0) & 0x400):
+                raise ValueError(f"Managed run path contains a junction or symlink: {candidate}")
+            candidate = candidate.parent
+        self.folder.mkdir(parents=True, exist_ok=False)
+        (self.folder / "failure_gate").mkdir()
+        self.manifest_path.write_text(json.dumps(self.plan, indent=2), encoding="utf-8")
+        header = "import hashlib, json, math, os, re, shutil, stat, sys, time\nfrom pathlib import Path\n"
+        definitions = {node.name: node for node in ast.parse(_STORAGE_LOADED_SOURCE).body
+                       if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+        worker = header + "\n\n".join(ast.get_source_segment(_STORAGE_LOADED_SOURCE, definitions[name])
+                                        for name in ("StorageRuntime", "storage_runtime_entry"))
+        worker += '\nif __name__ == "__main__":\n    storage_runtime_entry()\n'
+        (self.folder / "worker.py").write_text(worker, encoding="utf-8")
+        review = ["# REVIEW ONLY: image commands; execute run_project.ssf for checked cleanup."]
+        for stage in self.stages:
+            review.append("\n# " + stage["label"])
+            review.extend(stage["commands"])
+        (self.folder / "commands.txt").write_text("\n".join(review), encoding="utf-8")
+
+
+
+class _StorageThread(QtCore.QThread):
+    status = QtCore.pyqtSignal(str)
+
+    def __init__(self, manifest, iface, parent=None, *, started_ns=None):
+        super().__init__(parent)
+        self.manifest = manifest
+        self.iface = iface
+        self.started_ns = time.time_ns() if started_ns is None else started_ns
+        self.error = None
+
+    def run(self):
+        try:
+            runtime = StorageRuntime(self.manifest, self.iface, started_ns=self.started_ns)
+            runtime.on_log = self.status.emit
+            runtime.run()
+        except BaseException as exc:
+            self.error = str(exc)
+
+
+def storage_manifest_for_script(script, project):
+    prefix = "# OSC_STORAGE_MANIFEST "
+    paths = [line[len(prefix):] for line in Path(script).read_text(encoding="utf-8-sig").splitlines()
+             if line.startswith(prefix)]
+    if not paths:
+        if project.storage_policy == "min_disk":
+            raise ValueError("Build the low-disk script before running it")
+        return None
+    if len(paths) != 1:
+        raise ValueError("Invalid managed script header")
+    path = Path(paths[0]).absolute()
+    expected = Path(project.working_dir).absolute() / ".osc_low_disk"
+    if path.parent.parent != expected or path.name != "manifest.json":
+        raise ValueError("Managed script belongs to another project")
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    if plan.get("project_signature") != LowDiskMosaicPlan.project_signature(project):
+        raise ValueError("Project settings or frame selections changed. Build a new script before running.")
+    return path
+
+
+def check_storage_completion(manifest, started_ns):
+    state = json.loads((Path(manifest).parent / "state.json").read_text(encoding="utf-8"))
+    if state.get("started_ns", 0) < started_ns or state.get("status") != "complete":
+        raise RuntimeError(state.get("error") or "Managed run did not report fresh successful completion")
+    return state
+
+
+def _format_storage_size(size):
+    value = float(max(0, size))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024.0
+
+
+def _low_disk_tree_size(path):
+    """Measure a managed run without following aliases or directory reparse points."""
+    total = 0
+    pending = [Path(path)]
+    while pending:
+        directory = pending.pop()
+        st = directory.lstat()
+        if directory.is_symlink() or getattr(st, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"Refusing a reparse-point run directory: {directory}")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                entry_stat = entry.stat(follow_symlinks=False)
+                if entry.is_symlink():
+                    total += entry_stat.st_size
+                elif getattr(entry_stat, "st_file_attributes", 0) & 0x400:
+                    raise ValueError(f"Refusing a reparse point in a run bundle: {entry.path}")
+                elif entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                else:
+                    total += entry_stat.st_size
+    return total
+
+
+def _completed_low_disk_runs(work):
+    """Return (root, completed [(path, bytes)], protected names) for explicit cleanup."""
+    project_root = Path(work).resolve()
+    low_disk_root = project_root / ".osc_low_disk"
+    if not low_disk_root.exists():
+        return low_disk_root, [], []
+
+    root_stat = low_disk_root.lstat()
+    if low_disk_root.is_symlink() or getattr(root_stat, "st_file_attributes", 0) & 0x400:
+        return low_disk_root, [], [".osc_low_disk (reparse point)"]
+
+    completed = []
+    protected = []
+    for run_dir in sorted((p for p in low_disk_root.iterdir() if p.name != "active.lock"),
+                          key=lambda p: p.name.lower()):
+        try:
+            run_stat = run_dir.lstat()
+            if (not run_dir.is_dir() or run_dir.is_symlink()
+                    or getattr(run_stat, "st_file_attributes", 0) & 0x400):
+                protected.append(run_dir.name)
+                continue
+            state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+            if state.get("status") != "complete":
+                protected.append(run_dir.name)
+                continue
+            completed.append((run_dir, _low_disk_tree_size(run_dir)))
+        except Exception:
+            protected.append(run_dir.name)
+    return low_disk_root, completed, protected
+
+
+class SirilCommandBuilder:
+    def __init__(self, project: Project): self.project = project
+
+    def _nb_sequence_work_dir(self, work: Path) -> Path:
+        sessions = getattr(self.project, "sessions", []) or []
+        if sessions:
+            first = sessions[0]
+            session_dir = getattr(first, "work_subdir", None) or getattr(first, "name", None) or "Session 1"
+        else:
+            session_dir = "Session 1"
+        return (work / session_dir / "nb_sequences").resolve()
+
+    def _bias_arg(self, sess: Session) -> Optional[str]:
+        if sess.master_bias: return siril_arg(sess.master_bias)
+        if self.project.use_master_library: return "$defbias"
+        return None
+
+    def _dark_arg(self, sess: Session) -> Optional[str]:
+        if sess.master_dark: return siril_arg(sess.master_dark)
+        if self.project.use_master_library: return "$defdark"
+        return None
+
+    def _drizzle_flat_arg(self, p: Project, sess: Session, produced_flat: bool) -> str:
+        if produced_flat:
+            return " -flat=pp_flat_stacked"
+        if getattr(sess, "master_flat", None):
+            return f" -flat={siril_arg(sess.master_flat)}"
+        if p.use_master_library:
+            return " -flat=$defflat"
+        return ""
+
+    def _stack_cmd(self, seq_name: str, *, norm="addscale", out="stacked",
+                rgb_equal=False, output_norm=True, nonorm=False, use_32b=False) -> str:
+        # Reuse the same mapping used everywhere else
+        parts, _ = map_project_stack_method(self.project)
+
+        opts = []
+        if nonorm:     opts.append("-nonorm")
+        else:          opts.append(f"-norm={norm}")
+        if output_norm:opts.append("-output_norm")
+        if rgb_equal:  opts.append("-rgb_equal")
+        if use_32b:    opts.append("-32b")
+
+        return " ".join(["stack", seq_name] + parts + opts + [f"-out={out}"])
+
+    def _nb_master_name(self, path: Path, name: str) -> str:
+        return (path / name).as_posix()
+
+    def _nb_emit_shared_masters(self, L: list[str], root: Path, process_dir: Path, sess: Session) -> dict[str, str]:
+        masters: dict[str, str] = {}
+        bias_dir = (root / "bias").resolve()
+        dflats_dir = (root / "dark_flats").resolve()
+        darks_dir = (root / "darks").resolve()
+
+        if bias_dir.exists() and any(bias_dir.glob("*.fit*")):
+            L.append(f'cd "{bias_dir.as_posix()}"')
+            L.append("setext fit")
+            L.append("convert bias -out=../process")
+            L.append(f'cd "{process_dir.as_posix()}"')
+            L.append(self._stack_cmd("bias", norm="none", out="bias_stacked",
+                                     rgb_equal=False, output_norm=False, nonorm=True))
+            masters["bias"] = self._nb_master_name(process_dir, "bias_stacked")
+            L.append("")
+
+        if dflats_dir.exists() and any(dflats_dir.glob("*.fit*")):
+            L.append(f'cd "{dflats_dir.as_posix()}"')
+            L.append("setext fit")
+            L.append("convert darkflat -out=../process")
+            L.append(f'cd "{process_dir.as_posix()}"')
+            L.append(self._stack_cmd("darkflat", norm="none", out="df_stacked",
+                                     rgb_equal=False, output_norm=False, nonorm=True))
+            masters["darkflat"] = self._nb_master_name(process_dir, "df_stacked")
+            L.append("")
+
+        if darks_dir.exists() and any(darks_dir.glob("*.fit*")):
+            L.append(f'cd "{darks_dir.as_posix()}"')
+            L.append("setext fit")
+            L.append("convert dark -out=../process")
+            L.append(f'cd "{process_dir.as_posix()}"')
+            L.append(self._stack_cmd("dark", norm="none", out="dark_stacked",
+                                     rgb_equal=False, output_norm=False, nonorm=True))
+            masters["dark"] = self._nb_master_name(process_dir, "dark_stacked")
+            L.append("")
+
+        return masters
+
+    def _nb_flat_support_arg(
+        self,
+        p: Project,
+        sess: Session,
+        panel,
+        group: NarrowbandFrameSet,
+        shared_masters: dict[str, str],
+    ) -> Optional[str]:
+        md, mf, mb, mdf = _resolve_cal_paths(p, sess, panel=panel)
+        g_mdf = to_path_or_none(getattr(group, "master_dark_flat", None))
+        g_mb = to_path_or_none(getattr(group, "master_bias", None))
+        if g_mdf:
+            return f'-dark={g_mdf.as_posix()}'
+        if g_mb:
+            return f'-bias={g_mb.as_posix()}'
+        if mdf:
+            return f'-dark={mdf.as_posix()}'
+        if mb:
+            return f'-bias={mb.as_posix()}'
+        if "darkflat" in shared_masters:
+            return f'-dark={shared_masters["darkflat"]}'
+        if "bias" in shared_masters:
+            return f'-bias={shared_masters["bias"]}'
+        if p.use_master_library:
+            return "-bias=$defbias"
+        return None
+
+    def _nb_light_calibration_parts(
+        self,
+        p: Project,
+        sess: Session,
+        panel,
+        group: NarrowbandFrameSet,
+        shared_masters: dict[str, str],
+        made_pp_flat: bool,
+    ) -> list[str]:
+        md, mf, mb, mdf = _resolve_cal_paths(p, sess, panel=panel)
+        g_md = to_path_or_none(getattr(group, "master_dark", None))
+        g_mf = to_path_or_none(getattr(group, "master_flat", None))
+        parts = ["calibrate", "light"]
+        use_dark_cc = False
+        flat_used = False
+
+        if g_md:
+            parts.append(f'-dark={g_md.as_posix()}')
+            use_dark_cc = True
+        elif md:
+            parts.append(f'-dark={md.as_posix()}')
+            use_dark_cc = True
+        elif "dark" in shared_masters:
+            parts.append(f'-dark={shared_masters["dark"]}')
+            use_dark_cc = True
+        elif p.use_master_library:
+            parts.append("-dark=$defdark")
+            use_dark_cc = True
+
+        if g_mf:
+            parts.append(f'-flat={g_mf.as_posix()}')
+            flat_used = True
+        elif mf:
+            parts.append(f'-flat={mf.as_posix()}')
+            flat_used = True
+        elif made_pp_flat:
+            parts.append("-flat=pp_flat_stacked")
+            flat_used = True
+        elif p.use_master_library:
+            parts.append("-flat=$defflat")
+            flat_used = True
+
+        parts.append("-cfa")
+        if use_dark_cc:
+            parts.append("-cc=dark")
+        if flat_used:
+            parts.append("-equalize_cfa")
+        return parts
+
+    def _nb_broadband_flat_support_arg(
+        self,
+        p: Project,
+        sess: Session,
+        panel,
+        shared_masters: dict[str, str],
+    ) -> Optional[str]:
+        md, mf, mb, mdf = _resolve_cal_paths(p, sess, panel=panel)
+        if mdf:
+            return f'-dark={mdf.as_posix()}'
+        if mb:
+            return f'-bias={mb.as_posix()}'
+        if "darkflat" in shared_masters:
+            return f'-dark={shared_masters["darkflat"]}'
+        if "bias" in shared_masters:
+            return f'-bias={shared_masters["bias"]}'
+        if p.use_master_library:
+            return "-bias=$defbias"
+        return None
+
+    def _nb_broadband_light_calibration_parts(
+        self,
+        p: Project,
+        sess: Session,
+        panel,
+        shared_masters: dict[str, str],
+        made_pp_flat: bool,
+    ) -> list[str]:
+        md, mf, *_ = _resolve_cal_paths(p, sess, panel=panel)
+        parts = ["calibrate", "light"]
+        use_dark_cc = False
+        flat_used = False
+
+        if md:
+            parts.append(f'-dark={md.as_posix()}')
+            use_dark_cc = True
+        elif "dark" in shared_masters:
+            parts.append(f'-dark={shared_masters["dark"]}')
+            use_dark_cc = True
+        elif p.use_master_library:
+            parts.append("-dark=$defdark")
+            use_dark_cc = True
+
+        if made_pp_flat:
+            parts.append("-flat=pp_flat_stacked")
+            flat_used = True
+        elif mf:
+            parts.append(f'-flat={mf.as_posix()}')
+            flat_used = True
+        elif p.use_master_library:
+            parts.append("-flat=$defflat")
+            flat_used = True
+
+        parts.append("-cfa")
+        if use_dark_cc:
+            parts.append("-cc=dark")
+        if flat_used:
+            parts.append("-equalize_cfa")
+        parts.append("-debayer")
+        return parts
+
+    def _nb_emit_broadband_unit(
+        self,
+        L: list[str],
+        *,
+        p: Project,
+        sess: Session,
+        panel,
+        unit_label: str,
+        root: Path,
+        shared_masters: dict[str, str],
+        mosaic_register: bool = False,
+    ) -> list[tuple[str, str]]:
+        lights_dir = (root / "lights").resolve()
+        flats_dir = (root / "flats").resolve()
+        proc_dir = (root / "process").resolve()
+
+        if not (lights_dir.exists() and any(lights_dir.glob("*.fit*"))):
+            return []
+
+        L.append(f"# ---- OSC broadband RGB/luminance source: {unit_label} ----")
+        L.append("# NB mode keeps drizzle disabled for this broadband companion stack.")
+
+        made_pp_flat = False
+        if flats_dir.exists() and any(flats_dir.glob("*.fit*")):
+            L.append(f'cd "{flats_dir.as_posix()}"')
+            L.append("setext fit")
+            L.append("convert flat -out=../process")
+            L.append(f'cd "{proc_dir.as_posix()}"')
+            flat_cal = ["calibrate", "flat"]
+            support_arg = self._nb_broadband_flat_support_arg(p, sess, panel, shared_masters)
+            if support_arg:
+                flat_cal.append(support_arg)
+            else:
+                _warn(L, f"{unit_label} / OSC broadband: calibrating flats without bias/dark-flat")
+            L.append(" ".join(flat_cal))
+            L.append(self._stack_cmd("pp_flat", norm="mul", out="pp_flat_stacked",
+                                     rgb_equal=False, output_norm=False))
+            L.append("")
+            made_pp_flat = True
+
+        L.append(f'cd "{lights_dir.as_posix()}"')
+        L.append("setext fit")
+        L.append("convert light -out=../process")
+        L.append(f'cd "{proc_dir.as_posix()}"')
+
+        md, mf, *_ = _resolve_cal_paths(p, sess, panel=panel)
+        preflight_geometry(
+            lights_dir=lights_dir,
+            process_dir=proc_dir,
+            master_dark=md,
+            master_flat=mf,
+            logger=print,
+        )
+
+        parts = self._nb_broadband_light_calibration_parts(p, sess, panel, shared_masters, made_pp_flat)
+        if "-dark=$defdark" not in parts and not any(x.startswith("-dark=") for x in parts):
+            _warn(L, f"{unit_label} / OSC broadband: no dark for lights")
+        if "-flat=$defflat" not in parts and not any(x.startswith("-flat=") for x in parts):
+            _warn(L, f"{unit_label} / OSC broadband: no flat for lights")
+        L.append(" ".join(parts))
+
+        seq_name = "pp_light"
+        do_bkg = bool(getattr(p, "panel_background_extraction", False)) if getattr(p, "mosaic_enabled", False) else bool(getattr(p, "background_extraction_enabled", False))
+        if do_bkg:
+            L.append("seqsubsky pp_light 1")
+            seq_name = "bkg_pp_light"
+
+        if mosaic_register:
+            seq_name = self._nb_emit_mosaic_register(L, p, seq_name, f"{unit_label} OSC broadband")
+
+        L.append("")
+        return [(proc_dir.as_posix(), seq_name)]
+
+    def _nb_stack_broadband(
+        self,
+        L: list[str],
+        *,
+        work: Path,
+        seqs: list[tuple[str, str]],
+        out_name: str,
+        final_name: str,
+        set_comp,
+        already_registered: bool = False,
+        mirror_final: bool = True,
+        sequence_work: Optional[Path] = None,
+    ) -> Optional[str]:
+        if not seqs:
+            return None
+
+        p = self.project
+        set_comp(0)
+        final_path = (work / final_name).as_posix()
+        stack_seq_name = ""
+        scratch_dir = (sequence_work or work).resolve()
+
+        if len(seqs) == 1:
+            folder, seq_name = seqs[0]
+            L.append(f'cd "{folder}"')
+            if already_registered:
+                stack_seq_name = seq_name
+            else:
+                use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+                if use_disto:
+                    emit_distortion_plate_solve(L, seq_name)
+                reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+                if use_disto:
+                    reg_flags += " -disto=file platesolve_data.wcs"
+                L.append(f"register {seq_name}{reg_flags}")
+                if p.two_pass:
+                    L.append(f"seqapplyreg {seq_name}")
+                stack_seq_name = f"r_{seq_name}"
+            L.append(self._stack_cmd(stack_seq_name, norm="addscale", out=out_name,
+                                     rgb_equal=True, output_norm=True, use_32b=p.stack_32bit))
+        else:
+            L.append(f'cd "{scratch_dir.as_posix()}"')
+            merge_inputs = " ".join([f'"{folder}/{seq_name}"' for folder, seq_name in seqs])
+            merged_name = f"{out_name}_all"
+            L.append(f"merge {merge_inputs} {merged_name}")
+            use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+            if use_disto:
+                emit_distortion_plate_solve(L, merged_name)
+            reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+            if use_disto:
+                reg_flags += " -disto=file platesolve_data.wcs"
+            L.append(f"register {merged_name}{reg_flags}")
+            if p.two_pass:
+                L.append(f"seqapplyreg {merged_name}")
+            stack_seq_name = f"r_{merged_name}"
+            L.append(self._stack_cmd(stack_seq_name, norm="addscale", out=out_name,
+                                     rgb_equal=True, output_norm=True, use_32b=p.stack_32bit))
+
+        L.append(f"load {out_name}.fit")
+        if mirror_final:
+            L.append("mirrorx -bottomup")
+        L.append(f'save "{final_path}"')
+        L.append(f"# Broadband RGB output: {final_path}")
+        L.append("")
+        return final_path
+
+    def _nb_emit_broadband_mosaic(
+        self,
+        L: list[str],
+        *,
+        work: Path,
+        finals: list[str],
+        final_name: str,
+        set_comp,
+        sequence_work: Optional[Path] = None,
+    ) -> Optional[str]:
+        finals = [f for f in finals if f]
+        if not finals:
+            return None
+
+        p = self.project
+        final_path = (work / final_name).as_posix()
+        set_comp(0)
+
+        if len(finals) == 1:
+            L.append(f'cd "{Path(finals[0]).parent.as_posix()}"')
+            L.append(f'load "{Path(finals[0]).as_posix()}"')
+            L.append("mirrorx -bottomup")
+            L.append(f'save "{final_path}"')
+            L.append(f"# Broadband RGB output: {final_path}")
+            L.append("")
+            return final_path
+
+        mosaic_dir = (sequence_work or Path(finals[0]).parent).resolve()
+        prefix = "nb_broadband_mosaic"
+        L.append("# ---- Build broadband OSC mosaic companion ----")
+        L.append(f'cd "{mosaic_dir.as_posix()}"')
+        for i, fpath in enumerate(finals, start=1):
+            L.append(f'load "{Path(fpath).as_posix()}"')
+            L.append(f'save "{prefix}_{i:05d}.fit"')
+        L.append(f"seqplatesolve {prefix} -force -nocache")
+        if bool(getattr(p, "mosaic_maximize_framing", True)):
+            L.append(f"seqapplyreg {prefix} -framing=max")
+        else:
+            L.append(f"seqapplyreg {prefix}")
+
+        parts, _ = map_project_stack_method(p)
+        cmd = ["stack", f"r_{prefix}_"] + parts + ["-norm=addscale"]
+        if bool(getattr(p, "mosaic_maximize_framing", True)):
+            cmd.append("-maximize")
+        feather_px = int(getattr(p, "mosaic_feather_px", 0) or 0)
+        if feather_px > 0:
+            cmd.append(f"-feather={feather_px}")
+        if bool(getattr(p, "mosaic_overlap_norm", False)):
+            cmd.append("-overlap_norm")
+        cmd += ["-rgb_equal", "-output_norm"]
+        if bool(getattr(p, "stack_32bit", False)):
+            cmd.append("-32b")
+        cmd.append("-out=nb_broadband_mosaic_rgb")
+        L.append(" ".join(cmd))
+        L.append("load nb_broadband_mosaic_rgb.fit")
+        L.append("mirrorx -bottomup")
+        L.append(f'save "{final_path}"')
+        L.append(f"# Broadband RGB output: {final_path}")
+        L.append("")
+        return final_path
+
+    def _nb_emit_filter_group(
+        self,
+        L: list[str],
+        *,
+        p: Project,
+        sess: Session,
+        panel,
+        unit_label: str,
+        group_key: str,
+        group_root: Path,
+        shared_masters: dict[str, str],
+        mosaic_register: bool = False,
+    ) -> dict[str, list[tuple[str, str]]]:
+        group = NarrowbandFrameSet.from_dict(getattr(panel if panel is not None else sess, group_key, None))
+        out: dict[str, list[tuple[str, str]]] = {"Ha": [], "SII": [], "OIII": []}
+        lights_dir = (group_root / "lights").resolve()
+        flats_dir = (group_root / "flats").resolve()
+        proc_dir = (group_root / "process").resolve()
+
+        if not (lights_dir.exists() and any(lights_dir.glob("*.fit*"))):
+            return out
+
+        L.append(f"# ---- Narrowband {NB_GROUP_LABELS[group_key]}: {unit_label} ----")
+        group_masters = self._nb_emit_shared_masters(L, group_root, proc_dir, sess)
+        effective_masters = dict(shared_masters or {})
+        effective_masters.update(group_masters)
+
+        made_pp_flat = False
+        if flats_dir.exists() and any(flats_dir.glob("*.fit*")):
+            L.append(f'cd "{flats_dir.as_posix()}"')
+            L.append("setext fit")
+            L.append("convert flat -out=../process")
+            L.append(f'cd "{proc_dir.as_posix()}"')
+            flat_cal = ["calibrate", "flat"]
+            support_arg = self._nb_flat_support_arg(p, sess, panel, group, effective_masters)
+            if support_arg:
+                flat_cal.append(support_arg)
+            else:
+                _warn(L, f"{unit_label} / {NB_GROUP_LABELS[group_key]}: calibrating flats without bias/dark-flat")
+            L.append(" ".join(flat_cal))
+            L.append(self._stack_cmd("pp_flat", norm="mul", out="pp_flat_stacked",
+                                     rgb_equal=False, output_norm=False))
+            L.append("")
+            made_pp_flat = True
+
+        L.append(f'cd "{lights_dir.as_posix()}"')
+        L.append("setext fit")
+        L.append("convert light -out=../process")
+        L.append(f'cd "{proc_dir.as_posix()}"')
+
+        md, mf, *_ = _resolve_cal_paths(p, sess, panel=panel)
+        g_md = to_path_or_none(getattr(group, "master_dark", None)) or md
+        g_mf = to_path_or_none(getattr(group, "master_flat", None)) or mf
+        preflight_geometry(
+            lights_dir=lights_dir,
+            process_dir=proc_dir,
+            master_dark=g_md,
+            master_flat=g_mf,
+            logger=print,
+        )
+
+        parts = self._nb_light_calibration_parts(p, sess, panel, group, effective_masters, made_pp_flat)
+        if "-dark=$defdark" not in parts and not any(x.startswith("-dark=") for x in parts):
+            _warn(L, f"{unit_label} / {NB_GROUP_LABELS[group_key]}: no dark for NB lights")
+        if "-flat=$defflat" not in parts and not any(x.startswith("-flat=") for x in parts):
+            _warn(L, f"{unit_label} / {NB_GROUP_LABELS[group_key]}: no flat for NB lights")
+        L.append(" ".join(parts))
+        L.append("seqextract_HaOIII pp_light -resample=ha")
+
+        red_seq = "Ha_pp_light"
+        oiii_seq = "OIII_pp_light"
+        do_bkg = bool(getattr(p, "panel_background_extraction", False)) if getattr(p, "mosaic_enabled", False) else bool(getattr(p, "background_extraction_enabled", False))
+        if do_bkg:
+            L.append("seqsubsky Ha_pp_light 1")
+            L.append("seqsubsky OIII_pp_light 1")
+            red_seq = "bkg_Ha_pp_light"
+            oiii_seq = "bkg_OIII_pp_light"
+
+        if mosaic_register:
+            red_seq = self._nb_emit_mosaic_register(L, p, red_seq, unit_label)
+            oiii_seq = self._nb_emit_mosaic_register(L, p, oiii_seq, unit_label)
+
+        if group_key == "ha_oiii":
+            out["Ha"].append((proc_dir.as_posix(), red_seq))
+        else:
+            out["SII"].append((proc_dir.as_posix(), red_seq))
+        out["OIII"].append((proc_dir.as_posix(), oiii_seq))
+        L.append("")
+        return out
+
+    def _nb_emit_mosaic_register(self, L: list[str], p: Project, seq_name: str, label: str) -> str:
+        mosaic_two_pass = str(getattr(p, "mosaic_registration_mode", "")).lower().startswith("two")
+        reg_two_pass = bool(mosaic_two_pass) or bool(getattr(p, "two_pass", False))
+        L.append(f"# Register NB channel {seq_name} for {label}")
+        use_disto = distortion_correction_is_enabled(p)
+        if use_disto:
+            emit_distortion_plate_solve(L, seq_name)
+        disto_flags = " -disto=file platesolve_data.wcs" if use_disto else ""
+        if reg_two_pass:
+            L.append(f"register {seq_name}{disto_flags} -2pass")
+            L.append(f"seqapplyreg {seq_name}")
+        else:
+            L.append(f"register {seq_name}{disto_flags}")
+        return f"r_{seq_name}"
+
+    def _nb_stack_channel(
+        self,
+        L: list[str],
+        *,
+        work: Path,
+        channel: str,
+        seqs: list[tuple[str, str]],
+        out_name: str,
+        set_comp,
+        save_public: bool = True,
+        sequence_work: Optional[Path] = None,
+    ) -> str:
+        p = self.project
+        set_comp(0)
+        effective_out = out_name if save_public else f"{out_name}_work"
+        scratch_dir = (sequence_work or work).resolve()
+        final_dir = work if save_public else scratch_dir
+        if len(seqs) == 1:
+            folder, seq_name = seqs[0]
+            L.append(f'cd "{folder}"')
+            use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+            if use_disto:
+                emit_distortion_plate_solve(L, seq_name)
+            reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+            if use_disto:
+                reg_flags += " -disto=file platesolve_data.wcs"
+            L.append(f"register {seq_name}{reg_flags}")
+            if p.two_pass:
+                L.append(f"seqapplyreg {seq_name}")
+            L.append(self._stack_cmd(f"r_{seq_name}", norm="addscale", out=effective_out,
+                                     rgb_equal=False, output_norm=True, use_32b=p.stack_32bit))
+            L.append(f"load {effective_out}.fit")
+            final_path = (final_dir / f"{effective_out}.fit").as_posix()
+            L.append(f'save "{final_path}"')
+            if save_public:
+                L.append(f"# Mono {channel} output: {final_path}")
+            else:
+                L.append(f"# Internal {channel} channel stack for NB composition: {final_path}")
+            L.append("")
+            return final_path
+
+        L.append(f'cd "{scratch_dir.as_posix()}"')
+        merge_inputs = " ".join([f'"{folder}/{seq_name}"' for folder, seq_name in seqs])
+        merged_name = f"{effective_out}_all"
+        L.append(f"merge {merge_inputs} {merged_name}")
+        use_disto = distortion_correction_is_enabled(p) and not getattr(p, "mosaic_enabled", False)
+        if use_disto:
+            emit_distortion_plate_solve(L, merged_name)
+        reg_flags = " -layer=0" + (" -2pass" if p.two_pass else "")
+        if use_disto:
+            reg_flags += " -disto=file platesolve_data.wcs"
+        L.append(f"register {merged_name}{reg_flags}")
+        if p.two_pass:
+            L.append(f"seqapplyreg {merged_name}")
+        L.append(self._stack_cmd(f"r_{merged_name}", norm="addscale", out=effective_out,
+                                 rgb_equal=False, output_norm=True, use_32b=p.stack_32bit))
+        final_path = (final_dir / f"{effective_out}.fit").as_posix()
+        if save_public:
+            L.append(f"load {effective_out}.fit")
+            L.append(f'save "{final_path}"')
+        if save_public:
+            L.append(f"# Mono {channel} output: {final_path}")
+        else:
+            L.append(f"# Internal {channel} channel stack for NB composition: {final_path}")
+        L.append("")
+        return final_path
+
+    def _nb_emit_channel_mosaic(
+        self,
+        L: list[str],
+        *,
+        work: Path,
+        channel: str,
+        finals: list[str],
+        set_comp,
+        save_public: bool = True,
+        sequence_work: Optional[Path] = None,
+    ) -> Optional[str]:
+        finals = [f for f in finals if f]
+        if not finals:
+            return None
+        out_name = f"NB_{channel}_mono" if save_public else f"NB_{channel}_mono_work"
+        scratch_dir = (sequence_work or work).resolve()
+        final_dir = work if save_public else scratch_dir
+        final_path = (final_dir / f"{out_name}.fit").as_posix()
+        set_comp(0)
+        if len(finals) == 1:
+            L.append(f'cd "{Path(finals[0]).parent.as_posix()}"')
+            L.append(f'load "{Path(finals[0]).as_posix()}"')
+            L.append(f'save "{final_path}"')
+            if save_public:
+                L.append(f"# Mono {channel} mosaic output: {final_path}")
+            else:
+                L.append(f"# Internal {channel} channel mosaic for NB composition: {final_path}")
+            L.append("")
+            return final_path
+
+        p = self.project
+        mosaic_dir = scratch_dir
+        prefix = f"nb_{channel.lower()}_mosaic"
+        L.append(f'cd "{mosaic_dir.as_posix()}"')
+        for i, fpath in enumerate(finals, start=1):
+            L.append(f'load "{Path(fpath).as_posix()}"')
+            L.append(f'save "{prefix}_{i:05d}.fit"')
+        L.append(f"seqplatesolve {prefix} -force -nocache")
+        if bool(getattr(p, "mosaic_maximize_framing", True)):
+            L.append(f"seqapplyreg {prefix} -framing=max")
+        else:
+            L.append(f"seqapplyreg {prefix}")
+
+        parts, _ = map_project_stack_method(p)
+        cmd = ["stack", f"r_{prefix}_"] + parts + ["-norm=addscale"]
+        if bool(getattr(p, "mosaic_maximize_framing", True)):
+            cmd.append("-maximize")
+        feather_px = int(getattr(p, "mosaic_feather_px", 0) or 0)
+        if feather_px > 0:
+            cmd.append(f"-feather={feather_px}")
+        if bool(getattr(p, "mosaic_overlap_norm", False)):
+            cmd.append("-overlap_norm")
+        cmd.append("-output_norm")
+        if bool(getattr(p, "stack_32bit", False)):
+            cmd.append("-32b")
+        cmd.append(f"-out={out_name}")
+        L.append(" ".join(cmd))
+        L.append(f"load {out_name}.fit")
+        L.append(f'save "{final_path}"')
+        if save_public:
+            L.append(f"# Mono {channel} mosaic output: {final_path}")
+        else:
+            L.append(f"# Internal {channel} channel mosaic for NB composition: {final_path}")
+        L.append("")
+        return final_path
+
+    def _nb_blend_oiii_sources(
+        self,
+        L: list[str],
+        *,
+        work: Path,
+        source_files: dict[str, str],
+        source_counts: dict[str, int],
+        set_comp,
+        save_public: bool = True,
+        sequence_work: Optional[Path] = None,
+    ) -> str:
+        set_comp(0)
+        scratch_dir = (sequence_work or work).resolve()
+        effective_out = "NB_OIII_mono" if save_public else "NB_OIII_mono_work"
+        final_dir = work if save_public else scratch_dir
+        final_path = (final_dir / f"{effective_out}.fit").as_posix()
+        policy = normalize_nb_oiii_combine_policy(
+            getattr(self.project, "nb_oiii_merge_policy", None)
+        )
+
+        ref_key = "ha_oiii"
+        other_key = "sii_oiii"
+        ref_file = source_files[ref_key]
+        other_file = source_files[other_key]
+        ref_name = "r_nb_oiii_blend_00001"
+        other_name = "r_nb_oiii_blend_00002"
+        other_blend_name = other_name
+        balance_mode = normalize_nb_channel_balance_mode(
+            getattr(self.project, "nb_channel_balance_mode", None),
+            getattr(self.project, "nb_normalize_channels", True),
+        )
+
+        if policy == "WEIGHTED_MANUAL":
+            ha_weight = clamp_percent(getattr(self.project, "nb_oiii_manual_ha_weight", 50)) / 100.0
+            weight_note = "manual"
+        else:
+            ha_count = max(0, int(source_counts.get(ref_key, 0) or 0))
+            sii_count = max(0, int(source_counts.get(other_key, 0) or 0))
+            total_count = max(1, ha_count + sii_count)
+            ha_weight = ha_count / total_count
+            weight_note = f"auto by OIII sub count ({ha_count}:{sii_count})"
+        sii_weight = 1.0 - ha_weight
+
+        L.append("# ---- Blend OIII sources from Ha/OIII and SII/OIII ----")
+        L.append(f"# OIII blend weights ({weight_note}): Ha/OIII {ha_weight:.1%}, SII/OIII {sii_weight:.1%}")
+        L.append(f'cd "{scratch_dir.as_posix()}"')
+        L.append(f'load "{Path(ref_file).as_posix()}"')
+        L.append('save "nb_oiii_blend_00001.fit"')
+        L.append(f'load "{Path(other_file).as_posix()}"')
+        L.append('save "nb_oiii_blend_00002.fit"')
+        L.append("setref nb_oiii_blend 1")
+        L.append("register nb_oiii_blend -layer=0 -2pass")
+        L.append("seqapplyreg nb_oiii_blend -framing=min")
+        L.append("set32bits")
+        if balance_mode == "BACKGROUND":
+            L.append("# Background-match SII/OIII-derived OIII to Ha/OIII-derived OIII before weighted blend.")
+            other_blend_name = "nb_oiii_blend_bg_00002"
+            norm_expr = f"${other_name}$-median(${other_name}$)+median(${ref_name}$)"
+            L.append(f'pm "{norm_expr}"')
+            L.append(f'save "{other_blend_name}.fit"')
+        elif balance_mode == "MEDIAN_MAD":
+            L.append("# Median/MAD-match SII/OIII-derived OIII to Ha/OIII-derived OIII before weighted blend.")
+            other_blend_name = "nb_oiii_blend_norm_00002"
+            norm_expr = (
+                f"${other_name}$*mad(${ref_name}$)/mad(${other_name}$)"
+                f"-mad(${ref_name}$)/mad(${other_name}$)*median(${other_name}$)"
+                f"+median(${ref_name}$)"
+            )
+            L.append(f'pm "{norm_expr}"')
+            L.append(f'save "{other_blend_name}.fit"')
+        else:
+            L.append("# OIII source matching is disabled because NB Channel Balancing is set to None.")
+        blend_expr = f"{ha_weight:.6f}*${ref_name}$+{sii_weight:.6f}*${other_blend_name}$"
+        L.append(f'pm "{blend_expr}"')
+        L.append(f'save "{final_path}"')
+        if save_public:
+            L.append(f"# Blended OIII output: {final_path}")
+        else:
+            L.append(f"# Internal blended OIII channel for NB composition: {final_path}")
+        L.append("")
+        return final_path
+
+    def _nb_compose_inputs(self, L: list[str], *, ref_index: int) -> list[str]:
+        inputs = [f"r_nb_comp_{i:05d}" for i in range(1, 4)]
+        balance_mode = normalize_nb_channel_balance_mode(
+            getattr(self.project, "nb_channel_balance_mode", None),
+            getattr(self.project, "nb_normalize_channels", True),
+        )
+        if balance_mode == "NONE":
+            return inputs
+
+        ref_name = inputs[ref_index - 1]
+        balanced: list[str] = []
+        if balance_mode == "BACKGROUND":
+            L.append("# Background-match final NB channel levels before RGB composition.")
+        else:
+            L.append("# Median/MAD-match final NB channel levels before RGB composition.")
+        L.append(f"# NB channel balance reference: {ref_name}.fit")
+        L.append("set32bits")
+        for i, name in enumerate(inputs, start=1):
+            if i == ref_index:
+                balanced.append(name)
+                continue
+            if balance_mode == "BACKGROUND":
+                out_name = f"nb_comp_bg_{i:05d}"
+                expr = f"${name}$-median(${name}$)+median(${ref_name}$)"
+            else:
+                out_name = f"nb_comp_norm_{i:05d}"
+                expr = (
+                    f"${name}$*mad(${ref_name}$)/mad(${name}$)"
+                    f"-mad(${ref_name}$)/mad(${name}$)*median(${name}$)"
+                    f"+median(${ref_name}$)"
+                )
+            L.append(f'pm "{expr}"')
+            L.append(f'save "{out_name}.fit"')
+            balanced.append(out_name)
+        return balanced
+
+    def _nb_compose_final(self, L: list[str], *, work: Path, channel_files: dict[str, str], set_comp, sequence_work: Optional[Path] = None) -> tuple[str, str]:
+        if "Ha" not in channel_files or "OIII" not in channel_files:
+            raise ValueError("Narrowband extraction requires Ha/OIII data to produce Ha and OIII channels.")
+
+        set_comp(0)
+        scratch_dir = (sequence_work or work).resolve()
+        has_sii = bool(channel_files.get("SII"))
+        palette = str(getattr(self.project, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK").upper()
+        if palette in ("SHO", "HSO") and not has_sii:
+            raise ValueError(f"{palette} output requires SII/OIII data. Select HOO or SHO with HOO fallback when SII is unavailable.")
+
+        if palette == "HOO":
+            ordered = [channel_files["Ha"], channel_files["OIII"], channel_files["OIII"]]
+            ref_index = 1
+            out_name = "hoo_composed"
+            palette_label = "HOO"
+        elif palette == "HSO":
+            ordered = [channel_files["Ha"], channel_files["SII"], channel_files["OIII"]]
+            ref_index = 1
+            out_name = "hso_composed"
+            palette_label = "HSO"
+        elif has_sii:
+            ordered = [channel_files["SII"], channel_files["Ha"], channel_files["OIII"]]
+            ref_index = 2
+            out_name = "sho_composed"
+            palette_label = "SHO"
+        else:
+            ordered = [channel_files["Ha"], channel_files["OIII"], channel_files["OIII"]]
+            ref_index = 1
+            out_name = "hoo_composed"
+            palette_label = "HOO"
+
+        L.append("# ---- Align final NB channels and compose RGB ----")
+        L.append(f'cd "{scratch_dir.as_posix()}"')
+        for i, fpath in enumerate(ordered, start=1):
+            L.append(f'load "{Path(fpath).as_posix()}"')
+            L.append(f'save "nb_comp_{i:05d}.fit"')
+        L.append(f"setref nb_comp {ref_index}")
+        L.append("register nb_comp -layer=0 -2pass")
+        framing_mode = normalize_nb_final_framing_mode(
+            getattr(self.project, "nb_final_framing_mode", None)
+        ).lower()
+        L.append(f"seqapplyreg nb_comp -framing={framing_mode}")
+        comp_inputs = self._nb_compose_inputs(L, ref_index=ref_index)
+        rgbcomp_options = f"-out={out_name}"
+        if len(set(ordered)) < len(ordered):
+            # HOO reuses OIII for both G and B; avoid double-counting FITS exposure metadata.
+            rgbcomp_options += " -nosum"
+        L.append(f"rgbcomp {comp_inputs[0]} {comp_inputs[1]} {comp_inputs[2]} {rgbcomp_options}")
+        L.append(f"load {out_name}.fit")
+        L.append("mirrorx -bottomup")
+        final_abs = (work / f"{safe_slug(self.project.name)}_{palette_label}_final.fit").as_posix()
+        L.append(f'save "{final_abs}"')
+        L.append(f"# Final narrowband output: {final_abs}")
+        L.append("")
+        return final_abs, palette_label
+
+    def _nb_emit_lrgb_composition(
+        self,
+        L: list[str],
+        *,
+        work: Path,
+        nb_final_path: str,
+        broadband_path: str,
+        palette_label: str,
+        set_comp,
+        sequence_work: Optional[Path] = None,
+    ) -> str:
+        p = self.project
+        set_comp(0)
+        scratch_dir = (sequence_work or work).resolve()
+        out_name = f"{palette_label.lower()}_lrgb"
+        final_path = (work / f"{safe_slug(p.name)}_{palette_label}_LRGB.fit").as_posix()
+
+        L.append("# ---- Compose OSC broadband luminance with NB RGB ----")
+        L.append(f'cd "{scratch_dir.as_posix()}"')
+        L.append(f'load "{Path(nb_final_path).as_posix()}"')
+        L.append('save "nb_lrgb_align_00001.fit"')
+        L.append(f'load "{Path(broadband_path).as_posix()}"')
+        L.append('save "nb_lrgb_align_00002.fit"')
+        L.append("setref nb_lrgb_align 1")
+        L.append("register nb_lrgb_align -layer=0 -2pass")
+        L.append("seqapplyreg nb_lrgb_align")
+        L.append("load r_nb_lrgb_align_00002.fit")
+        L.append("split broadband_L broadband_a broadband_b -lab")
+        L.append(f"rgbcomp -lum=broadband_L r_nb_lrgb_align_00001 -out={out_name}")
+        L.append(f"load {out_name}.fit")
+        L.append(f'save "{final_path}"')
+        L.append(f"# LRGB narrowband + broadband output: {final_path}")
+        L.append("")
+        return final_path
+
+    def _build_nb_non_mosaic(self) -> str:
+        p = self.project
+        if not p.working_dir:
+            raise ValueError("Working directory is not set.")
+        work = Path(p.working_dir).resolve()
+        sequence_work = self._nb_sequence_work_dir(work)
+        sequence_work.mkdir(parents=True, exist_ok=True)
+        L: list[str] = []
+        L.append("#!Siril script generated by multi-night-stacking.py (NB Extraction)")
+        L.append("requires 1.4.0")
+        L.append("setfindstar reset")
+        L.append("")
+        L.append(f'cd "{work.as_posix()}"')
+        L.append("# Narrowband extraction enabled: normal OSC final is skipped.")
+        L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
+        L.append(
+            f"# Distortion correction: {'ON' if distortion_correction_is_enabled(p) else 'OFF'}"
+        )
+        L.append(f"# OIII combine policy: {normalize_nb_oiii_combine_policy(getattr(p, 'nb_oiii_merge_policy', None))}.")
+        L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
+        L.append("")
+
+        comp_state = [-1]
+        def set_comp(val: int):
+            set_comp_if_needed(L, comp_state, val)
+        set_comp(1 if bool(p.compress_intermediates) else 0)
+        save_mono = bool(getattr(p, "nb_save_mono_outputs", True))
+        if not save_mono:
+            L.append("# Mono channel outputs are disabled; internal channel stacks are still created for NB composition.")
+            L.append("")
+
+        channel_seqs: dict[str, list[tuple[str, str]]] = {"Ha": [], "SII": [], "OIII": []}
+        oiii_source_seqs: dict[str, list[tuple[str, str]]] = {key: [] for key in NB_GROUP_KEYS}
+        oiii_source_counts: dict[str, int] = {key: 0 for key in NB_GROUP_KEYS}
+        broadband_seqs: list[tuple[str, str]] = []
+        for sess in p.sessions:
+            sess_root = (work / (sess.work_subdir or sess.name)).resolve()
+            process_dir = (sess_root / "process").resolve()
+            L.append(f"# ---------------- NB Session: {sess.name} ----------------")
+            shared_masters = self._nb_emit_shared_masters(L, sess_root, process_dir, sess)
+            for group_key in NB_GROUP_KEYS:
+                group_root = (sess_root / NB_GROUP_FOLDERS[group_key]).resolve()
+                found = self._nb_emit_filter_group(
+                    L,
+                    p=p,
+                    sess=sess,
+                    panel=None,
+                    unit_label=sess.name,
+                    group_key=group_key,
+                    group_root=group_root,
+                    shared_masters=shared_masters,
+                )
+                for channel, seqs in found.items():
+                    channel_seqs[channel].extend(seqs)
+                if found["OIII"]:
+                    oiii_source_seqs[group_key].extend(found["OIII"])
+                    oiii_source_counts[group_key] += sum(1 for _ in (group_root / "lights").glob("*.fit*"))
+            if bool(getattr(p, "nb_use_osc_broadband", False)):
+                broadband_seqs.extend(self._nb_emit_broadband_unit(
+                    L,
+                    p=p,
+                    sess=sess,
+                    panel=None,
+                    unit_label=sess.name,
+                    root=sess_root,
+                    shared_masters=shared_masters,
+                ))
+
+        if not channel_seqs["Ha"]:
+            raise ValueError("Narrowband extraction requires Ha/OIII lights.")
+
+        L.append("# ---- Stack extracted NB channels ----")
+        L.append("setfindstar")
+        channel_files: dict[str, str] = {}
+        for channel in ("Ha", "SII"):
+            if channel_seqs[channel]:
+                channel_files[channel] = self._nb_stack_channel(
+                    L,
+                    work=work,
+                    channel=channel,
+                    seqs=channel_seqs[channel],
+                    out_name=f"NB_{channel}_mono",
+                    set_comp=set_comp,
+                    save_public=save_mono,
+                    sequence_work=sequence_work,
+                )
+        oiii_policy = normalize_nb_oiii_combine_policy(getattr(p, "nb_oiii_merge_policy", None))
+        oiii_sources = [key for key in NB_GROUP_KEYS if oiii_source_seqs[key]]
+        if channel_seqs["OIII"]:
+            if oiii_policy != "MERGE_ALL" and len(oiii_sources) == 2:
+                source_files: dict[str, str] = {}
+                source_counts: dict[str, int] = {}
+                for key in NB_GROUP_KEYS:
+                    source_files[key] = self._nb_stack_channel(
+                        L,
+                        work=work,
+                        channel=f"OIII_{NB_GROUP_FOLDERS[key]}",
+                        seqs=oiii_source_seqs[key],
+                        out_name=f"NB_OIII_{NB_GROUP_FOLDERS[key]}_mono",
+                        set_comp=set_comp,
+                        save_public=False,
+                        sequence_work=sequence_work,
+                    )
+                    source_counts[key] = oiii_source_counts[key]
+                channel_files["OIII"] = self._nb_blend_oiii_sources(
+                    L,
+                    work=work,
+                    source_files=source_files,
+                    source_counts=source_counts,
+                    set_comp=set_comp,
+                    save_public=save_mono,
+                    sequence_work=sequence_work,
+                )
+            else:
+                if oiii_policy != "MERGE_ALL" and len(oiii_sources) < 2:
+                    L.append("# OIII weighted blend requested, but only one OIII source group was found; using merge-all OIII stack.")
+                    L.append("")
+                channel_files["OIII"] = self._nb_stack_channel(
+                    L,
+                    work=work,
+                    channel="OIII",
+                    seqs=channel_seqs["OIII"],
+                    out_name="NB_OIII_mono",
+                    set_comp=set_comp,
+                    save_public=save_mono,
+                    sequence_work=sequence_work,
+                )
+
+        broadband_path = None
+        if bool(getattr(p, "nb_use_osc_broadband", False)) and broadband_seqs:
+            L.append("# ---- Stack OSC broadband RGB companion ----")
+            broadband_path = self._nb_stack_broadband(
+                L,
+                work=work,
+                seqs=broadband_seqs,
+                out_name="NB_broadband_rgb_stack",
+                final_name=f"{safe_slug(p.name)}_broadband_rgb.fit",
+                set_comp=set_comp,
+                sequence_work=sequence_work,
+            )
+        elif bool(getattr(p, "nb_use_osc_broadband", False)):
+            L.append("# OSC broadband option is enabled, but no OSC-tab lights were found.")
+            L.append("")
+
+        nb_final_path, palette_label = self._nb_compose_final(L, work=work, channel_files=channel_files, set_comp=set_comp, sequence_work=sequence_work)
+        if bool(getattr(p, "nb_luminance_combine", False)):
+            if broadband_path:
+                self._nb_emit_lrgb_composition(
+                    L,
+                    work=work,
+                    nb_final_path=nb_final_path,
+                    broadband_path=broadband_path,
+                    palette_label=palette_label,
+                    set_comp=set_comp,
+                    sequence_work=sequence_work,
+                )
+            else:
+                L.append("# LRGB combine requested, but no broadband RGB stack was produced.")
+                L.append("")
+        L.append("setfindstar reset")
+        return "\n".join(L)
+
+    def _build_nb_mosaic(self) -> str:
+        p = self.project
+        if not p.working_dir:
+            raise ValueError("Working directory is not set.")
+        work = Path(p.working_dir).resolve()
+        sequence_work = self._nb_sequence_work_dir(work)
+        sequence_work.mkdir(parents=True, exist_ok=True)
+        L: list[str] = []
+        L.append("#!Siril script generated by multi-night-stacking.py (Mosaic NB Extraction)")
+        L.append("requires 1.4.0")
+        L.append("setfindstar reset")
+        L.append("")
+        L.append(f'cd "{work.as_posix()}"')
+        L.append("# Narrowband extraction enabled: normal OSC mosaic final is skipped.")
+        L.append("# NB drizzle policy: disabled. Drizzle settings are preserved but ignored in this script.")
+        L.append(
+            f"# Distortion correction: {'ON' if distortion_correction_is_enabled(p) else 'OFF'}"
+        )
+        L.append(f"# OIII combine policy: {normalize_nb_oiii_combine_policy(getattr(p, 'nb_oiii_merge_policy', None))}.")
+        L.append(f"# NB aggregate sequence workspace: {sequence_work.as_posix()}")
+        L.append("")
+
+        comp_state = [-1]
+        def set_comp(val: int):
+            set_comp_if_needed(L, comp_state, val)
+        set_comp(1 if bool(p.compress_intermediates) else 0)
+        save_mono = bool(getattr(p, "nb_save_mono_outputs", True))
+        if not save_mono:
+            L.append("# Mono channel outputs are disabled; internal channel mosaics are still created for NB composition.")
+            L.append("")
+
+        panel_channel_seqs: dict[str, dict[str, list[tuple[str, str]]]] = {
+            "Ha": {}, "SII": {}, "OIII": {}
+        }
+        panel_oiii_source_seqs: dict[str, dict[str, list[tuple[str, str]]]] = {
+            key: {} for key in NB_GROUP_KEYS
+        }
+        panel_oiii_source_counts: dict[str, int] = {key: 0 for key in NB_GROUP_KEYS}
+        broadband_panel_seqs: dict[str, list[tuple[str, str]]] = {}
+
+        for sess in p.sessions:
+            sess_root = (work / (sess.work_subdir or sess.name)).resolve()
+            for panel in getattr(sess, "panels", []) or []:
+                pid = getattr(panel, "panel_id", None) or "Panel"
+                pan_root = (sess_root / pid).resolve()
+                process_dir = (pan_root / "process").resolve()
+                unit_label = f"{sess.name} / {pid}"
+                L.append(f"# ---------------- NB Mosaic Unit: {unit_label} ----------------")
+                shared_masters = self._nb_emit_shared_masters(L, pan_root, process_dir, sess)
+                for group_key in NB_GROUP_KEYS:
+                    group_root = (pan_root / NB_GROUP_FOLDERS[group_key]).resolve()
+                    found = self._nb_emit_filter_group(
+                        L,
+                        p=p,
+                        sess=sess,
+                        panel=panel,
+                        unit_label=unit_label,
+                        group_key=group_key,
+                        group_root=group_root,
+                        shared_masters=shared_masters,
+                        mosaic_register=True,
+                    )
+                    for channel, seqs in found.items():
+                        if seqs:
+                            panel_channel_seqs[channel].setdefault(pid, []).extend(seqs)
+                    if found["OIII"]:
+                        panel_oiii_source_seqs[group_key].setdefault(pid, []).extend(found["OIII"])
+                        panel_oiii_source_counts[group_key] += sum(1 for _ in (group_root / "lights").glob("*.fit*"))
+                if bool(getattr(p, "nb_use_osc_broadband", False)):
+                    seqs = self._nb_emit_broadband_unit(
+                        L,
+                        p=p,
+                        sess=sess,
+                        panel=panel,
+                        unit_label=unit_label,
+                        root=pan_root,
+                        shared_masters=shared_masters,
+                        mosaic_register=True,
+                    )
+                    if seqs:
+                        broadband_panel_seqs.setdefault(pid, []).extend(seqs)
+
+        if not any(panel_channel_seqs["Ha"].values()):
+            raise ValueError("Mosaic narrowband extraction requires Ha/OIII panel lights.")
+
+        L.append("# ---- Stack per-panel NB channels ----")
+        panel_finals: dict[str, list[str]] = {"Ha": [], "SII": [], "OIII": []}
+        oiii_policy = normalize_nb_oiii_combine_policy(getattr(p, "nb_oiii_merge_policy", None))
+        oiii_sources = [key for key in NB_GROUP_KEYS if any(panel_oiii_source_seqs[key].values())]
+        for channel in ("Ha", "SII"):
+            for pid, seqs in panel_channel_seqs[channel].items():
+                if not seqs:
+                    continue
+                out_name = f"NB_{safe_slug(pid)}_{channel}_panel"
+                panel_finals[channel].append(self._nb_stack_channel(
+                    L,
+                    work=work,
+                    channel=channel,
+                    seqs=seqs,
+                    out_name=out_name,
+                    set_comp=set_comp,
+                    save_public=False,
+                    sequence_work=sequence_work,
+                ))
+        if panel_channel_seqs["OIII"]:
+            if oiii_policy == "MERGE_ALL" or len(oiii_sources) < 2:
+                if oiii_policy != "MERGE_ALL" and len(oiii_sources) < 2:
+                    L.append("# OIII weighted blend requested, but only one OIII source group was found; using merge-all OIII stack.")
+                    L.append("")
+                for pid, seqs in panel_channel_seqs["OIII"].items():
+                    if not seqs:
+                        continue
+                    out_name = f"NB_{safe_slug(pid)}_OIII_panel"
+                    panel_finals["OIII"].append(self._nb_stack_channel(
+                        L,
+                        work=work,
+                        channel="OIII",
+                        seqs=seqs,
+                        out_name=out_name,
+                        set_comp=set_comp,
+                        save_public=False,
+                        sequence_work=sequence_work,
+                    ))
+
+        L.append("# ---- Build channel mosaics ----")
+        channel_files: dict[str, str] = {}
+        for channel in ("Ha", "SII", "OIII"):
+            if channel == "OIII" and oiii_policy != "MERGE_ALL" and len(oiii_sources) == 2:
+                continue
+            path = self._nb_emit_channel_mosaic(
+                L,
+                work=work,
+                channel=channel,
+                finals=panel_finals[channel],
+                set_comp=set_comp,
+                save_public=save_mono,
+                sequence_work=sequence_work,
+            )
+            if path:
+                channel_files[channel] = path
+        if oiii_policy != "MERGE_ALL" and len(oiii_sources) == 2:
+            L.append("# ---- Stack and mosaic OIII sources separately ----")
+            source_mosaic_files: dict[str, str] = {}
+            source_counts: dict[str, int] = {}
+            for key in NB_GROUP_KEYS:
+                source_panel_finals: list[str] = []
+                for pid, seqs in panel_oiii_source_seqs[key].items():
+                    if not seqs:
+                        continue
+                    out_name = f"NB_{safe_slug(pid)}_OIII_{NB_GROUP_FOLDERS[key]}_panel"
+                    source_panel_finals.append(self._nb_stack_channel(
+                        L,
+                        work=work,
+                        channel=f"OIII_{NB_GROUP_FOLDERS[key]}",
+                        seqs=seqs,
+                        out_name=out_name,
+                        set_comp=set_comp,
+                        save_public=False,
+                        sequence_work=sequence_work,
+                    ))
+                    source_counts[key] = panel_oiii_source_counts[key]
+                source_path = self._nb_emit_channel_mosaic(
+                    L,
+                    work=work,
+                    channel=f"OIII_{NB_GROUP_FOLDERS[key]}",
+                    finals=source_panel_finals,
+                    set_comp=set_comp,
+                    save_public=False,
+                    sequence_work=sequence_work,
+                )
+                if source_path:
+                    source_mosaic_files[key] = source_path
+            if len(source_mosaic_files) == 2:
+                channel_files["OIII"] = self._nb_blend_oiii_sources(
+                    L,
+                    work=work,
+                    source_files=source_mosaic_files,
+                    source_counts=source_counts,
+                    set_comp=set_comp,
+                    save_public=save_mono,
+                    sequence_work=sequence_work,
+                )
+
+        broadband_path = None
+        if bool(getattr(p, "nb_use_osc_broadband", False)) and broadband_panel_seqs:
+            L.append("# ---- Stack per-panel OSC broadband companions ----")
+            broadband_panel_finals: list[str] = []
+            for pid, seqs in broadband_panel_seqs.items():
+                path = self._nb_stack_broadband(
+                    L,
+                    work=work,
+                    seqs=seqs,
+                    out_name=f"NB_{safe_slug(pid)}_broadband_panel_stack",
+                    final_name=f"NB_{safe_slug(pid)}_broadband_panel.fit",
+                    set_comp=set_comp,
+                    already_registered=True,
+                    mirror_final=False,
+                    sequence_work=sequence_work,
+                )
+                if path:
+                    broadband_panel_finals.append(path)
+            broadband_path = self._nb_emit_broadband_mosaic(
+                L,
+                work=work,
+                finals=broadband_panel_finals,
+                final_name=f"{safe_slug(p.name)}_broadband_rgb.fit",
+                set_comp=set_comp,
+                sequence_work=sequence_work,
+            )
+        elif bool(getattr(p, "nb_use_osc_broadband", False)):
+            L.append("# OSC broadband option is enabled, but no OSC-tab panel lights were found.")
+            L.append("")
+
+        nb_final_path, palette_label = self._nb_compose_final(L, work=work, channel_files=channel_files, set_comp=set_comp, sequence_work=sequence_work)
+        if bool(getattr(p, "nb_luminance_combine", False)):
+            if broadband_path:
+                self._nb_emit_lrgb_composition(
+                    L,
+                    work=work,
+                    nb_final_path=nb_final_path,
+                    broadband_path=broadband_path,
+                    palette_label=palette_label,
+                    set_comp=set_comp,
+                    sequence_work=sequence_work,
+                )
+            else:
+                L.append("# LRGB combine requested, but no broadband RGB stack was produced.")
+                L.append("")
+        L.append("setfindstar reset")
+        return "\n".join(L)
+
+    def build(self) -> str:
+        """
+        Build a Siril .ssf for non-mosaic projects.
+        (Mosaic projects are delegated to _build_mosaic_phase1().)
+        """
+        p = self.project
+        if not p.working_dir:
+            raise ValueError("Working directory is not set.")
+        work = Path(p.working_dir).resolve()
+
+        if getattr(p, "storage_policy", "keep_all") == "min_disk":
+            bundle = LowDiskMosaicPlan(p)
+            self.storage_bundle = bundle
+            return bundle.build()
+
+        if getattr(p, "nb_extraction_enabled", False):
+            if getattr(p, "mosaic_enabled", False):
+                return self._build_nb_mosaic()
+            return self._build_nb_non_mosaic()
+
+        # Mosaic path is handled separately
+        if getattr(p, "mosaic_enabled", False):
+            return self._build_mosaic_phase1()
+
+        L: list[str] = []
+        L.append("#!Siril script generated by multi-night-stacking.py")
+        L.append("requires 1.4.0")
+        L.append("setfindstar reset")
+        L.append("")
+        L.append(f'cd "{work.as_posix()}"')
+        L.append("")
+        L.append("# Use Master Library: " + ("enabled (configured in Siril preferences)." if p.use_master_library else "disabled (using per-session overrides if provided)."))
+        L.append(f"# Allow uncalibrated runs: {'YES' if p.allow_uncalibrated else 'NO'}")
+        if p.drizzle_enabled:
+            L.append(f"# Drizzle: ON (Scaling={p.drizzle_scaling:g}, PixFrac={p.drizzle_pixfrac:g}, Kernel={p.drizzle_kernel})")
+        else:
+            L.append("# Drizzle: OFF")
+        L.append(f"# Background Extraction: {'ON' if p.background_extraction_enabled else 'OFF'}")
+        L.append(f"# 2-pass registration: {'ON' if p.two_pass else 'OFF'}")
+        distortion_enabled = distortion_correction_is_enabled(p)
+        L.append(f"# Distortion correction: {'ON' if distortion_enabled else 'OFF'}")
+        if is_gesdt_stack_method(p.stack_method):
+            outliers, significance = normalized_gesdt_parameters(
+                getattr(p, "gesdt_outliers", 0.3),
+                getattr(p, "gesdt_significance", 0.05),
+            )
+            L.append(
+                f"# Global stack method: {p.stack_method} "
+                f"(outliers={outliers:g}, significance={significance:g})"
+            )
+        else:
+            L.append(
+                f"# Global stack method: {p.stack_method} "
+                f"(low={p.reject_sigma_low:g}, high={p.reject_sigma_high:g})"
+            )
+        L.append("")
+
+        # Compression control
+        want_fz = bool(p.compress_intermediates)
+        comp_state = [-1]
+        def set_comp(val: int):
+            set_comp_if_needed(L, comp_state, val)
+        set_comp(1 if want_fz else 0)
+
+        # Pack Sequence decisions (lights only)
+        mode = (p.pack_sequences_mode or "off").lower()  # off|fitseq|ser|auto
+        if distortion_enabled and mode != "off":
+            _warn(
+                L,
+                "Pack sequences disabled because distortion plate-solving requires unpacked FITS sequences.",
+            )
+            mode = "off"
+        pack_thresh = int(getattr(p, "pack_threshold", 2000))
+
+        def _count_frames(dirpath: Path) -> int:
+            if not dirpath.exists():
+                return 0
+            n = 0
+            for pat in ("*.fit", "*.fits", "*.fit.fz", "*.fits.fz"):
+                n += sum(1 for _ in dirpath.glob(pat))
+            return n
+
+        session_roots: list[Path] = []
+        lights_counts: list[int] = []
+        total_lights = 0
+        for sess in p.sessions:
+            root = (work / (sess.work_subdir or sess.name)).resolve()
+            session_roots.append(root)
+            n = _count_frames(root / "lights")
+            lights_counts.append(n)
+            total_lights += n
+
+        force_pack_lights = (mode == "auto" and total_lights >= pack_thresh)
+
+        def _pack_flag_for_lights(sess_index: int) -> str:
+            if mode in ("fitseq", "ser"):
+                return f" -{mode}"
+            if mode == "auto":
+                if force_pack_lights or lights_counts[sess_index] >= pack_thresh:
+                    return " -fitseq"
+            return ""
+
+        # Track where pp_light sequences live for global merge/stack
+        pp_seqs: list[tuple[str, str]] = []
+        produced_flat: dict[str, bool] = {}
+
+        any_session = False
+
+        # ---------- Per-session phase: build masters, lights prep, calibrate ----------
+        for i, sess in enumerate(p.sessions):
+            sess_root   = (work / (sess.work_subdir or sess.name)).resolve()
+            bias_dir    = (sess_root / "bias").resolve()
+            darks_dir   = (sess_root / "darks").resolve()
+            flats_dir   = (sess_root / "flats").resolve()
+            dflats_dir  = (sess_root / "dark_flats").resolve()   # <-- correct folder
+            lights_dir  = (sess_root / "lights").resolve()
+            process_dir = (sess_root / "process").resolve()
+
+            L.append(f"# ---------------- Session: {sess.name} ----------------")
+
+            # Decide if we have *raw* calibration frames to build masters
+            have_raw_bias   = bias_dir.exists()   and any(bias_dir.glob("*.fit*"))
+            have_raw_dflats = dflats_dir.exists() and any(dflats_dir.glob("*.fit*"))
+            have_raw_darks  = darks_dir.exists()  and any(darks_dir.glob("*.fit*"))
+            have_raw_flats  = flats_dir.exists()  and any(flats_dir.glob("*.fit*"))
+            have_lights     = lights_dir.exists() and any(lights_dir.glob("*.fit*"))
+
+            # Build master BIAS (no normalization)
+            if have_raw_bias:
+                L.append(f'cd "{bias_dir.as_posix()}"')
+                L.append("setext fit")
+                L.append("convert bias -out=../process")
+                L.append(f'cd "{process_dir.as_posix()}"')
+                L.append(self._stack_cmd("bias", norm="none", out="bias_stacked",
+                                         rgb_equal=False, output_norm=False, nonorm=True))
+                L.append("cd .."); L.append("")
+
+            # Build master DARK FLAT (no normalization)
+            if have_raw_dflats:
+                L.append(f'cd "{dflats_dir.as_posix()}"')
+                L.append("setext fit")
+                L.append("convert darkflat -out=../process")
+                L.append(f'cd "{process_dir.as_posix()}"')
+                L.append(self._stack_cmd("darkflat", norm="none", out="df_stacked",
+                                         rgb_equal=False, output_norm=False, nonorm=True))
+                L.append("cd .."); L.append("")
+
+            # Build master DARK (no normalization)
+            if have_raw_darks:
+                L.append(f'cd "{darks_dir.as_posix()}"')
+                L.append("setext fit")
+                L.append("convert dark -out=../process")
+                L.append(f'cd "{process_dir.as_posix()}"')
+                L.append(self._stack_cmd("dark", norm="none", out="dark_stacked",
+                                         rgb_equal=False, output_norm=False, nonorm=True))
+                L.append("cd .."); L.append("")
+
+            # Build pp_flat_stacked if raw flats exist
+            made_pp_flat = False
+            if have_raw_flats:
+                # 1) Convert flats into process/
+                L.append(f'cd "{flats_dir.as_posix()}"')
+                L.append("setext fit")
+                L.append("convert flat -out=../process")
+                L.append(f'cd "{process_dir.as_posix()}"')
+
+                # 2) Choose how to calibrate flats: prefer a dark-flat, else a bias, else library $defbias
+                _md, _mf, _mb, _mdf = _resolve_cal_paths(self.project, sess, panel=None)
+
+                # Builder only logs; validator already prompted the user
+                if not (_mdf or _mb or p.use_master_library):
+                    _warn(L, f"{sess.name}: calibrating flats WITHOUT bias/dark-flat (validator already warned)")
+
+                flat_cal_parts = ["calibrate", "flat"]
+                if _mdf:
+                    # Dark-flat provided: in Siril this is passed with -dark= (it’s just a dark matched to flat exposure)
+                    flat_cal_parts.append(f'-dark={_mdf.as_posix()}')
+                elif _mb:
+                    flat_cal_parts.append(f'-bias={_mb.as_posix()}')
+                elif p.use_master_library:
+                    # Best-effort library bias; Siril exposes $defbias, not a dark-flat variable
+                    flat_cal_parts.append("-bias=$defbias")
+
+                # No CFA/equalize flags for flat calibration
+                L.append(" ".join(flat_cal_parts))
+
+                # 3) Now we have pp_flat_*.fit — stack them to a master
+                L.append(self._stack_cmd("pp_flat", norm="mul", out="pp_flat_stacked",
+                                        rgb_equal=False, output_norm=False))
+                L.append("cd .."); L.append("")
+                made_pp_flat = True
+                produced_flat[sess.name] = True
+
+            # Lights → process (with packing if chosen)
+            if not have_lights:
+                L.append("# (No lights found in this session.)")
+                L.append("")
+                continue
+
+            L.append(f'cd "{lights_dir.as_posix()}"')
+            L.append("setext fit")
+            L.append(f"convert light{_pack_flag_for_lights(i)} -out=../process")
+            L.append(f'cd "{process_dir.as_posix()}"')
+
+            # Resolve effective masters (panel=None → session→library)
+            md, mf, *_ = _resolve_cal_paths(self.project, sess, panel=None)
+
+            # Geometry preflight (parks odd sizes; warns if masters mismatch)
+            preflight_geometry(
+                lights_dir=lights_dir,
+                process_dir=process_dir,
+                master_dark=md,
+                master_flat=mf,
+                logger=print,
+            )
+            # --- Calibration availability (respect Master Library and session-built flats) ---
+            use_lib = bool(getattr(p, "use_master_library", False))
+
+            # What do we actually have available?
+            has_dark = bool(md) or use_lib
+            has_flat = bool(mf) or bool(made_pp_flat) or use_lib
+
+            if not has_dark and not has_flat:
+                _warn(L, f"Session {sess.name}: running lights WITHOUT dark/flat (validator already warned)")
+            elif not has_dark:
+                _warn(L, f"Session {sess.name}: no dark for lights (validator already warned)")
+            elif not has_flat:
+                _warn(L, f"Session {sess.name}: no flat for lights (validator already warned)")
+
+            # --- Build safe 'calibrate light' for OSC, honoring library & pp_flat ---
+            parts = ["calibrate", "light"]
+
+            # DARK
+            if md:
+                parts.append(f'-dark={md.as_posix()}')
+                use_dark_cc = True
+            elif use_lib:
+                parts.append("-dark=$defdark")
+                use_dark_cc = True
+            else:
+                use_dark_cc = False  # truly no dark
+
+            # FLAT
+            flat_used = False
+            if made_pp_flat:
+                parts.append('-flat=pp_flat_stacked')
+                flat_used = True
+            elif mf:
+                parts.append(f'-flat={mf.as_posix()}')
+                flat_used = True
+            elif use_lib:
+                parts.append("-flat=$defflat")
+                flat_used = True
+
+            # OSC flags
+            parts.append("-cfa")
+            if use_dark_cc:
+                parts.append("-cc=dark")
+            if flat_used and not p.drizzle_enabled:
+                parts.append("-equalize_cfa")
+            if not p.drizzle_enabled:
+                parts.append("-debayer")
+
+            L.append(" ".join(parts))
+            L.append("")
+
+            seq_name = "pp_light"
+            if getattr(p, "background_extraction_enabled", False):
+                L.append("# Background extraction enabled")
+                L.append("seqsubsky pp_light 1")
+                L.append("")
+                seq_name = "bkg_pp_light"
+
+            pp_seqs.append((process_dir.as_posix(), seq_name))
+            any_session = True
+
+        # ---------- Global register/stack ----------
+        if not (any_session and pp_seqs):
+            L.append("# No sessions with usable lights were found to stack.")
+            L.append("")
+            L.append("setfindstar reset")
+            # Do not close here; leave Siril’s viewer state alone
+            # L.append("close")
+            return "\n".join(L)
+
+        L.append("# ---------------- Global Registration & Stacking ----------------")
+        base_dir, _ = pp_seqs[0]
+        L.append(f'cd "{base_dir}"')
+
+        reg_flags    = " -layer=0" + (" -2pass" if p.two_pass else "")
+        if distortion_enabled:
+            reg_flags += " -disto=file platesolve_data.wcs"
+        drizzle_args = f" -drizzle -scale={p.drizzle_scaling:g} -pixfrac={p.drizzle_pixfrac:g} -kernel={p.drizzle_kernel}"
+
+        L.append("setfindstar")
+
+        if len(pp_seqs) == 1:
+            # Single session
+            sess = p.sessions[0]
+            reg_target = pp_seqs[0][1]
+            stack_target = f"r_{reg_target}"
+
+            if distortion_enabled:
+                emit_distortion_plate_solve(L, reg_target)
+
+            if p.drizzle_enabled and not p.two_pass:
+                # Drizzle fast-path (no seqapplyreg) – add -flat as weight if available
+                flat_opt = ""
+                if produced_flat.get(sess.name, False):
+                    flat_opt = " -flat=pp_flat_stacked"
+                elif p.use_master_library:
+                    flat_opt = " -flat=$defflat"
+
+                L.append(f"register {reg_target}{reg_flags}{drizzle_args}{flat_opt}")
+                L.append(self._stack_cmd(
+                    stack_target, norm="addscale", out="final_stacked",
+                    rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
+                ))
+            else:
+                # Non-drizzle OR drizzle+2pass (needs seqapplyreg)
+                L.append(f"register {reg_target}{reg_flags}")
+                if p.drizzle_enabled:
+                    L.append(f"seqapplyreg {reg_target}{drizzle_args}")
+                    L.append(self._stack_cmd(
+                        stack_target, norm="addscale", out="final_stacked",
+                        rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
+                    ))
+                else:
+                    if p.two_pass:
+                        L.append(f"seqapplyreg {reg_target}")
+                    L.append(self._stack_cmd(
+                        stack_target, norm="addscale", out="final_stacked",
+                        rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
+                    ))
+        else:
+            # Multi-session: merge -> register/stack
+            inputs = " ".join([f'"{folder}/{seq}"' for (folder, seq) in pp_seqs])
+            L.append(f"merge {inputs} all_sessions")
+
+            if distortion_enabled:
+                emit_distortion_plate_solve(L, "all_sessions")
+
+            if p.drizzle_enabled and not p.two_pass:
+                L.append(f"register all_sessions{reg_flags}{drizzle_args}")
+                L.append(self._stack_cmd(
+                    "r_all_sessions", norm="addscale", out="final_stacked",
+                    rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
+                ))
+            else:
+                L.append(f"register all_sessions{reg_flags}")
+                if p.drizzle_enabled:
+                    L.append(f"seqapplyreg all_sessions{drizzle_args}")
+                    L.append(self._stack_cmd(
+                        "r_all_sessions", norm="addscale", out="final_stacked",
+                        rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
+                    ))
+                else:
+                    if p.two_pass:
+                        L.append("seqapplyreg all_sessions")
+                    L.append(self._stack_cmd(
+                        "r_all_sessions", norm="addscale", out="final_stacked",
+                        rgb_equal=True, output_norm=True, use_32b=p.stack_32bit,
+                    ))
+
+        # Final copy/open
+        proj_slug = safe_slug(self.project.name)
+        L.append('# Copy final image to the project working directory')
+        want_fz = bool(getattr(p, "compress_intermediates", False))
+        if want_fz:
+            L.append("load final_stacked.fit.fz")
+            set_comp(0)  # save uncompressed final to project root
+        else:
+            L.append("load final_stacked.fit")
+        L.append("mirrorx -bottomup")
+        L.append(f'save "../../{proj_slug}_final.fit"')
+        L.append(f'# Final output: ../../{proj_slug}_final.fit')
+        # L.append(f'cd "{base_dir}"')
+
+        # Footer
+        L.append("")
+        L.append("setfindstar reset")
+        # Do not close; this leaves the final image open in Siril
+        # L.append("close")
+        return "\n".join(L)
+
+    def _build_mosaic_phase1(self) -> str:
+        """
+        Phase 1 for mosaic projects:
+        - Per panel: convert → preflight → calibrate (OSC) → register (panel-local)
+        - Outputs r_pp_light sequences per panel for downstream mosaic assembly (phase 2).
+        """
+        p = self.project
+        # Drizzle can be enabled either via the main Drizzle section or via Mosaic "Drizzle per panel" scope.
+        drizzle_any = bool(getattr(p, "drizzle_enabled", False) or getattr(p, "mosaic_drizzle_per_panel", False) )
+        # Phase 1 (per-panel) drizzle should trigger when either main drizzle is enabled or "Drizzle per panel" is selected.
+        drizzle_panel = bool(getattr(p, "drizzle_enabled", False) or getattr(p, "mosaic_drizzle_per_panel", False))
+        # Collect registered sequences per panel across sessions
+        panel_seq_map: dict[str, list[str]] = {}
+        if not getattr(p, "mosaic_enabled", False):
+            # Fallback to non-mosaic if toggled off
+            return self.build()
+
+        if not p.working_dir:
+            raise ValueError("Working directory is not set.")
+        work = Path(p.working_dir).resolve()
+
+        L: list[str] = []
+        L.append("#!Siril script generated by multi-night-stacking.py (Mosaic Phase 1)")
+        L.append("requires 1.4.0")
+        L.append("setfindstar reset")
+        L.append("")
+        L.append(f'cd "{work.as_posix()}"')
+        L.append("")
+        L.append("# --- Mosaic settings ---")
+        L.append("# Use Master Library: " + ("enabled (configured in Siril preferences)." if p.use_master_library else "disabled (panel/session overrides only)."))
+        L.append(f"# Allow uncalibrated runs: {'YES' if p.allow_uncalibrated else 'NO'}")
+        L.append("# NOTE: Mosaic Mode forces 'Pack sequences' OFF (Siril 1.4 cannot platesolve packed sequences).")
+        if drizzle_any:
+            L.append(f"# Drizzle: ON (Scaling={p.drizzle_scaling:g}, PixFrac={p.drizzle_pixfrac:g}, Kernel={p.drizzle_kernel})")
+        else:
+            L.append("# Drizzle: OFF")
+        L.append(f"# 2-pass registration: {'ON' if p.two_pass else 'OFF'}")
+        distortion_enabled = distortion_correction_is_enabled(p)
+        L.append(f"# Distortion correction: {'ON' if distortion_enabled else 'OFF'}")
+        L.append("")
+
+        # Compression control (avoid flapping)
+        want_fz = bool(p.compress_intermediates)
+        comp_state = -1
+        def set_comp(val: int):
+            nonlocal comp_state
+            if comp_state != val:
+                L.append(f"setcompress {val}")
+                comp_state = val
+        set_comp(1 if want_fz else 0)
+
+        # Pack Sequence decisions (per-panel lights)
+        mode = (p.pack_sequences_mode or "off").lower()  # off|fitseq|ser|auto
+        # Siril 1.4 mosaic limitation: plate-solving doesn't work on FITSEQ/SER.
+        # Force unpacked FITS for mosaic panel processing.
+        mode = "off"        
+        pack_thresh = int(getattr(p, "pack_threshold", 2000))
+
+        def _count_frames(dirpath: Path) -> int:
+            if not dirpath.exists():
+                return 0
+            n = 0
+            for pat in ("*.fit", "*.fits", "*.fit.fz", "*.fits.fz"):
+                n += sum(1 for _ in dirpath.glob(pat))
+            return n
+
+        # Collect panel roots for optional summary / future phases
+        any_panel = False
+
+        # NEW: collect per-panel finals to feed Phase 2
+        produced: list[str] = []
+
+        # -------- Iterate sessions -> panels --------
+        for sess in p.sessions:
+            sess_root = (work / (sess.work_subdir or sess.name)).resolve()
+            panels = list(getattr(sess, "panels", []) or [])
+            if not panels:
+                # Some users organize panels as subfolders even without explicit panel objects.
+                # If no panel objects, treat a single "panel" at session root.
+                panels = [{"name": "Panel", "id": "Panel", "master_dark": None, "master_flat": None,
+                        "master_bias": None, "master_darkflat": None}]
+
+            L.append(f"# ------------- Session: {sess.name} (panels: {len(panels)}) -------------")
+
+            # Precompute per-session threshold logic for AUTO packing
+            # (we evaluate per panel too, but a session-level hint can help)
+            session_pan_light_count = 0
+            for _pan in panels:
+                pname = getattr(_pan, "name", None) or getattr(_pan, "id", None) or "panel"
+                pan_root = (sess_root / pname).resolve()
+                session_pan_light_count += _count_frames(pan_root / "lights")
+
+            def _pack_flag_for_panel(pan_root: Path) -> str:
+                if mode in ("fitseq", "ser"):
+                    return f" -{mode}"
+                if mode == "auto":
+                    # Prefer panel-level count; fall back to session aggregate
+                    n = _count_frames((pan_root / "lights"))
+                    if n >= pack_thresh or session_pan_light_count >= pack_thresh:
+                        return " -fitseq"
+                return ""
+
+            for panel in panels:
+                pid   = (getattr(panel, "panel_id", None)
+                         or getattr(panel, "id", None)
+                         or getattr(panel, "name", None)
+                         or "panel")
+                pname = getattr(panel, "name", None) or pid
+
+                L.append(f"# ---- Panel {pid} in Session {sess.name} ----")
+
+                pan_root   = (sess_root / pname).resolve()
+                lights_dir = (pan_root / "lights").resolve()
+                proc_dir   = (pan_root / "process").resolve()
+
+                # Convert panel lights
+                if not getattr(self, "_storage_collect", False) and (
+                        not lights_dir.exists() or not any(lights_dir.glob("*.fit*"))):
+                    L.append(f'# (No lights found for panel {pid} in this session.)')
+                    L.append("")
+                    continue
+
+                # --- Optional: build per-panel pp_flat_stacked when raw flats are provided ---
+                made_pp_flat = False
+                panel_flats = list(getattr(panel, "flats", []) or [])
+                if panel_flats:
+                    # Prefer an explicit flats_dir on the panel if you store it; otherwise use <panel>/flats
+                    flats_dir_attr = getattr(panel, "flats_dir", "") or ""
+                    flats_dir = Path(flats_dir_attr) if flats_dir_attr else (pan_root / "flats")
+
+                    # 1) Convert flats into the panel's process folder
+                    L.append(f'cd "{flats_dir.as_posix()}"')
+                    L.append("setext fit")
+                    L.append('convert flat -out=../process')
+                    L.append(f'cd "{proc_dir.as_posix()}"')
+
+                    # 2) Calibrate flats: prefer dark-flat, else bias, else library bias
+                    md, mf, mb, mdf = _resolve_cal_paths(p, sess, panel=panel)
+
+                    if not (mdf or mb or getattr(p, "use_master_library", False)):
+                        _warn(L, f"{getattr(sess,'name','Session')} / "
+                                f"{getattr(panel,'panel_id',getattr(panel,'id','Panel'))}: "
+                                "calibrating flats WITHOUT bias/dark-flat (validator already warned)")
+
+                    cal_flat = ["calibrate", "flat"]
+                    if mdf:
+                        cal_flat.append(f'-dark={Path(mdf).as_posix()}')
+                    elif mb:
+                        cal_flat.append(f'-bias={Path(mb).as_posix()}')
+                    elif bool(getattr(p, "use_master_library", False)):
+                        cal_flat.append("-bias=$defbias")
+                    L.append(" ".join(cal_flat))
+
+                    # 3) Stack calibrated flats to master
+                    L.append(self._stack_cmd("pp_flat", norm="mul", out="pp_flat_stacked",
+                                            rgb_equal=False, output_norm=False))
+                    L.append("cd .."); L.append("")
+                    made_pp_flat = True
+
+                L.append(f'cd "{lights_dir.as_posix()}"')
+                L.append("setext fit")
+                L.append(f'convert light{_pack_flag_for_panel(pan_root)} -out=../process')
+                L.append(f'cd "{proc_dir.as_posix()}"')
+
+                # Resolve calibration paths (panel → session → library)
+                md, mf, mb, mdf = _resolve_cal_paths(self.project, sess, panel=panel)
+
+                # Geometry preflight
+                if not getattr(self, "_storage_collect", False):
+                    preflight_geometry(
+                        lights_dir=lights_dir,
+                        process_dir=proc_dir,
+                        master_dark=md,
+                        master_flat=mf,
+                        logger=print,
+                    )
+
+                # Warnings (panel scope)
+                if not md and not mf:
+                    _warn(L, f"{sess.name} / {pid}: running lights WITHOUT dark/flat (validator already warned)")
+                elif not md:
+                    _warn(L, f"{sess.name} / {pid}: no dark for lights (validator already warned)")
+                elif not mf:
+                    _warn(L, f"{sess.name} / {pid}: no flat for lights (validator already warned)")
+
+                # Build safe calibrate command (OSC) — honor Master Library like non-mosaic builder
+                use_lib = bool(getattr(p, "use_master_library", False))
+                parts = ["calibrate", "light"]
+
+                # DARK
+                use_dark_cc = False
+                if md:
+                    parts.append(f'-dark={md.as_posix()}')
+                    use_dark_cc = True
+                elif use_lib:
+                    parts.append("-dark=$defdark")
+                    use_dark_cc = True
+
+                # FLAT
+                flat_used = False
+                if made_pp_flat:
+                    parts.append('-flat=pp_flat_stacked')
+                    flat_used = True                
+                elif mf:
+                    parts.append(f'-flat={mf.as_posix()}')
+                    flat_used = True
+                elif use_lib:
+                    parts.append("-flat=$defflat")
+                    flat_used = True
+                # (If you later add per-panel pp_flat_stacked support, prefer it here.)
+
+                # OSC flags
+                parts.append("-cfa")
+                if use_dark_cc:
+                    parts.append("-cc=dark")
+                if flat_used and not drizzle_panel:
+                    parts.append("-equalize_cfa")
+                if not drizzle_panel:
+                    parts.append("-debayer")
+
+                L.append(" ".join(parts))
+                L.append("")
+
+                # --- Background extraction (optional, controlled by "Panel Background Extraction") ---
+                do_bkg = bool(getattr(p, "panel_background_extraction", False))
+                seq_base = "bkg_pp_light" if do_bkg else "pp_light"
+
+                if do_bkg:
+                    L.append("# Panel background extraction enabled")
+                    L.append("seqsubsky pp_light 1")  # -> bkg_pp_light_*.fit
+                else:
+                    L.append("# Panel background extraction disabled (using calibrated pp_light directly)")
+
+                L.append("")
+
+                # --- Optionally plate-solve the first frame for a distortion WCS file ---
+                if distortion_enabled:
+                    emit_distortion_plate_solve(L, seq_base)
+
+                # --- Register the chosen sequence ---
+                # Mosaic Registration Mode governs whether we run 1-pass or 2-pass registration.
+                # Drizzle-per-panel ALWAYS forces 2-pass because drizzle output is generated via seqapplyreg.
+                mosaic_two_pass = str(getattr(p, "mosaic_registration_mode", "")).lower().startswith("two")
+                reg_two_pass = bool(mosaic_two_pass) or bool(getattr(p, "two_pass", False))
+                disto_flags = " -disto=file platesolve_data.wcs" if distortion_enabled else ""
+                disto_label = " with WCS undistortion" if distortion_enabled else ""
+
+                if drizzle_panel:
+                    drizzle_args = (
+                        f" -drizzle -scale={p.drizzle_scaling:g}"
+                        f" -pixfrac={p.drizzle_pixfrac:g}"
+                        f" -kernel={p.drizzle_kernel}"
+                    )
+                    L.append(f"# Register panel {pid} sequence{disto_label} (2-pass) + drizzle")
+                    # Siril CLI/script syntax: -2pass computes transforms only (no transformed images are generated).
+                    # There is no '-noout' option for the 'register' command in SSF scripts.
+                    L.append(f"register {seq_base}{disto_flags} -2pass")
+                    L.append(f"seqapplyreg {seq_base}{drizzle_args}")
+                elif reg_two_pass:
+                    L.append(f"# Register panel {pid} sequence{disto_label} (2-pass)")
+                    L.append(f"register {seq_base}{disto_flags} -2pass")
+                    L.append(f"seqapplyreg {seq_base}")
+                else:
+                    L.append(f"# Register panel {pid} sequence{disto_label}")
+                    L.append(f"register {seq_base}{disto_flags}")
+                L.append("")
+
+                # Instead of stacking now, remember this session’s registered seq for cross-session merge
+                seq_dir = (proc_dir / f"r_{seq_base}").as_posix()   # seq_base is "bkg_pp_light" if BE on, else "pp_light"
+                panel_seq_map.setdefault(pid, []).append(seq_dir)
+
+                any_panel = True
+
+        if not any_panel:
+            L.append("# No panels with usable lights were found.")
+            L.append("")
+            L.append("setfindstar reset")
+            # Do not close; nothing was produced anyway
+            # L.append("close")
+            return "\n".join(L)
+
+        # --- End Mosaic Phase 1 (all panels calibrated, registered & stacked) ---
+        # Begin Phase 2: stitch per-panel finals into the mosaic
+        # Map UI selections to tokens/flags for the Phase 2 helper
+        feather_px = int(getattr(p, "mosaic_feather_px", 0) or 0)
+        maximize_framing = bool(getattr(p, "mosaic_maximize_framing", True))
+        overlap_norm = bool(getattr(p, "mosaic_overlap_norm", False))
+
+        # ---- Phase 1B: cross-session merge and stack, per panel ----
+        L.append(f"# ---- Phase 1B: cross-session merge and stack, per panel ----")
+        L.append("")
+        for pid, seqs in panel_seq_map.items():
+            # Work in the first seq's process directory
+            first_seq = Path(seqs[0])
+            proc_dir = first_seq.parent  # .../Session X/<panel>/process
+            L.append(f"# ---- Panel {pid} ----")
+            L.append(f'cd "{proc_dir.as_posix()}"')
+            # Ensure intermediate outputs (merge/register) respect the user compression setting.
+            # Phase 1B temporarily disables compression for final per-panel stacks only.
+            set_comp(1 if want_fz else 0)
+
+            parts, _ = map_project_stack_method(p)
+
+            if len(seqs) == 1:
+                # Single session: no merge, no re-register — stack the existing registered seq
+                seq_name = first_seq.name  # e.g. "r_bkg_pp_light" or "r_pp_light"
+                out_name = f"{safe_slug(pid)}_final"
+                cmd = ["stack", seq_name] + parts + ["-norm=addscale"]
+                cmd += ["-rgb_equal", "-output_norm"]
+                if bool(getattr(p, "stack_32bit", False)):
+                    cmd.append("-32b")
+                cmd.append(f"-out={out_name}")
+
+                if want_fz:
+                    set_comp(0)
+                L.append(" ".join(cmd))
+                if want_fz:
+                    set_comp(1)
+                L.append("")
+                produced.append((proc_dir / f"{out_name}.fit").as_posix())
+
+            else:
+                # Multi-session: merge -> register -> stack
+                merged_name = f"ALL_{pid}"
+                merge_args = " ".join([f'"{s}"' for s in seqs])
+                L.append(f"merge {merge_args} {merged_name}")
+
+                # full-canvas registration (simple, no extra flags needed here)
+                L.append(f"register {merged_name} -layer=0")
+                out_name = f"{safe_slug(pid)}_final"
+                cmd = ["stack", f"r_{merged_name}_"] + parts + ["-norm=addscale"]
+                cmd += ["-rgb_equal", "-output_norm"]
+                if bool(getattr(p, "stack_32bit", False)):
+                    cmd.append("-32b")
+                cmd.append(f"-out={out_name}")
+
+                if want_fz:
+                    set_comp(0)
+                L.append(" ".join(cmd))
+                if want_fz:
+                    set_comp(1)
+                L.append("")
+                produced.append((proc_dir / f"{out_name}.fit").as_posix())
+
+        # Keep using the same compression state tracker from Phase 1
+        emit_phase2_mosaic(
+            work=work,
+            produced=produced,
+            p=p,
+            L=L,
+            comp_state=comp_state,
+            set_comp_if_needed=set_comp_if_needed,
+            safe_slug=safe_slug,
+            feather_px=feather_px,
+            overlap_norm=overlap_norm,
+        )
+
+        return "\n".join(L)
+
+def emit_phase2_mosaic(
+    *,
+    work,                        # Path to project working dir (Path)
+    produced,                    # list[str] per-panel *_final.fit (some may be None/"")
+    p,                           # project/config object
+    L,                           # list[str] Siril commands buffer
+    comp_state,                  # compression state tracker (e.g., [0] or 0)
+    set_comp_if_needed,          # fn(L, comp_state_ref, desired_state)
+    safe_slug,                   # fn(name)->safe slug
+    feather_px,                  # int pixels for -feather
+    overlap_norm                 # bool for -overlap_norm
+):
+    """
+    Phase 2: WCS-based mosaic stitching.
+    - Build a mosaic sequence by merging each panel's r_pp_light (already registered in Phase 1).
+    - Plate-solve the merged sequence, then seqapplyreg with framing=max to place panels on a full canvas.
+    - Optional background match (if enabled in p).
+    - Stack to mosaic_final.fit, optionally resample, mirror + write {project}_final.fit at project root.
+    """
+
+    # Gather only the produced panel finals (skip any panels without output)
+    finals = [f for f in (produced or []) if f]
+
+
+    # Compression preference for intermediates (.fit.fz) in this run
+    want_fz = bool(getattr(p, "compress_intermediates", False))
+    # Phase 2 mosaic stitching is built from per-panel *_final.fit images, which are RGB (not mono/CFA).
+    # Siril drizzle only works on mono/CFA sequences, so drizzle must be skipped here.
+    drizzle_mosaic = False
+    if getattr(p, "drizzle_enabled", False):
+        L.append("# NOTE: Drizzle is enabled, but Phase 2 mosaic stitching uses RGB panel finals; drizzle is skipped in Phase 2.")
+
+    L.append("# ---- Phase 2: Stitching panels into a mosaic ----")
+    L.append("setcompress 0")
+    if len(finals) == 0:
+        L.append("# No panel finals were produced; nothing to stitch.")
+        L.append("setfindstar reset")
+        # Do not close; leave viewer state as-is
+        # L.append("close")
+        return
+
+    if len(finals) == 1:
+        # Single panel: just promote to mosaic_final and project root
+        one = finals[0]
+        L.append(f'cd "{Path(one).parent.as_posix()}"')
+        L.append(f'load "{Path(one).as_posix()}"')
+        L.append('save "mosaic_final.fit"')
+
+        proj_slug = safe_slug(getattr(p, "name", "project"))
+        L.append('load "mosaic_final.fit"')
+        L.append('mirrorx -bottomup')
+        final_abs = (work / f"{proj_slug}_final.fit").as_posix()
+        L.append(f'save "{final_abs}"')
+        L.append(f"# Final mosaic written to {final_abs}")
+        L.append("setfindstar reset")
+        # Do not close; leave mosaic_final displayed in Siril
+        # L.append("close")
+        return
+
+    # Use the first panel's existing process directory as the working folder
+    mosaic_dir = Path(finals[0]).parent
+    L.append(f'cd "{mosaic_dir.as_posix()}"')
+    L.append("# Using existing process directory for mosaic assembly.")
+
+    # --- Build mosaic sequence directly from per-panel finals (no merge) ---
+    # Optional: keep honoring the user’s Global Reference by reordering 'finals' first
+    ref_sel = (getattr(p, "mosaic_global_reference", "") or "").strip()
+    if ref_sel and not ref_sel.lower().startswith("bestframe"):
+        try:
+            sess_name, panel_id = [x.strip() for x in ref_sel.split("/", 1)]
+            import re
+            sess_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", sess_name)
+            pid_slug  = re.sub(r"[^A-Za-z0-9_.-]+", "_", panel_id)
+            wanted = f"{sess_slug}_{pid_slug}_final.fit".lower()
+            match = next((f for f in finals if f.lower().endswith(wanted)), None)
+            if match:
+                finals = [match] + [f for f in finals if f != match]
+                L.append(f'# Using "{ref_sel}" as global registration reference.')
+            else:
+                L.append(f'# NOTE: Global Reference "{ref_sel}" not found among panel finals; using first panel as reference.')
+        except Exception:
+            L.append(f'# NOTE: Could not parse Global Reference "{ref_sel}"; using first panel as reference.')
+    else:
+        L.append("# Using first panel as registration reference (BestFrame auto).")
+
+    # Work inside the first panel's existing process directory (already exists)
+    from pathlib import Path as _P
+    L.append("# Build mosaic sequence from per-panel finals:")
+    for i, fpath in enumerate(finals, start=1):
+        L.append(f'load "{_P(fpath).as_posix()}"')
+        L.append(f'save "mosaic_{i:05d}.fit"')
+    L.append("")  # now we have a 'mosaic' sequence on disk
+
+    # WCS solve and apply registration on the merged sequence
+    L.append("seqplatesolve mosaic -force -nocache")
+    maximize_framing = bool(getattr(p, "mosaic_maximize_framing", True))
+    if maximize_framing:
+        L.append("seqapplyreg mosaic -framing=max")
+    else:
+        L.append("seqapplyreg mosaic")
+    L.append("")
+
+    # Ensure final outputs are uncompressed
+
+    parts, _ = map_project_stack_method(p)
+
+    cmd = ["stack", "r_mosaic_"]
+    cmd += parts
+    cmd += ["-norm=addscale"]
+    if maximize_framing:
+        cmd.append("-maximize")
+    if int(feather_px or 0) > 0:
+        cmd.append(f"-feather={int(feather_px)}")
+    if overlap_norm:
+        cmd.append("-overlap_norm")
+    cmd += ["-rgb_equal", "-output_norm"]
+    if bool(getattr(p, "stack_32bit", False)):
+        cmd.append("-32b")
+    cmd.append("-out=mosaic_final")
+
+    L.append(" ".join(cmd))
+    L.append("")
+
+    # Optional canvas scaling
+    try:
+        canvas_scale = float(getattr(p, "mosaic_canvas_scale", 1.0) or 1.0)
+    except Exception:
+        canvas_scale = 1.0
+    if abs(canvas_scale - 1.0) > 1e-6:
+        L.append('load "mosaic_final.fit"')
+        L.append(f"resample {canvas_scale:g}")
+        L.append('save "mosaic_final_scaled.fit"')
+        L.append("")
+
+    # Promote mosaic final to project root and load it
+    proj_slug = safe_slug(getattr(p, "name", "project"))
+    L.append('load "mosaic_final.fit"')
+    L.append('mirrorx -bottomup')
+    final_abs = (work / f"{proj_slug}_final.fit").as_posix()
+    L.append(f'save "{final_abs}"')
+    L.append(f"# Final mosaic written to {final_abs}")
+
+    L.append("setfindstar reset")
+    # Do not close; keep the mosaic open in Siril
+    # L.append("close")
+
+GESDT_METHOD_NAMES = {
+    "gesdt rejection",
+    "gesdt",
+    "generalized extreme studentized deviate test",
+    "generalized",
+    "rej generalized",
+    "rej_generalized",
+}
+
+
+def is_gesdt_stack_method(ui_method: str) -> bool:
+    return (ui_method or "").strip().lower() in GESDT_METHOD_NAMES
+
+
+def normalized_gesdt_parameters(outliers, significance) -> tuple[float, float]:
+    """Return Siril-safe GESDT parameters, falling back to Siril's defaults."""
+    try:
+        outliers = float(outliers)
+    except (TypeError, ValueError):
+        outliers = 0.3
+    try:
+        significance = float(significance)
+    except (TypeError, ValueError):
+        significance = 0.05
+    if not 0.0 < outliers < 1.0:
+        outliers = 0.3
+    if not 0.0 < significance < 1.0:
+        significance = 0.05
+    return outliers, significance
+
+
+def map_project_stack_method(project):
+    return map_stack_method(
+        getattr(project, "stack_method", None) or "Winsorized Rejection",
+        float(getattr(project, "reject_sigma_low", 3.0) or 3.0),
+        float(getattr(project, "reject_sigma_high", 3.0) or 3.0),
+        getattr(project, "gesdt_outliers", 0.3),
+        getattr(project, "gesdt_significance", 0.05),
+    )
+
+
+def map_stack_method(
+    ui_method: str,
+    sigma_lo: float,
+    sigma_hi: float,
+    gesdt_outliers: float = 0.3,
+    gesdt_significance: float = 0.05,
+):
+    """
+    Returns (command parts, needs_rejection_parameters).
+    Examples:
+      ["rej", "sigma", "3", "3"]  -> Sigma Rejection
+      ["rej", "generalized", "0.3", "0.05"] -> GESDT Rejection
+      ["rej", "3", "3"]           -> Winsorized Rejection (default)
+      ["mean", "none"]            -> Mean
+      ["med"]                     -> Median
+    """
+    ui = (ui_method or "").strip().lower()
+
+    # Accept either labels or old tokens, just in case
+    if ui in ("sigma rejection", "sigma", "sigma clipping", "rej sigma", "rej_sigma"):
+        return ["rej", "sigma", f"{sigma_lo:g}", f"{sigma_hi:g}"], True
+
+    if ui in GESDT_METHOD_NAMES:
+        outliers, significance = normalized_gesdt_parameters(gesdt_outliers, gesdt_significance)
+        return ["rej", "generalized", f"{outliers:g}", f"{significance:g}"], True
+
+    if ui in ("winsorized rejection", "winsorized", "rejection", "wrej", "rej winsorized", "rej_winsorized"):
+        # Simple 'rej' uses Siril's default winsorized rejection
+        return ["rej", f"{sigma_lo:g}", f"{sigma_hi:g}"], True
+
+    if ui in ("mean",):
+        return ["mean", "none"], False
+
+    if ui in ("median", "med"):
+        return ["med"], False
+
+    # Fallback to winsorized rejection
+    return ["rej", f"{sigma_lo:g}", f"{sigma_hi:g}"], True
+
+# -----------------------------
+# Qt Widgets
+# -----------------------------
+
+class FrameListWidget(QtWidgets.QWidget):
+    changed = QtCore.pyqtSignal()
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        title = "Biases" if title.lower()=="bias" else ("Dark Flats" if title.lower()=="dark_flats" else title)
+        self.title = title
+
+        self.list = QtWidgets.QListWidget()
+        self.btn_add = QtWidgets.QPushButton("Add")
+        self.btn_remove = QtWidgets.QPushButton("Remove")
+        self.btn_clear = QtWidgets.QPushButton("Clear")
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addWidget(self.btn_add); btns.addWidget(self.btn_remove); btns.addWidget(self.btn_clear)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel(title))
+        layout.addWidget(self.list)
+        layout.addLayout(btns)
+
+        self.btn_add.clicked.connect(self.add_files)
+        self.btn_remove.clicked.connect(self.remove_selected)
+        self.btn_clear.clicked.connect(self.clear_all)
+
+    def add_files(self):
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, f"Add {self.title}")
+        for f in files: self.list.addItem(f)
+        if files: self.changed.emit()
+
+    def remove_selected(self):
+        for it in self.list.selectedItems():
+            self.list.takeItem(self.list.row(it))
+        self.changed.emit()
+
+    def clear_all(self):
+        self.list.clear()
+        self.changed.emit()
+
+    def get_paths(self) -> List[str]:
+        return [self.list.item(i).text() for i in range(self.list.count())]
+
+    def set_paths(self, paths: List[str]):
+        self.list.clear()
+        for p in paths: self.list.addItem(p)
+
+class MasterOverrideWidget(QtWidgets.QWidget):
+    changed = QtCore.pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.ed_bias = QtWidgets.QLineEdit()
+        self.ed_dark = QtWidgets.QLineEdit()
+        self.ed_flat = QtWidgets.QLineEdit()
+        self.ed_darkflat = QtWidgets.QLineEdit()
+
+        self.btn_bias = QtWidgets.QPushButton("...")
+        self.btn_dark = QtWidgets.QPushButton("...")
+        self.btn_flat = QtWidgets.QPushButton("...")
+        self.btn_darkflat = QtWidgets.QPushButton("...")
+
+        grid = QtWidgets.QGridLayout(self)
+        grid.addWidget(QtWidgets.QLabel("Master Bias"), 0, 0)
+        grid.addWidget(self.ed_bias, 0, 1)
+        grid.addWidget(self.btn_bias, 0, 2)
+
+        grid.addWidget(QtWidgets.QLabel("Master Dark"), 1, 0)
+        grid.addWidget(self.ed_dark, 1, 1)
+        grid.addWidget(self.btn_dark, 1, 2)
+
+        grid.addWidget(QtWidgets.QLabel("Master Flat"), 2, 0)
+        grid.addWidget(self.ed_flat, 2, 1)
+        grid.addWidget(self.btn_flat, 2, 2)
+
+        grid.addWidget(QtWidgets.QLabel("Master Dark Flat"), 3, 0)
+        grid.addWidget(self.ed_darkflat, 3, 1)
+        grid.addWidget(self.btn_darkflat, 3, 2)
+
+        self.btn_bias.clicked.connect(lambda: self.pick_file(self.ed_bias))
+        self.btn_dark.clicked.connect(lambda: self.pick_file(self.ed_dark))
+        self.btn_flat.clicked.connect(lambda: self.pick_file(self.ed_flat))
+        self.btn_darkflat.clicked.connect(lambda: self.pick_file(self.ed_darkflat))
+
+        for ed in (self.ed_bias, self.ed_dark, self.ed_flat, self.ed_darkflat):
+            ed.textChanged.connect(self.changed)
+
+    def pick_file(self, target: QtWidgets.QLineEdit):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Pick master file")
+        if f:
+            target.setText(f)
+            self.changed.emit()
+
+    def get_overrides(self) -> Dict[str, Optional[str]]:
+        return {
+            "master_bias": self.ed_bias.text() or None,
+            "master_dark": self.ed_dark.text() or None,
+            "master_flat": self.ed_flat.text() or None,
+            "master_dark_flat": self.ed_darkflat.text() or None,
+        }
+
+    def set_overrides(self, d: Dict[str, Optional[str]]):
+        self.ed_bias.setText(d.get("master_bias") or "")
+        self.ed_dark.setText(d.get("master_dark") or "")
+        self.ed_flat.setText(d.get("master_flat") or "")
+        self.ed_darkflat.setText(d.get("master_dark_flat") or "")
+
+class SessionEditor(QtWidgets.QWidget):
+    """Right-hand session editor: boxed lists for frame types + per-session overrides."""
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # --- Top: session meta ---
+        self.ed_session_name = QtWidgets.QLineEdit("Session 1")
+        self.ed_work_subdir  = QtWidgets.QLineEdit()
+        meta_form = QtWidgets.QFormLayout()
+        meta_form.addRow("Session Name", self.ed_session_name)
+        meta_form.addRow("Working Subdir (optional)", self.ed_work_subdir)
+
+        # --- Helper to create a boxed list group with Add/Remove/Clear ---
+        def make_list_group(title: str):
+            box = QtWidgets.QGroupBox(title)
+            v = QtWidgets.QVBoxLayout(box)
+            lst = QtWidgets.QListWidget()
+            lst.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            v.addWidget(lst)
+            hb = QtWidgets.QHBoxLayout()
+            btn_add = QtWidgets.QPushButton("Add")
+            btn_rm  = QtWidgets.QPushButton("Remove")
+            btn_clr = QtWidgets.QPushButton("Clear")
+            hb.addWidget(btn_add); hb.addWidget(btn_rm); hb.addWidget(btn_clr); hb.addStretch(1)
+            v.addLayout(hb)
+            return box, lst, btn_add, btn_rm, btn_clr
+
+        # --- Boxed groups for each frame type ---
+        self.grp_lights, self.lst_lights, self.bt_add_light, self.bt_rm_light, self.bt_clr_light = make_list_group("Lights")
+        self.grp_biases, self.lst_biases, self.bt_add_bias, self.bt_rm_bias, self.bt_clr_bias     = make_list_group("Biases")
+        self.grp_darks,  self.lst_darks,  self.bt_add_dark, self.bt_rm_dark, self.bt_clr_dark     = make_list_group("Darks")
+        self.grp_flats,  self.lst_flats,  self.bt_add_flat, self.bt_rm_flat, self.bt_clr_flat     = make_list_group("Flats")
+        self.grp_df,     self.lst_df,     self.bt_add_df,   self.bt_rm_df,   self.bt_clr_df       = make_list_group("Dark Flats")
+        self.nb_group_widgets = {}
+        self.nb_override_widgets = {}
+        self.nb_override_boxes = {}
+        for key in NB_GROUP_KEYS:
+            self.nb_group_widgets[key] = {
+                "lights": make_list_group("Lights"),
+                "bias": make_list_group("Biases"),
+                "darks": make_list_group("Darks"),
+                "flats": make_list_group("Flats"),
+                "dark_flats": make_list_group("Dark Flats"),
+            }
+            self.nb_override_boxes[key] = QtWidgets.QGroupBox("Per-filter Master Overrides (optional)")
+            ov = QtWidgets.QVBoxLayout(self.nb_override_boxes[key])
+            self.nb_override_widgets[key] = MasterOverrideWidget()
+            ov.addWidget(self.nb_override_widgets[key])
+
+        # --- Per-session Master Overrides (boxed form) ---
+        self.grp_overrides = QtWidgets.QGroupBox("Per-session Master Overrides (optional)")
+        ov_form = QtWidgets.QFormLayout(self.grp_overrides)
+
+        def make_pick_row():
+            le = QtWidgets.QLineEdit()
+            btn = QtWidgets.QPushButton("…")
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(le, 1); row.addWidget(btn)
+            w = QtWidgets.QWidget(); w.setLayout(row)
+            return le, btn, w
+
+        self.ed_master_bias, self.bt_pick_mbias, w_mb = make_pick_row()
+        self.ed_master_dark, self.bt_pick_mdark, w_md = make_pick_row()
+        self.ed_master_flat, self.bt_pick_mflat, w_mf = make_pick_row()
+        self.ed_master_df,   self.bt_pick_mdf,   w_mdf= make_pick_row()
+
+        ov_form.addRow("Master Bias",     w_mb)
+        ov_form.addRow("Master Dark",     w_md)
+        ov_form.addRow("Master Flat",     w_mf)
+        ov_form.addRow("Master Dark Flat",w_mdf)
+
+        # --- Lay out: meta at top, Lights (full width), then 2x2 grid, then overrides (full width) ---
+        grid = QtWidgets.QGridLayout()
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        # Lights spans two columns
+        grid.addWidget(self.grp_lights, 0, 0, 1, 2)
+        # Biases / Darks row
+        grid.addWidget(self.grp_biases, 1, 0, 1, 1)
+        grid.addWidget(self.grp_darks,  1, 1, 1, 1)
+        # Flats / Dark Flats row
+        grid.addWidget(self.grp_flats,  2, 0, 1, 1)
+        grid.addWidget(self.grp_df,     2, 1, 1, 1)
+        # Overrides spans two columns
+        grid.addWidget(self.grp_overrides, 3, 0, 1, 2)
+
+        osc_page = QtWidgets.QWidget()
+        osc_page.setLayout(grid)
+        self.frame_tabs = QtWidgets.QTabWidget()
+        osc_idx = self.frame_tabs.addTab(osc_page, "OSC")
+        self.frame_tabs.setTabToolTip(osc_idx, FRAME_TAB_TOOLTIPS["osc"])
+        for key in NB_GROUP_KEYS:
+            page = QtWidgets.QWidget()
+            page_grid = QtWidgets.QGridLayout(page)
+            page_grid.setColumnStretch(0, 1)
+            page_grid.setColumnStretch(1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["lights"][0], 0, 0, 1, 2)
+            page_grid.addWidget(self.nb_group_widgets[key]["bias"][0], 1, 0, 1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["darks"][0], 1, 1, 1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["flats"][0], 2, 0, 1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["dark_flats"][0], 2, 1, 1, 1)
+            page_grid.addWidget(self.nb_override_boxes[key], 3, 0, 1, 2)
+            idx = self.frame_tabs.addTab(page, NB_GROUP_LABELS[key])
+            self.frame_tabs.setTabToolTip(idx, FRAME_TAB_TOOLTIPS[key])
+
+        main = QtWidgets.QVBoxLayout(self)
+        main.addLayout(meta_form)
+        main.addWidget(self.frame_tabs, 1)
+
+        # --- Wiring ---
+        # Adders
+        self.bt_add_light.clicked.connect(lambda: self._add_files(self.lst_lights))
+        self.bt_add_bias.clicked.connect(lambda: self._add_files(self.lst_biases))
+        self.bt_add_dark.clicked.connect(lambda: self._add_files(self.lst_darks))
+        self.bt_add_flat.clicked.connect(lambda: self._add_files(self.lst_flats))
+        self.bt_add_df.clicked.connect(lambda: self._add_files(self.lst_df))
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                self.nb_group_widgets[key][frame_type][2].clicked.connect(
+                    lambda _=False, k=key, ft=frame_type: self._add_files(self.nb_group_widgets[k][ft][1])
+                )
+
+        # Removers
+        self.bt_rm_light.clicked.connect(lambda: self._remove_selected(self.lst_lights))
+        self.bt_rm_bias.clicked.connect(lambda: self._remove_selected(self.lst_biases))
+        self.bt_rm_dark.clicked.connect(lambda: self._remove_selected(self.lst_darks))
+        self.bt_rm_flat.clicked.connect(lambda: self._remove_selected(self.lst_flats))
+        self.bt_rm_df.clicked.connect(lambda: self._remove_selected(self.lst_df))
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                self.nb_group_widgets[key][frame_type][3].clicked.connect(
+                    lambda _=False, k=key, ft=frame_type: self._remove_selected(self.nb_group_widgets[k][ft][1])
+                )
+
+        # Clearers
+        self.bt_clr_light.clicked.connect(lambda: self._clear_all(self.lst_lights))
+        self.bt_clr_bias.clicked.connect(lambda: self._clear_all(self.lst_biases))
+        self.bt_clr_dark.clicked.connect(lambda: self._clear_all(self.lst_darks))
+        self.bt_clr_flat.clicked.connect(lambda: self._clear_all(self.lst_flats))
+        self.bt_clr_df.clicked.connect(lambda: self._clear_all(self.lst_df))
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                self.nb_group_widgets[key][frame_type][4].clicked.connect(
+                    lambda _=False, k=key, ft=frame_type: self._clear_all(self.nb_group_widgets[k][ft][1])
+                )
+
+        # Override pickers
+        self.bt_pick_mbias.clicked.connect(lambda: self._pick_file(self.ed_master_bias))
+        self.bt_pick_mdark.clicked.connect(lambda: self._pick_file(self.ed_master_dark))
+        self.bt_pick_mflat.clicked.connect(lambda: self._pick_file(self.ed_master_flat))
+        self.bt_pick_mdf.clicked.connect(lambda: self._pick_file(self.ed_master_df))
+
+        # Dirty tracking
+        self.ed_session_name.textChanged.connect(self.changed.emit)
+        self.ed_work_subdir.textChanged.connect(self.changed.emit)
+        self.ed_master_bias.textChanged.connect(self.changed.emit)
+        self.ed_master_dark.textChanged.connect(self.changed.emit)
+        self.ed_master_flat.textChanged.connect(self.changed.emit)
+        self.ed_master_df.textChanged.connect(self.changed.emit)
+        for key in NB_GROUP_KEYS:
+            self.nb_override_widgets[key].changed.connect(self.changed.emit)
+
+        for lst in (self.lst_lights, self.lst_biases, self.lst_darks, self.lst_flats, self.lst_df):
+            m = lst.model()
+            m.rowsInserted.connect(self._emit_changed)
+            m.rowsRemoved.connect(self._emit_changed)
+            m.modelReset.connect(self._emit_changed)  # important for .clear()
+            lst.itemChanged.connect(self._emit_changed)
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                lst = self.nb_group_widgets[key][frame_type][1]
+                m = lst.model()
+                m.rowsInserted.connect(self._emit_changed)
+                m.rowsRemoved.connect(self._emit_changed)
+                m.modelReset.connect(self._emit_changed)
+                lst.itemChanged.connect(self._emit_changed)
+
+    @QtCore.pyqtSlot()
+    def _emit_changed(self):
+        self.changed.emit()
+
+    # ---------- Utilities ----------
+    def set_frame_groups_enabled(self, enabled: bool):
+        """
+        Enable/disable the frame list groups (Lights/Biases/Darks/Flats/Dark Flats)
+        while leaving session metadata and master overrides editable.
+        """
+        groups = [self.grp_lights, self.grp_biases, self.grp_darks, self.grp_flats, self.grp_df]
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                groups.append(self.nb_group_widgets[key][frame_type][0])
+        for grp in groups:
+            grp.setEnabled(enabled)
+
+    def _add_files(self, lst: QtWidgets.QListWidget):
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add files")
+        if not files:
+            return
+        for f in files:
+            lst.addItem(f)
+        self.changed.emit()
+
+    def _remove_selected(self, lst: QtWidgets.QListWidget):
+        for it in lst.selectedItems():
+            row = lst.row(it)
+            lst.takeItem(row)
+        self.changed.emit()
+
+    def _clear_all(self, lst: QtWidgets.QListWidget):
+        lst.clear()
+        self.changed.emit()
+
+    def _pick_file(self, le: QtWidgets.QLineEdit):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Pick file")
+        if f:
+            le.setText(f)
+            self.changed.emit()
+ 
+    # ---------- Model sync ----------
+    def from_session(self, s: "Session"):
+        self.ed_session_name.setText(getattr(s, "name", "") or "")
+        self.ed_work_subdir.setText(getattr(s, "work_subdir", "") or "")
+
+        # accept plural or singular attribute names
+        self._fill_list(self.lst_lights,     self._get_list(s, ("lights",)))
+        self._fill_list(self.lst_biases,     self._get_list(s, ("biases", "bias")))
+        self._fill_list(self.lst_darks,      self._get_list(s, ("darks", "dark")))
+        self._fill_list(self.lst_flats,      self._get_list(s, ("flats", "flat")))
+        self._fill_list(self.lst_df,         self._get_list(s, ("dark_flats", "dark_flat", "darkflat")))
+        for key in NB_GROUP_KEYS:
+            group = NarrowbandFrameSet.from_dict(getattr(s, key, None))
+            for frame_type in NB_FRAME_TYPES:
+                self._fill_list(self.nb_group_widgets[key][frame_type][1], getattr(group, frame_type, []))
+            self.nb_override_widgets[key].set_overrides(group.to_dict())
+
+        self.ed_master_bias.setText(getattr(s, "master_bias", "") or "")
+        self.ed_master_dark.setText(getattr(s, "master_dark", "") or "")
+        self.ed_master_flat.setText(getattr(s, "master_flat", "") or "")
+        self.ed_master_df.setText(getattr(s, "master_dark_flat", "") or "")
+
+    def to_session(self) -> "Session":
+        # Name is required by your Session __init__
+        name = self.ed_session_name.text().strip() or "Session"
+        s = Session(name=name)
+
+        # Optional subdir
+        s.work_subdir = self.ed_work_subdir.text().strip() or None
+
+        # Collect lists from UI
+        lights     = self._items(self.lst_lights)
+        biases     = self._items(self.lst_biases)
+        darks      = self._items(self.lst_darks)
+        flats      = self._items(self.lst_flats)
+        dark_flats = self._items(self.lst_df)
+
+        # Write both plural & singular for compatibility with the rest of your code
+        s.lights = lights
+
+        s.biases = biases
+        s.bias   = biases
+
+        s.darks  = darks
+        s.dark   = darks
+
+        s.flats  = flats
+        s.flat   = flats
+
+        s.dark_flats = dark_flats
+        s.dark_flat  = dark_flats
+        s.darkflat   = dark_flats  # in case older code referenced this
+        s.ha_oiii = NarrowbandFrameSet(
+            lights=self._items(self.nb_group_widgets["ha_oiii"]["lights"][1]),
+            bias=self._items(self.nb_group_widgets["ha_oiii"]["bias"][1]),
+            darks=self._items(self.nb_group_widgets["ha_oiii"]["darks"][1]),
+            flats=self._items(self.nb_group_widgets["ha_oiii"]["flats"][1]),
+            dark_flats=self._items(self.nb_group_widgets["ha_oiii"]["dark_flats"][1]),
+            **self.nb_override_widgets["ha_oiii"].get_overrides(),
+        )
+        s.sii_oiii = NarrowbandFrameSet(
+            lights=self._items(self.nb_group_widgets["sii_oiii"]["lights"][1]),
+            bias=self._items(self.nb_group_widgets["sii_oiii"]["bias"][1]),
+            darks=self._items(self.nb_group_widgets["sii_oiii"]["darks"][1]),
+            flats=self._items(self.nb_group_widgets["sii_oiii"]["flats"][1]),
+            dark_flats=self._items(self.nb_group_widgets["sii_oiii"]["dark_flats"][1]),
+            **self.nb_override_widgets["sii_oiii"].get_overrides(),
+        )
+
+        # Per-session master overrides
+        s.master_bias      = self.ed_master_bias.text().strip() or None
+        s.master_dark      = self.ed_master_dark.text().strip() or None
+        s.master_flat      = self.ed_master_flat.text().strip() or None
+        s.master_dark_flat = self.ed_master_df.text().strip() or None
+
+        return s
+
+
+    # ---- helpers for plural/singular compatibility ----
+    def _get_list(self, obj, names):
+        """Return list from the first existing attribute in names; fall back to []."""
+        for n in names:
+            if hasattr(obj, n):
+                v = getattr(obj, n)
+                if v is None:
+                    return []
+                # ensure it's a list of strings
+                return list(v)
+        return []
+
+    # helpers
+    def _fill_list(self, lst: QtWidgets.QListWidget, paths: List[str]):
+        lst.clear()
+        for p in paths or []:
+            lst.addItem(p)
+
+    def _items(self, lst: QtWidgets.QListWidget) -> List[str]:
+        return [lst.item(i).text() for i in range(lst.count())]
+# =================================================================
+# New: PanelEditor UI (embedded for single-file)
+# =================================================================
+class PanelEditor(QtWidgets.QWidget):
+    """Right-hand editor for a single Panel's frame lists."""
+    changed = QtCore.pyqtSignal()
+    copy_cals_from_first_requested = QtCore.pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.ed_panel_id = QtWidgets.QLineEdit("A1")
+        self.ed_desc = QtWidgets.QLineEdit()
+        meta = QtWidgets.QFormLayout()
+        meta.addRow("Panel ID", self.ed_panel_id)
+        meta.addRow("Description", self.ed_desc)
+
+        def make_group(title: str):
+            box = QtWidgets.QGroupBox(title)
+            v = QtWidgets.QVBoxLayout(box)
+            lst = QtWidgets.QListWidget()
+            lst.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            v.addWidget(lst)
+            h = QtWidgets.QHBoxLayout()
+            add = QtWidgets.QPushButton("Add"); rm = QtWidgets.QPushButton("Remove"); clr = QtWidgets.QPushButton("Clear")
+            h.addWidget(add); h.addWidget(rm); h.addWidget(clr); h.addStretch(1)
+            v.addLayout(h)
+            return box, lst, add, rm, clr
+
+        self.grp_lights, self.lst_lights, self.bt_add_light, self.bt_rm_light, self.bt_clr_light = make_group("Lights")
+        self.grp_biases, self.lst_biases, self.bt_add_bias, self.bt_rm_bias, self.bt_clr_bias = make_group("Biases")
+        self.grp_darks,  self.lst_darks,  self.bt_add_dark, self.bt_rm_dark, self.bt_clr_dark = make_group("Darks")
+        self.grp_flats,  self.lst_flats,  self.bt_add_flat, self.bt_rm_flat, self.bt_clr_flat = make_group("Flats")
+        self.grp_df,     self.lst_df,     self.bt_add_df,   self.bt_rm_df,   self.bt_clr_df   = make_group("Dark Flats")
+        self.nb_group_widgets = {}
+        self.nb_override_widgets = {}
+        self.nb_override_boxes = {}
+        for key in NB_GROUP_KEYS:
+            self.nb_group_widgets[key] = {
+                "lights": make_group("Lights"),
+                "bias": make_group("Biases"),
+                "darks": make_group("Darks"),
+                "flats": make_group("Flats"),
+                "dark_flats": make_group("Dark Flats"),
+            }
+            self.nb_override_boxes[key] = QtWidgets.QGroupBox("Per-filter Master Overrides (optional)")
+            ov = QtWidgets.QVBoxLayout(self.nb_override_boxes[key])
+            self.nb_override_widgets[key] = MasterOverrideWidget()
+            ov.addWidget(self.nb_override_widgets[key])
+
+        grid = QtWidgets.QGridLayout()
+        grid.addWidget(self.grp_lights, 0, 0, 1, 2)
+        grid.addWidget(self.grp_biases, 1, 0)
+        grid.addWidget(self.grp_darks,  1, 1)
+        grid.addWidget(self.grp_flats,  2, 0)
+        grid.addWidget(self.grp_df,     2, 1)
+
+        # Button to copy calibration frames from the first panel in the session
+        self._copy_source_panel_id: Optional[str] = None
+        self.btn_copy_cals = QtWidgets.QPushButton()
+        self.btn_copy_cals.setVisible(False)  # hidden until we know we can use it
+        grid.addWidget(self.btn_copy_cals, 3, 0, 1, 2)
+
+        osc_page = QtWidgets.QWidget()
+        osc_page.setLayout(grid)
+        self.frame_tabs = QtWidgets.QTabWidget()
+        osc_idx = self.frame_tabs.addTab(osc_page, "OSC")
+        self.frame_tabs.setTabToolTip(osc_idx, FRAME_TAB_TOOLTIPS["osc"])
+        for key in NB_GROUP_KEYS:
+            page = QtWidgets.QWidget()
+            page_grid = QtWidgets.QGridLayout(page)
+            page_grid.setColumnStretch(0, 1)
+            page_grid.setColumnStretch(1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["lights"][0], 0, 0, 1, 2)
+            page_grid.addWidget(self.nb_group_widgets[key]["bias"][0], 1, 0, 1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["darks"][0], 1, 1, 1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["flats"][0], 2, 0, 1, 1)
+            page_grid.addWidget(self.nb_group_widgets[key]["dark_flats"][0], 2, 1, 1, 1)
+            page_grid.addWidget(self.nb_override_boxes[key], 3, 0, 1, 2)
+            idx = self.frame_tabs.addTab(page, NB_GROUP_LABELS[key])
+            self.frame_tabs.setTabToolTip(idx, FRAME_TAB_TOOLTIPS[key])
+
+        main = QtWidgets.QVBoxLayout(self)
+        main.addLayout(meta)
+        main.addWidget(self.frame_tabs, 1)
+
+        # Wiring
+        self.ed_panel_id.textChanged.connect(self.changed.emit)
+        self.ed_desc.textChanged.connect(self.changed.emit)
+        for key in NB_GROUP_KEYS:
+            self.nb_override_widgets[key].changed.connect(self.changed.emit)
+
+        self.bt_add_light.clicked.connect(lambda: self._add_files(self.lst_lights))
+        self.bt_add_bias.clicked.connect(lambda: self._add_files(self.lst_biases))
+        self.bt_add_dark.clicked.connect(lambda: self._add_files(self.lst_darks))
+        self.bt_add_flat.clicked.connect(lambda: self._add_files(self.lst_flats))
+        self.bt_add_df.clicked.connect(lambda: self._add_files(self.lst_df))
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                self.nb_group_widgets[key][frame_type][2].clicked.connect(
+                    lambda _=False, k=key, ft=frame_type: self._add_files(self.nb_group_widgets[k][ft][1])
+                )
+
+        self.bt_rm_light.clicked.connect(lambda: self._remove_selected(self.lst_lights))
+        self.bt_rm_bias.clicked.connect(lambda: self._remove_selected(self.lst_biases))
+        self.bt_rm_dark.clicked.connect(lambda: self._remove_selected(self.lst_darks))
+        self.bt_rm_flat.clicked.connect(lambda: self._remove_selected(self.lst_flats))
+        self.bt_rm_df.clicked.connect(lambda: self._remove_selected(self.lst_df))
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                self.nb_group_widgets[key][frame_type][3].clicked.connect(
+                    lambda _=False, k=key, ft=frame_type: self._remove_selected(self.nb_group_widgets[k][ft][1])
+                )
+
+        self.bt_clr_light.clicked.connect(lambda: self._clear_all(self.lst_lights))
+        self.bt_clr_bias.clicked.connect(lambda: self._clear_all(self.lst_biases))
+        self.bt_clr_dark.clicked.connect(lambda: self._clear_all(self.lst_darks))
+        self.bt_clr_flat.clicked.connect(lambda: self._clear_all(self.lst_flats))
+        self.bt_clr_df.clicked.connect(lambda: self._clear_all(self.lst_df))
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                self.nb_group_widgets[key][frame_type][4].clicked.connect(
+                    lambda _=False, k=key, ft=frame_type: self._clear_all(self.nb_group_widgets[k][ft][1])
+                )
+
+        for lst in (self.lst_lights, self.lst_biases, self.lst_darks, self.lst_flats, self.lst_df):
+            m = lst.model()
+            m.rowsInserted.connect(self._emit_changed)
+            m.rowsRemoved.connect(self._emit_changed)
+            m.modelReset.connect(self._emit_changed)
+            lst.itemChanged.connect(self._emit_changed)
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                lst = self.nb_group_widgets[key][frame_type][1]
+                m = lst.model()
+                m.rowsInserted.connect(self._emit_changed)
+                m.rowsRemoved.connect(self._emit_changed)
+                m.modelReset.connect(self._emit_changed)
+                lst.itemChanged.connect(self._emit_changed)
+
+        self.btn_copy_cals.clicked.connect(self.copy_cals_from_first_requested)
+
+    @QtCore.pyqtSlot()
+    def _emit_changed(self):
+        self.changed.emit()
+
+    # Public API
+    def from_panel(self, pan: Panel | None):
+        for l in (self.lst_lights, self.lst_biases, self.lst_darks, self.lst_flats, self.lst_df):
+            l.clear()
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                self.nb_group_widgets[key][frame_type][1].clear()
+            self.nb_override_widgets[key].set_overrides({})
+        if not pan:
+            self.ed_panel_id.setText("")
+            self.ed_desc.setText("")
+            return
+        self.ed_panel_id.setText(pan.panel_id or "")
+        self.ed_desc.setText(pan.description or "")
+        for lst, seq in (
+            (self.lst_lights, pan.lights),
+            (self.lst_biases, pan.bias),
+            (self.lst_darks,  pan.darks),
+            (self.lst_flats,  pan.flats),
+            (self.lst_df,     pan.dark_flats),
+        ):
+            for x in seq:
+                lst.addItem(x)
+        for key in NB_GROUP_KEYS:
+            group = NarrowbandFrameSet.from_dict(getattr(pan, key, None))
+            for frame_type in NB_FRAME_TYPES:
+                for x in getattr(group, frame_type, []):
+                    self.nb_group_widgets[key][frame_type][1].addItem(x)
+            self.nb_override_widgets[key].set_overrides(group.to_dict())
+
+    def to_panel(self) -> Panel:
+        pan = Panel()
+        pan.panel_id   = self.ed_panel_id.text().strip() or "A1"
+        pan.description= self.ed_desc.text().strip()
+        pan.lights     = [self.lst_lights.item(i).text() for i in range(self.lst_lights.count())]
+        pan.bias       = [self.lst_biases.item(i).text() for i in range(self.lst_biases.count())]
+        pan.darks      = [self.lst_darks.item(i).text() for i in range(self.lst_darks.count())]
+        pan.flats      = [self.lst_flats.item(i).text() for i in range(self.lst_flats.count())]
+        pan.dark_flats = [self.lst_df.item(i).text() for i in range(self.lst_df.count())]
+        pan.ha_oiii = NarrowbandFrameSet(
+            lights=[self.nb_group_widgets["ha_oiii"]["lights"][1].item(i).text()
+                    for i in range(self.nb_group_widgets["ha_oiii"]["lights"][1].count())],
+            bias=[self.nb_group_widgets["ha_oiii"]["bias"][1].item(i).text()
+                  for i in range(self.nb_group_widgets["ha_oiii"]["bias"][1].count())],
+            darks=[self.nb_group_widgets["ha_oiii"]["darks"][1].item(i).text()
+                   for i in range(self.nb_group_widgets["ha_oiii"]["darks"][1].count())],
+            flats=[self.nb_group_widgets["ha_oiii"]["flats"][1].item(i).text()
+                   for i in range(self.nb_group_widgets["ha_oiii"]["flats"][1].count())],
+            dark_flats=[self.nb_group_widgets["ha_oiii"]["dark_flats"][1].item(i).text()
+                        for i in range(self.nb_group_widgets["ha_oiii"]["dark_flats"][1].count())],
+            **self.nb_override_widgets["ha_oiii"].get_overrides(),
+        )
+        pan.sii_oiii = NarrowbandFrameSet(
+            lights=[self.nb_group_widgets["sii_oiii"]["lights"][1].item(i).text()
+                    for i in range(self.nb_group_widgets["sii_oiii"]["lights"][1].count())],
+            bias=[self.nb_group_widgets["sii_oiii"]["bias"][1].item(i).text()
+                  for i in range(self.nb_group_widgets["sii_oiii"]["bias"][1].count())],
+            darks=[self.nb_group_widgets["sii_oiii"]["darks"][1].item(i).text()
+                   for i in range(self.nb_group_widgets["sii_oiii"]["darks"][1].count())],
+            flats=[self.nb_group_widgets["sii_oiii"]["flats"][1].item(i).text()
+                   for i in range(self.nb_group_widgets["sii_oiii"]["flats"][1].count())],
+            dark_flats=[self.nb_group_widgets["sii_oiii"]["dark_flats"][1].item(i).text()
+                        for i in range(self.nb_group_widgets["sii_oiii"]["dark_flats"][1].count())],
+            **self.nb_override_widgets["sii_oiii"].get_overrides(),
+        )
+        return pan
+
+    def set_copy_source_panel(self, panel_id: Optional[str], enabled: bool):
+        """Update the label and enabled state of the 'copy calibration frames' button.
+
+        panel_id:
+            The panel ID of the source panel (typically the first panel in the session).
+        enabled:
+            Whether the action is logically available (e.g. mosaic is ON and there
+            are at least two panels).
+        """
+        self._copy_source_panel_id = panel_id if panel_id else None
+
+        if self._copy_source_panel_id:
+            # Always show the button when we have a valid source panel,
+            # but enable/disable it based on the `enabled` flag.
+            self.btn_copy_cals.setText(
+                f"Copy Calibration Frames from panel {self._copy_source_panel_id} to other panels"
+            )
+            self.btn_copy_cals.setVisible(True)
+            self.btn_copy_cals.setEnabled(enabled)
+        else:
+            # No valid source panel → hide and disable the button
+            self.btn_copy_cals.setVisible(False)
+            self.btn_copy_cals.setEnabled(False)
+
+    # Helpers
+    def _add_files(self, lst: QtWidgets.QListWidget):
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add files")
+        if not files:
+            return
+        for f in files:
+            lst.addItem(f)
+        self.changed.emit()
+
+    def _remove_selected(self, lst: QtWidgets.QListWidget):
+        for it in list(lst.selectedItems()):
+            lst.takeItem(lst.row(it))
+        self.changed.emit()
+
+    def _clear_all(self, lst: QtWidgets.QListWidget):
+        lst.clear()
+        self.changed.emit()
+
+    def set_frame_groups_enabled(self, enabled: bool):
+        """
+        Enable/disable the frame list groups (Lights/Biases/Darks/Flats/Dark Flats)
+        while leaving panel metadata fields editable.
+        """
+        groups = [self.grp_lights, self.grp_biases, self.grp_darks, self.grp_flats, self.grp_df]
+        for key in NB_GROUP_KEYS:
+            for frame_type in NB_FRAME_TYPES:
+                groups.append(self.nb_group_widgets[key][frame_type][0])
+            groups.append(self.nb_override_boxes[key])
+        for grp in groups:
+            grp.setEnabled(enabled)
+
+    def set_metadata_enabled(self, enabled: bool):
+        """Enable/disable Panel metadata editing."""
+        for w in (self.ed_panel_id, self.ed_desc):
+            w.setEnabled(enabled)
+
+class MosaicGraphicsView(QtWidgets.QGraphicsView):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
+        self.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
+        self._zoom = 0
+
+    def wheelEvent(self, e: QtGui.QWheelEvent):
+        # Smooth zoom on wheel
+        factor = 1.15 if e.angleDelta().y() > 0 else (1/1.15)
+        self.scale(factor, factor)
+        e.accept()
+
+class MosaicPreviewDialog(QtWidgets.QDialog):
+    """
+    Simple 2D grid preview of the mosaic layout with overlap, panel IDs,
+    data status (empty/partial/full), and global reference highlight.
+    """
+    def __init__(self, *, rows:int, cols:int, overlap_pct:int,
+                 name_scheme:int, global_ref_pid:Optional[str],
+                 panel_status:Dict[str, Dict[str, int]],   # pid -> {"lights": n, "bias": n, ...}
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preview Mosaic Layout")
+        self.resize(820, 600)
+
+        self.rows = max(1, int(rows))
+        self.cols = max(1, int(cols))
+        self.overlap = max(0.0, min(0.5, float(overlap_pct)/100.0))
+        self.name_scheme = int(name_scheme)
+        self.global_ref = global_ref_pid or None
+        self.panel_status = panel_status or {}
+
+        # Scene & view
+        self.scene = QtWidgets.QGraphicsScene(self)
+        self.view  = MosaicGraphicsView(self)
+        self.view.setScene(self.scene)
+
+        # Buttons row
+        btn_copy = QtWidgets.QPushButton("Copy to Clipboard")
+        btn_fit  = QtWidgets.QPushButton("Fit to View")
+        btn_close= QtWidgets.QPushButton("Close")
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(btn_copy)
+        btns.addWidget(btn_fit)
+        btns.addWidget(btn_close)
+
+        # Legend
+        legend = QtWidgets.QLabel("Legend:  ■ Full (has lights & any cals)   ■ Partial (some frames)   ■ Empty")
+        legend.setStyleSheet("color: #666;")
+        legend.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(self.view, 1)
+        lay.addWidget(legend)
+        lay.addLayout(btns)
+
+        btn_close.clicked.connect(self.accept)
+        btn_fit.clicked.connect(self._fit)
+        btn_copy.clicked.connect(self._copy)
+
+        self._build_scene()
+        self._fit()
+
+    # --- helpers ---
+    def _panel_id(self, r:int, c:int)->str:
+        if self.name_scheme == 0:
+            return f"{chr(ord('A')+r)}{c+1}"
+        return f"R{r+1}C{c+1}"
+
+    def _brush_for(self, pid:str)->QtGui.QBrush:
+        st = self.panel_status.get(pid, {})
+        total = sum(int(v) for v in st.values())
+        lights = int(st.get("lights", 0))
+        if total == 0:
+            # empty
+            pat = QtCore.Qt.BrushStyle.Dense6Pattern
+            b = QtGui.QBrush(QtGui.QColor(200,200,200), pat)
+            return b
+        if lights > 0 and total > lights:
+            # full (has lights + at least one cal type)
+            return QtGui.QBrush(QtGui.QColor(120,170,255,180))
+        # partial (some frames but maybe missing cals OR only lights)
+        return QtGui.QBrush(QtGui.QColor(240,190,90,180))
+
+    def _build_scene(self):
+        self.scene.clear()
+        tile_w = 200.0
+        tile_h = 200.0
+        step_x = tile_w * (1.0 - self.overlap)
+        step_y = tile_h * (1.0 - self.overlap)
+
+        thin_pen  = QtGui.QPen(QtGui.QColor(60,60,60)); thin_pen.setWidthF(1.0)
+        ref_pen   = QtGui.QPen(QtGui.QColor(40,180,80)); ref_pen.setWidth(3)
+
+        font = QtGui.QFont()
+        font.setPointSize(11)
+        font_bold = QtGui.QFont(font); font_bold.setBold(True)
+
+        # Draw tiles
+        for r in range(self.rows):
+            for c in range(self.cols):
+                pid = self._panel_id(r, c)
+                x = c * step_x
+                y = r * step_y
+
+                rect_item = self.scene.addRect(x, y, tile_w, tile_h, thin_pen, self._brush_for(pid))
+
+                # label (centered)
+                label = self.scene.addText(pid, font_bold)
+                br = label.boundingRect()
+                label.setPos(x + tile_w/2 - br.width()/2, y + tile_h/2 - br.height()/2)
+
+                # counts line under the label
+                st = self.panel_status.get(pid, {})
+                if st:
+                    counts = " | ".join([f"L:{int(st.get('lights',0))}",
+                                         f"F:{int(st.get('flats',0))}",
+                                         f"B:{int(st.get('bias',0))}",
+                                         f"D:{int(st.get('darks',0))}",
+                                         f"DF:{int(st.get('dark_flats',0))}"])
+                    sub = self.scene.addText(counts, font)
+                    sub_br = sub.boundingRect()
+                    sub.setPos(x + tile_w/2 - sub_br.width()/2, y + tile_h*0.62)
+
+                # global ref highlight
+                if self.global_ref and pid == self.global_ref:
+                    self.scene.addRect(x, y, tile_w, tile_h, ref_pen)
+                    star = self.scene.addText("★", font_bold)
+                    star.setDefaultTextColor(QtGui.QColor(40,180,80))
+                    star.setPos(x + tile_w - 22, y + 4)
+
+        # Feather hints (overlap bands)
+        if self.overlap > 0:
+            alpha = 60
+            band_col = QtGui.QColor(0,0,0,alpha)
+            band_pen = QtGui.QPen(QtCore.Qt.PenStyle.NoPen)
+            # vertical bands between columns
+            for r in range(self.rows):
+                for c in range(self.cols-1):
+                    x = (c+1)*step_x
+                    y = r*step_y
+                    w = tile_w*self.overlap
+                    self.scene.addRect(x, y, w, tile_h, band_pen, QtGui.QBrush(band_col))
+            # horizontal bands between rows
+            for r in range(self.rows-1):
+                for c in range(self.cols):
+                    x = c*step_x
+                    y = (r+1)*step_y
+                    h = tile_h*self.overlap
+                    self.scene.addRect(x, y, tile_w, h, band_pen, QtGui.QBrush(band_col))
+
+        # Canvas scale badge if not 1.0 is handled by caller subtitle (optional)
+
+    def _fit(self):
+        self.view.fitInView(self.scene.itemsBoundingRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _copy(self):
+        # Render scene to an image and put on clipboard
+        rect = self.scene.itemsBoundingRect()
+        img = QtGui.QImage(int(rect.width())+8, int(rect.height())+8, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(QtGui.QColor(255,255,255,0))
+        painter = QtGui.QPainter(img)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        self.scene.render(painter, QtCore.QRectF(img.rect()), rect.adjusted(-4, -4, 4, 4))
+        painter.end()
+        QtWidgets.QApplication.clipboard().setImage(img)
+
+    def showEvent(self, e: QtGui.QShowEvent) -> None:
+        super().showEvent(e)
+        # Fit once after the widget is on screen so the viewport has real size.
+        QtCore.QTimer.singleShot(0, self._fit)
+
+
+class ProjectWidget(QtWidgets.QWidget):
+    status_message = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.project = Project()
+        self._dirty = False
+        self._suspend_dirty = False
+        self._loading_session = False
+        self._loading_panel = False
+
+        # Siril console bridge
+        self.siril = SirilConsoleBridge()
+        if self.siril.connected:
+            self.siril.log(
+                "[Multi-Night Stacking] Connected to Siril Python API.",
+                s.LogColor.GREEN,
+            )
+            self.siril.log(
+                "Support for the provided OSC Multi-Night Stacking script is provided "
+                "by Roland Teague and not by the Siril developers.",
+                s.LogColor.GREEN,
+            )
+            self.siril.log(
+                "Please reach out to me on Facebook for any questions or open an "
+                "issue report on Github to report any bugs.",
+                s.LogColor.GREEN,
+            )
+            self.siril.log(
+                "Facebook Profile: https://www.facebook.com/roland.teague.9/",
+                s.LogColor.GREEN,
+            )
+            self.siril.log(
+                "Github Repo: https://github.com/rolandet/siril-scripts",
+                s.LogColor.GREEN,
+            )
+        else:
+            print(
+                "[Multi-Night Stacking] Support for this script is provided by Roland Teague."
+                "Please reach out to Roland on Facebook for any questions or open an "
+                "issue report on GitHub to report any bugs."
+                "Facebook Profile: https://www.facebook.com/roland.teague.9/"
+                "GitHub Repo: https://github.com/rolandet/siril-scripts"                
+            )
+
+        # Process bookkeeping
+        self._proc: Optional[subprocess.Popen] = None
+        self._run_timer: Optional[QtCore.QTimer] = None
+        self._run_started_at: Optional["datetime"] = None
+        self._run_siril_verstr: Optional[str] = None
+
+        # ---------------- Top-level controls ----------------
+        self.ed_name     = QtWidgets.QLineEdit(self.project.name)
+        self.ed_workdir  = QtWidgets.QLineEdit()
+        self.btn_workdir = QtWidgets.QPushButton("Browse…")
+
+        self.cb_use_library = QtWidgets.QCheckBox("Use Siril Master Library (project-level)")
+        self.cb_use_library.setChecked(True)
+
+        self.cb_allow_uncal = QtWidgets.QCheckBox("Allow no calibration frames")  # NEW
+        self.cb_allow_uncal.setChecked(False)       
+
+        # New: Remember window size checkbox (configurable)
+        self.cb_remember_size = QtWidgets.QCheckBox("Remember last window size")
+        self.cb_remember_size.setChecked(False)
+
+        # Drizzle controls
+        self.cb_drizzle   = QtWidgets.QCheckBox("Enable Drizzle")
+        self.lbl_scaling  = QtWidgets.QLabel("Scaling")
+        self.spin_scaling = QtWidgets.QDoubleSpinBox()
+        self.spin_scaling.setRange(0.1, 3.0); self.spin_scaling.setSingleStep(0.1); self.spin_scaling.setValue(1.0)
+
+        self.lbl_pixfrac  = QtWidgets.QLabel("Pixel Fraction")
+        self.spin_pixfrac = QtWidgets.QDoubleSpinBox()
+        self.spin_pixfrac.setRange(0.0, 1.0); self.spin_pixfrac.setSingleStep(0.05); self.spin_pixfrac.setValue(1.0)
+
+        self.lbl_kernel   = QtWidgets.QLabel("Kernel")
+        self.cb_kernel    = QtWidgets.QComboBox()
+        self.cb_kernel.addItems(["square", "point", "turbo", "gaussian", "lanczos2", "lanczos3"])
+
+        self.cb_two_pass  = QtWidgets.QCheckBox("Use 2-pass registration")
+        self.cb_two_pass.setToolTip("Computes transforms in pass #1, applies in pass #2.\nEnable for challenging datasets or drizzle if desired.")
+        self.cb_background_extraction = QtWidgets.QCheckBox("Background Extraction")
+        self.cb_background_extraction.setToolTip(
+            "Runs seqsubsky on the calibrated sequence before alignment."
+        )
+        self.cb_distortion_correction = QtWidgets.QCheckBox(
+            "Distortion Correction (plate solve + registration)"
+        )
+        self.cb_distortion_correction.setToolTip(
+            "Plate-solves the registration reference and applies its SIP distortion model\n"
+            "with register -disto=file. Recommended for multi-night and mosaic projects.\n"
+            "Single-night projects default off; multi-night and mosaic projects default on.\n"
+            "Requires unpacked FITS sequences, so sequence packing is disabled when enabled."
+        )
+
+        # Stacking controls (global)
+        # Stacking controls (global)
+        self.cb_stack_method = QtWidgets.QComboBox()
+        self.cb_stack_method.addItems([
+            "Winsorized Rejection",  # default
+            "Sigma Rejection",
+            "GESDT Rejection",
+            "Mean",
+            "Median"
+        ])
+        self.cb_stack_method.setCurrentIndex(0)
+        self.cb_stack_method.setToolTip(
+            "Average stacking with optional pixel rejection. GESDT uses Siril's Generalized Extreme "
+            "Studentized Deviate Test with dedicated outlier-fraction and significance parameters."
+        )
+
+        # map UI index -> Siril token
+        self._stack_method_map = {
+            0: "rej",
+            1: "rej sigma",
+            2: "rej generalized",
+            3: "mean",
+            4: "median",
+        }
+        self._stack_method_rev = {v: k for k, v in self._stack_method_map.items()}
+        self.cb_stack_method.setCurrentIndex(0)  # default to Rejection
+
+        self.lbl_sigma_low  = QtWidgets.QLabel("Sigma Low")
+        self.dbl_sigma_low  = QtWidgets.QDoubleSpinBox()
+        self.dbl_sigma_low.setRange(0.1, 10.0);  self.dbl_sigma_low.setSingleStep(0.1);  self.dbl_sigma_low.setValue(3.0)
+
+        self.lbl_sigma_high = QtWidgets.QLabel("Sigma High")
+        self.dbl_sigma_high = QtWidgets.QDoubleSpinBox()
+        self.dbl_sigma_high.setRange(0.1, 10.0); self.dbl_sigma_high.setSingleStep(0.1); self.dbl_sigma_high.setValue(3.0)
+
+        self.lbl_gesdt_outliers = QtWidgets.QLabel("Outlier Fraction")
+        self.dbl_gesdt_outliers = QtWidgets.QDoubleSpinBox()
+        self.dbl_gesdt_outliers.setDecimals(3)
+        self.dbl_gesdt_outliers.setRange(0.001, 0.999)
+        self.dbl_gesdt_outliers.setSingleStep(0.01)
+        self.dbl_gesdt_outliers.setValue(0.3)
+        self.dbl_gesdt_outliers.setToolTip(
+            "Maximum fraction of samples GESDT may treat as outliers. Siril default: 0.3."
+        )
+
+        self.lbl_gesdt_significance = QtWidgets.QLabel("Significance")
+        self.dbl_gesdt_significance = QtWidgets.QDoubleSpinBox()
+        self.dbl_gesdt_significance.setDecimals(3)
+        self.dbl_gesdt_significance.setRange(0.001, 0.999)
+        self.dbl_gesdt_significance.setSingleStep(0.01)
+        self.dbl_gesdt_significance.setValue(0.05)
+        self.dbl_gesdt_significance.setToolTip(
+            "GESDT statistical significance level. Siril default: 0.05."
+        )
+
+        # Under Stacking
+        self.cb_stack_32 = QtWidgets.QCheckBox("32-bit Output for Final Stack")
+        self.cb_stack_32.setToolTip("Writes the final LIGHTS stack as 32-bit FITS (-32b).")
+        self.cb_compress = QtWidgets.QCheckBox("Compress Intermediates (Siril settings)")
+        self.cb_compress.setToolTip("Legacy compression uses Siril preferences and may quantize floating-point data. Low disk usage has its own explicit lossless option.")
+
+        # siril-cli path
+        self.ed_siril = QtWidgets.QLineEdit()
+        self.btn_siril = QtWidgets.QPushButton("Find…")
+        self.cb_force_cli = QtWidgets.QCheckBox("Force siril-cli (ignore Python API)")
+
+        self.ed_siril.setToolTip(
+            "Optional: Path to siril-cli.\n"
+            "By default, when Siril is running and the Python API is connected, "
+            "runs execute inside Siril.\n"
+            "If 'Force siril-cli' is checked, the Run button will always use siril-cli."
+        )
+        self.btn_siril.setToolTip(
+            "Browse for siril-cli. This is used when running outside of Siril, "
+            "or when 'Force siril-cli' is enabled."
+        )
+        self.cb_force_cli.setToolTip(
+            "If checked, always run via siril-cli even when the Siril Python API is available.\n"
+            "Abort only works in CLI mode; for in-Siril runs, use Siril's Stop button."
+        )
+
+        # Narrowband extraction controls
+        self.chk_nb_enabled = QtWidgets.QCheckBox("Enable Ha/SII and OIII Extraction")
+        self.chk_nb_enabled.setToolTip(
+            "Use the Ha/OIII and SII/OIII filter tabs to extract mono Ha, SII, and OIII channels.\n"
+            "When enabled, the generated Siril script produces the narrowband final instead of the normal OSC final."
+        )
+        self.chk_nb_save_mono = QtWidgets.QCheckBox("Save Ha, SII, and OIII mono stacks")
+        self.chk_nb_save_mono.setChecked(True)
+        self.chk_nb_save_mono.setToolTip(
+            "When enabled, keeps named linear mono outputs:\n"
+            "NB_Ha_mono.fit, NB_SII_mono.fit when available, and NB_OIII_mono.fit.\n"
+            "When disabled, internal channel stacks are still created because RGB composition needs them."
+        )
+        self.cmb_nb_channel_balance = QtWidgets.QComboBox()
+        self.cmb_nb_channel_balance.addItems([label for label, _token in NB_CHANNEL_BALANCE_OPTIONS])
+        self.cmb_nb_channel_balance.setToolTip(
+            "Controls how aligned SII/Ha/OIII channel levels are balanced before RGB composition.\n"
+            "Median/MAD Match aligns background and contrast. Background Match Only aligns medians while preserving channel contrast. None preserves raw channel levels."
+        )
+        self.cmb_nb_final_framing = QtWidgets.QComboBox()
+        self.cmb_nb_final_framing.addItems([label for label, _token in NB_FINAL_FRAMING_OPTIONS])
+        self.cmb_nb_final_framing.setToolTip(
+            "Controls how final Ha/SII/OIII channels are framed after channel registration.\n"
+            "Common overlap avoids blank channel borders and false-color edges.\n"
+            "Reference frame or Maximum extent can preserve more field, but may leave areas where one channel has no data."
+        )
+        self.cmb_nb_oiii_combine = QtWidgets.QComboBox()
+        self.cmb_nb_oiii_combine.addItems([label for label, _token in NB_OIII_COMBINE_OPTIONS])
+        self.cmb_nb_oiii_combine.setToolTip(
+            "Controls how OIII extracted from Ha/OIII and SII/OIII filter groups is combined.\n"
+            "Merge all OIII subs stacks every OIII frame together and is recommended for most projects.\n"
+            "Weighted blend modes stack each filter group's OIII separately, align the two OIII masters, normalize them, then blend them."
+        )
+        self.sld_nb_oiii_manual_ha = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.sld_nb_oiii_manual_ha.setRange(0, 100)
+        self.sld_nb_oiii_manual_ha.setValue(50)
+        self.sld_nb_oiii_manual_ha.setSingleStep(5)
+        self.sld_nb_oiii_manual_ha.setPageStep(10)
+        self.sld_nb_oiii_manual_ha.setToolTip(
+            "Manual OIII blend balance. 0% uses only SII/OIII-derived OIII; 100% uses only Ha/OIII-derived OIII."
+        )
+        self.lbl_nb_oiii_manual = QtWidgets.QLabel()
+        self.lbl_nb_oiii_manual.setMinimumWidth(165)
+        self.nb_oiii_manual_widget = QtWidgets.QWidget()
+        nb_oiii_manual_layout = QtWidgets.QHBoxLayout(self.nb_oiii_manual_widget)
+        nb_oiii_manual_layout.setContentsMargins(0, 0, 0, 0)
+        nb_oiii_manual_layout.addWidget(self.sld_nb_oiii_manual_ha, 1)
+        nb_oiii_manual_layout.addWidget(self.lbl_nb_oiii_manual)
+        self._update_nb_oiii_manual_label()
+        self.lbl_nb_oiii_weights = QtWidgets.QLabel()
+        self.lbl_nb_oiii_weights.setWordWrap(True)
+        self.lbl_nb_oiii_weights.setToolTip(
+            "Estimated OIII blend weights from the project light lists.\n"
+            "Generated scripts calculate auto weights from prepared Ha/OIII and SII/OIII light folders at build time."
+        )
+        self.chk_nb_use_osc_broadband = QtWidgets.QCheckBox("Use OSC tab as broadband RGB / luminance source")
+        self.chk_nb_use_osc_broadband.setChecked(False)
+        self.chk_nb_use_osc_broadband.setToolTip(
+            "Off by default. Enable only when the OSC tab contains broadband, no-filter, UV/IR-cut,\n"
+            "or star/RGB data that should be processed alongside the narrowband channels.\n"
+            "When enabled, the script saves a separate <project>_broadband_rgb.fit."
+        )
+        self.chk_nb_luminance_combine = QtWidgets.QCheckBox("Create LRGB output from OSC luminance")
+        self.chk_nb_luminance_combine.setToolTip(
+            "Requires the OSC broadband option above. Aligns the broadband OSC stack to the SHO/HSO/HOO image,\n"
+            "extracts Lab luminance, and creates an additional <project>_<palette>_LRGB.fit."
+        )
+        self.cmb_nb_palette = QtWidgets.QComboBox()
+        self.cmb_nb_palette.addItems([label for label, _token in NB_PALETTE_OPTIONS])
+        self.cmb_nb_palette.setToolTip(
+            "Select the narrowband RGB composition.\n"
+            "SHO maps SII to red, Ha to green, and OIII to blue.\n"
+            "HSO maps Ha to red, SII to green, and OIII to blue.\n"
+            "HOO maps Ha to red and OIII to green/blue.\n"
+            "The fallback option uses SHO when SII is available and HOO when it is not."
+        )
+        self.lbl_nb_fixed = QtWidgets.QLabel(
+            "Extraction uses seqextract_HaOIII pp_light -resample=ha.\n"
+            "OIII from both filter groups is merged. Drizzle is disabled in NB mode."
+        )
+        self.lbl_nb_fixed.setWordWrap(True)
+        self.lbl_nb_fixed.setToolTip(
+            "Technical processing notes for this tab: Ha/OIII and SII/OIII frames are extracted before debayering,\n"
+            "OIII from both filters is merged, and drizzle commands are not emitted in narrowband mode."
+        )
+        self.lbl_nb_fixed.setStyleSheet("color: #666666;")
+
+        # Sessions list + editor (existing)
+        self.sessions_list       = QtWidgets.QListWidget()
+        self.btn_add_sess        = QtWidgets.QPushButton("Add Session")
+        self.btn_remove_sess     = QtWidgets.QPushButton("Remove Session")
+        self.btn_dup_sess        = QtWidgets.QPushButton("Duplicate Session")
+        self.btn_remove_data_all = QtWidgets.QPushButton("Remove Data (All Sessions)")
+        self.btn_remove_data_all.setToolTip(
+            "Delete all on-disk temporary data for every session in this project.\n"
+            "The confirmation can also remove completed low-disk run bundles.\n"
+            "Keeps the project configuration and session definitions in the UI.\n"
+            "Use when you want to re-run processing from scratch without losing setup."
+        )
+        self.session_editor      = SessionEditor()
+
+        # NEW: Panels list + buttons (per-session)
+        self.lst_panels       = QtWidgets.QListWidget()
+        self.btn_add_panel    = QtWidgets.QPushButton("Add Panel")
+        self.btn_remove_panel = QtWidgets.QPushButton("Remove Panel")
+        self.lst_panels.currentRowChanged.connect(self.load_selected_panel)
+
+        # NEW: Panel editor (right tab)
+        self.panel_editor = PanelEditor()
+        self.panel_editor.changed.connect(self.update_current_panel)
+        self.panel_editor.changed.connect(self._on_frame_sources_changed)
+        self.panel_editor.changed.connect(self.mark_dirty)
+        self.panel_editor.changed.connect(self._on_nb_oiii_policy_changed)
+        self.panel_editor.copy_cals_from_first_requested.connect(self._on_copy_cals_from_first_panel)
+
+        # Bottom actions
+        self.btn_prepare     = QtWidgets.QPushButton("Prepare Working Directory (Symlink/Copy Files)")
+        self.btn_prepare.setToolTip(
+            "Creates the required temporary directory structure for the project.\n"
+            "Copies/symlinks image files into per-session folders,\n"
+            "and initializes log files. Must be run before building Siril scripts."
+        )        
+        self.btn_build_script= QtWidgets.QPushButton("Build Siril Script")
+        self.btn_build_script.setToolTip(
+            "Generates the Siril .ssf script for the project.\n"
+            "Run this after preparing the working directory and defining sessions/panels."
+        )        
+        self.btn_run_siril   = QtWidgets.QPushButton("Run Siril Script")
+        self.btn_run_siril.setToolTip(
+            "Executes the created .ssf script for the project using the Siril Python API.\n"
+            "Script execution will use the siril-cli as fallback or if forced.\n"
+            "Run this only after building the Siril scripts."
+        )        
+        self.btn_abort       = QtWidgets.QPushButton("Abort Run")
+        self.btn_abort.setEnabled(False)
+        self.btn_abort.setToolTip(
+            "Abort only works for CLI runs.\n"
+            "For in-Siril runs started via the Python API, use Siril's Stop button."
+        )
+
+        # Run mode label
+        self.lbl_run_mode = QtWidgets.QLabel("Run mode: not started")
+        self.lbl_run_mode.setToolTip(
+            "Shows whether the last run used the Siril Python API or siril-cli."
+        )
+        self.lbl_run_mode.setStyleSheet("color: #666666; font-style: italic;")
+
+        # ---------------- Left column layout (with boxes) ----------------
+        left_form = QtWidgets.QFormLayout()
+        left_form.addRow("Project Name", self.ed_name)
+
+        work_row = QtWidgets.QHBoxLayout()
+        work_row.addWidget(self.ed_workdir, 1)
+        work_row.addWidget(self.btn_workdir)
+        left_form.addRow("Working Directory", work_row)
+        row_lib = QtWidgets.QHBoxLayout()
+        row_lib.addWidget(self.cb_use_library)
+        row_lib.addSpacing(16)
+        row_lib.addWidget(self.cb_allow_uncal)   # NEW
+        row_lib.addSpacing(16)
+        row_lib.addWidget(self.cb_remember_size)
+        row_lib.addStretch(1)
+        left_form.addRow("", row_lib)
+
+
+        # DRIZZLE (boxed)
+        drizzle_box  = QtWidgets.QGroupBox("Drizzle")
+        drizzle_form = QtWidgets.QFormLayout(drizzle_box)
+        drizzle_form.addRow("", self.cb_drizzle)
+        drow = QtWidgets.QHBoxLayout()
+        drow.addWidget(self.lbl_scaling);  drow.addWidget(self.spin_scaling)
+        drow.addSpacing(12)
+        drow.addWidget(self.lbl_pixfrac);  drow.addWidget(self.spin_pixfrac)
+        drow.addSpacing(12)
+        drow.addWidget(self.lbl_kernel);   drow.addWidget(self.cb_kernel)
+        drow.addStretch(1)
+        drizzle_form.addRow("", drow)
+
+        # REGISTRATION + STACKING (boxed)
+        stack_box  = QtWidgets.QGroupBox("Registration and Stacking")
+        stack_form = QtWidgets.QFormLayout(stack_box)
+        reg_bg_row = QtWidgets.QHBoxLayout()
+        reg_bg_row.addWidget(self.cb_two_pass)
+        reg_bg_row.addSpacing(18)
+        reg_bg_row.addWidget(self.cb_background_extraction)
+        reg_bg_row.addStretch(1)
+        stack_form.addRow("", reg_bg_row)
+        stack_form.addRow("", self.cb_distortion_correction)
+        mrow = QtWidgets.QHBoxLayout()
+        mrow.addWidget(QtWidgets.QLabel("Method"))
+        mrow.addWidget(self.cb_stack_method)
+        mrow.addStretch(1)
+        stack_form.addRow("", mrow)
+        srow = QtWidgets.QHBoxLayout()
+        srow.addWidget(self.lbl_sigma_low);  srow.addWidget(self.dbl_sigma_low)
+        srow.addSpacing(12)
+        srow.addWidget(self.lbl_sigma_high); srow.addWidget(self.dbl_sigma_high)
+        srow.addWidget(self.lbl_gesdt_outliers); srow.addWidget(self.dbl_gesdt_outliers)
+        srow.addSpacing(12)
+        srow.addWidget(self.lbl_gesdt_significance); srow.addWidget(self.dbl_gesdt_significance)
+        srow.addStretch(1)
+        stack_form.addRow("", srow)
+        optrow = QtWidgets.QHBoxLayout()
+        optrow.addWidget(self.cb_stack_32)
+        optrow.addSpacing(18)
+        optrow.addWidget(self.cb_compress)
+        optrow.addStretch(1)
+        stack_form.addRow("", optrow)
+
+        # --- Pack sequences controls (existing behaviour preserved) ---
+        _pack_form = self.cb_stack_32.parentWidget().layout()
+        row_widget = QtWidgets.QWidget(self)
+        row = QtWidgets.QHBoxLayout(row_widget); row.setContentsMargins(0, 0, 0, 0)
+        self.pack_label  = QtWidgets.QLabel("Pack sequences:", self)
+        self.pack_mode   = QtWidgets.QComboBox(self)
+        self.pack_mode.addItems(["Off", "FITSEQ", "SER", "Auto when > N"])
+        self.pack_mode.setToolTip("Use FITSEQ/SER to avoid OS open-file limits on very large sequences")
+        self.pack_thresh = QtWidgets.QSpinBox(self)
+        self.pack_thresh.setRange(100, 10000); self.pack_thresh.setValue(2000)
+        self.pack_thresh.setToolTip("Threshold in Auto mode (total light frames that triggers packing)")
+        self._toggle_pack_thresh()
+        self.pack_mode.currentIndexChanged.connect(self._toggle_pack_thresh)
+        row.addWidget(self.pack_label); row.addSpacing(8); row.addWidget(self.pack_mode)
+        row.addSpacing(12); row.addWidget(self.pack_thresh); row.addStretch(1)
+        if isinstance(_pack_form, QtWidgets.QFormLayout):
+            _pack_form.addRow(row_widget)
+        else:
+            _pack_form.addWidget(row_widget)
+
+        # siril-cli path row
+        sr = QtWidgets.QHBoxLayout()
+        sr.addWidget(self.ed_siril, 1)
+        sr.addWidget(self.btn_siril)
+        left_form.addRow("siril-cli Path (optional)", sr)
+        left_form.addRow(self.cb_force_cli)
+
+        for gb in (drizzle_box, stack_box):
+            gb.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
+                             QtWidgets.QSizePolicy.Policy.Fixed)
+
+        # ========== NEW: MOSAIC Processing (boxed) ==========
+        mosaic_box  = QtWidgets.QGroupBox("Mosaic Processing (Experimental)")
+        mosaic_form = QtWidgets.QGridLayout(mosaic_box)
+
+        self.chk_mosaic_enabled = QtWidgets.QCheckBox("Enable Mosaic Mode")
+        mosaic_form.addWidget(self.chk_mosaic_enabled, 0, 0, 1, 4)
+
+        mosaic_form.addWidget(QtWidgets.QLabel("Grid Layout:"), 1, 0)
+        self.sp_mosaic_rows = QtWidgets.QSpinBox();  self.sp_mosaic_rows.setRange(1, 20)
+        self.sp_mosaic_cols = QtWidgets.QSpinBox();  self.sp_mosaic_cols.setRange(1, 20)
+        self.sp_mosaic_overlap = QtWidgets.QSpinBox(); self.sp_mosaic_overlap.setRange(0, 50); self.sp_mosaic_overlap.setSuffix(" %")
+        gl = QtWidgets.QHBoxLayout()
+        gl.addWidget(QtWidgets.QLabel("Rows"));    gl.addWidget(self.sp_mosaic_rows)
+        gl.addSpacing(8)
+        gl.addWidget(QtWidgets.QLabel("Columns")); gl.addWidget(self.sp_mosaic_cols)
+        gl.addSpacing(8)
+        gl.addWidget(QtWidgets.QLabel("Overlap")); gl.addWidget(self.sp_mosaic_overlap)
+        glw = QtWidgets.QWidget(); glw.setLayout(gl)
+        mosaic_form.addWidget(glw, 1, 1, 1, 3)
+
+        mosaic_form.addWidget(QtWidgets.QLabel("Global Reference:"), 2, 0)
+        self.cmb_mosaic_ref = QtWidgets.QComboBox(); self.cmb_mosaic_ref.setPlaceholderText("Select session/frame…")
+        mosaic_form.addWidget(self.cmb_mosaic_ref, 2, 1, 1, 3)
+
+        mosaic_form.addWidget(QtWidgets.QLabel("Canvas Scale:"), 3, 0)
+        self.dsb_mosaic_scale = QtWidgets.QDoubleSpinBox(); self.dsb_mosaic_scale.setRange(0.25, 4.0); self.dsb_mosaic_scale.setSingleStep(0.05); self.dsb_mosaic_scale.setValue(1.0)
+        mosaic_form.addWidget(self.dsb_mosaic_scale, 3, 1)
+
+        mosaic_form.addWidget(QtWidgets.QLabel("Registration Mode:"), 3, 2)
+        self.cmb_mosaic_reg = QtWidgets.QComboBox(); self.cmb_mosaic_reg.addItems(["Two-pass", "One-pass"])
+        mosaic_form.addWidget(self.cmb_mosaic_reg, 3, 3)
+
+        #mosaic_form.addWidget(QtWidgets.QLabel("Mosaic Stacking Method:"), 4, 0)
+        #self.cmb_mosaic_stack = QtWidgets.QComboBox(); self.cmb_mosaic_stack.addItems(["Mean", "Winsorized", "Sigma", "Median"])
+        #mosaic_form.addWidget(self.cmb_mosaic_stack, 4, 1, 1, 3)
+        #self.cmb_mosaic_stack.setVisible(False)
+
+        self.chk_mosaic_bg = QtWidgets.QCheckBox("Panel Background Extraction")
+        self.chk_mosaic_bg.setToolTip(
+            "If enabled, runs 'seqsubsky pp_light 1' for each panel right after calibration.\n"
+            "This produces 'bkg_pp_light' and we then register/stack that sequence.\n"
+            "Disable to register/stack the calibrated 'pp_light' sequence directly."
+        )
+        self.chk_mosaic_maximize = QtWidgets.QCheckBox("Maximize Framing")
+        self.chk_mosaic_maximize.setToolTip(
+            "When enabled, Siril preserves the full mosaic canvas during registration and stacking.\n"
+            "This maps to: seqapplyreg -framing=max (Phase 2) and stack -maximize (Phase 1B/Phase 2)."
+        )
+        self.chk_mosaic_overlap_norm = QtWidgets.QCheckBox("Normalize on Overlaps")
+        self.chk_mosaic_overlap_norm.setToolTip(
+            "When enabled, Siril computes relative normalization using the regions where panels overlap.\n"
+            "Useful for evening out background/brightness differences between panels."
+        )
+        mosaic_form.addWidget(self.chk_mosaic_bg, 5, 0, 1, 4)
+        mosaic_form.addWidget(self.chk_mosaic_maximize, 8, 2, 1, 2)
+        mosaic_form.addWidget(self.chk_mosaic_overlap_norm, 8, 0, 1, 2)
+
+        mosaic_form.addWidget(QtWidgets.QLabel("Border Feathering:"), 6, 0)
+        self.sp_mosaic_feather = QtWidgets.QSpinBox(); self.sp_mosaic_feather.setRange(0, 500); self.sp_mosaic_feather.setSuffix(" px"); self.sp_mosaic_feather.setValue(50)
+        mosaic_form.addWidget(self.sp_mosaic_feather, 6, 1)
+        self.chk_link_feather = QtWidgets.QCheckBox("Auto-calculate feathering from Overlap %")
+        self.chk_link_feather.setChecked(True)
+        self.chk_link_feather.setToolTip(
+            "Uses the mosaic overlap percentage and the short edge of a representative light frame\n"
+            "to calculate Siril's border feathering in pixels. The value updates automatically;\n"
+            "disable this option to enter feathering manually."
+        )
+        mosaic_form.addWidget(self.chk_link_feather, 6, 2, 1, 2)
+        self.lbl_mosaic_feather_status = QtWidgets.QLabel()
+        self.lbl_mosaic_feather_status.setWordWrap(True)
+        self.lbl_mosaic_feather_status.setStyleSheet("color: #777777;")
+        mosaic_form.addWidget(self.lbl_mosaic_feather_status, 7, 0, 1, 4)
+
+        self.chk_mosaic_drizzle_panel = QtWidgets.QCheckBox("Drizzle per panel")
+        self.chk_mosaic_drizzle_panel.setToolTip(
+            "Enable drizzle during per-panel registration.\n"
+            "Selecting this option forces Two-pass registration (required for drizzle)."
+        )
+        mosaic_form.addWidget(self.chk_mosaic_drizzle_panel, 9, 0, 1, 2)
+
+        # --- Grid-driven panel management ---
+        self.chk_auto_grid = QtWidgets.QCheckBox("Auto-manage panels by grid (advanced)")
+        self.chk_auto_grid.setToolTip(
+            "Automatically create, name, and position panels using the grid dimensions "
+            "and overlap percentage above.\n"
+            "When disabled, panels can be added, removed, or repositioned manually."
+        )
+        self.btn_gen_grid  = QtWidgets.QPushButton("Generate panels from grid…")
+        self.cmb_grid_scope = QtWidgets.QComboBox()
+        self.cmb_grid_scope.addItems(["Selected session", "All sessions"])
+        self.cmb_name_scheme = QtWidgets.QComboBox()
+        self.cmb_name_scheme.addItems(["RowLetter+ColNumber (A1, B2…)", "R#C# (R1C2…)"])
+
+        grid_line = QtWidgets.QHBoxLayout()
+        grid_line.addWidget(self.btn_gen_grid)
+        grid_line.addWidget(QtWidgets.QLabel("Scope:"))
+        grid_line.addWidget(self.cmb_grid_scope)
+        grid_line.addWidget(QtWidgets.QLabel("Names:"))
+        grid_line.addWidget(self.cmb_name_scheme)
+
+        mosaic_form.addWidget(self.chk_auto_grid, 9, 2, 1, 2)
+        mosaic_form.addLayout(grid_line, 10, 0, 1, 4)
+
+        self.btn_preview_mosaic = QtWidgets.QPushButton("Preview Mosaic Layout…")
+        mosaic_form.addWidget(self.btn_preview_mosaic, 11, 0, 1, 4)
+
+        self.cmb_storage = QtWidgets.QComboBox()
+        self.cmb_storage.addItem("Keep intermediates", "keep_all")
+        self.cmb_storage.addItem("Low disk usage (OSC mosaic)", "min_disk")
+        self.cmb_storage.setToolTip("Low disk usage removes this run's temporary sequences after their last successful consumer. Raw inputs, masters and final stacks are retained. Re-stacking removed sequences requires recomputation.")
+        mosaic_form.addWidget(QtWidgets.QLabel("Storage:"), 12, 0)
+        mosaic_form.addWidget(self.cmb_storage, 12, 1, 1, 3)
+        self.cmb_storage_compression = QtWidgets.QComboBox()
+        self.cmb_storage_compression.addItem("Uncompressed", "off")
+        self.cmb_storage_compression.addItem("Lossless GZIP2 (no quantization)", "gzip2")
+        mosaic_form.addWidget(QtWidgets.QLabel("Low-disk compression:"), 13, 0)
+        mosaic_form.addWidget(self.cmb_storage_compression, 13, 1, 1, 3)
+        self.sp_storage_reserve = QtWidgets.QSpinBox()
+        self.sp_storage_reserve.setRange(1, 1024)
+        self.sp_storage_reserve.setSuffix(" GiB")
+        self.sp_storage_reserve.setToolTip("Free space retained in addition to the next stage's uncompressed output budget. Default: 20 GiB for Windows, swap and uncertainty.")
+        mosaic_form.addWidget(QtWidgets.QLabel("Free-space reserve:"), 14, 0)
+        mosaic_form.addWidget(self.sp_storage_reserve, 14, 1)
+
+        # ========== Narrowband Extraction (boxed) ==========
+        nb_box = QtWidgets.QGroupBox("Ha/SII and OIII Extraction")
+        nb_form = QtWidgets.QFormLayout(nb_box)
+        nb_form.addRow("", self.chk_nb_enabled)
+        nb_form.addRow("Output", self.cmb_nb_palette)
+        nb_form.addRow("Final NB Framing", self.cmb_nb_final_framing)
+        nb_form.addRow("OIII Combine Policy", self.cmb_nb_oiii_combine)
+        nb_form.addRow("Manual OIII Blend", self.nb_oiii_manual_widget)
+        nb_form.addRow("OIII Weights", self.lbl_nb_oiii_weights)
+        nb_form.addRow("NB Channel Balancing", self.cmb_nb_channel_balance)
+        nb_form.addRow("", self.chk_nb_save_mono)
+        nb_form.addRow("", self.chk_nb_use_osc_broadband)
+        nb_form.addRow("", self.chk_nb_luminance_combine)
+        nb_form.addRow("", self.lbl_nb_fixed)
+
+        # Left-side processing tabs. Sessions/Panels remain visible below these.
+        self.left_options_tabs = QtWidgets.QTabWidget()
+        reg_page = QtWidgets.QWidget()
+        reg_layout = QtWidgets.QVBoxLayout(reg_page)
+        reg_layout.addWidget(stack_box)
+        reg_layout.addWidget(drizzle_box)
+        reg_layout.addStretch(1)
+
+        mosaic_page = QtWidgets.QWidget()
+        mosaic_layout = QtWidgets.QVBoxLayout(mosaic_page)
+        mosaic_layout.addWidget(mosaic_box)
+        mosaic_layout.addStretch(1)
+
+        nb_page = QtWidgets.QWidget()
+        nb_layout = QtWidgets.QVBoxLayout(nb_page)
+        nb_layout.addWidget(nb_box)
+        nb_layout.addStretch(1)
+
+        reg_idx = self.left_options_tabs.addTab(reg_page, "Registration and Stacking")
+        mosaic_idx = self.left_options_tabs.addTab(mosaic_page, "Mosaic Processing")
+        nb_idx = self.left_options_tabs.addTab(nb_page, "Ha/SII and OIII Extraction")
+        self.left_options_tabs.setTabToolTip(reg_idx, LEFT_TAB_TOOLTIPS["registration"])
+        self.left_options_tabs.setTabToolTip(mosaic_idx, LEFT_TAB_TOOLTIPS["mosaic"])
+        self.left_options_tabs.setTabToolTip(nb_idx, LEFT_TAB_TOOLTIPS["nb"])
+        left_form.addRow(self.left_options_tabs)
+
+        # ========== Sessions + Panels side-by-side (boxed) ==========
+        container = QtWidgets.QWidget()
+        sp_h = QtWidgets.QHBoxLayout(container)
+
+        # Sessions (existing)
+        sessions_box = QtWidgets.QGroupBox("Sessions")
+        sessions_box.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
+                           QtWidgets.QSizePolicy.Policy.Preferred)
+        sv = QtWidgets.QVBoxLayout(sessions_box)
+        sv.addWidget(self.sessions_list, 1)
+        sbtns = QtWidgets.QHBoxLayout()
+        sbtns.addWidget(self.btn_add_sess)
+        sbtns.addWidget(self.btn_remove_sess)
+        sbtns.addWidget(self.btn_dup_sess)
+        sbtns.addStretch(1)
+        sbtns.addWidget(self.btn_remove_data_all)
+        sv.addLayout(sbtns)
+
+        # Panels (new)
+        panels_box = QtWidgets.QGroupBox("Panels (per session)")
+        self.grp_panels = panels_box
+        panels_box.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
+                         QtWidgets.QSizePolicy.Policy.Preferred)
+        pv = QtWidgets.QVBoxLayout(panels_box)
+        pv.addWidget(self.lst_panels, 1)
+        pbtns = QtWidgets.QHBoxLayout()
+        pbtns.addWidget(self.btn_add_panel)
+        pbtns.addWidget(self.btn_remove_panel)
+        pv.addLayout(pbtns)
+
+        sp_h.addWidget(sessions_box, 1)
+        sp_h.addWidget(panels_box, 1)
+        left_form.addRow(container)
+
+        # ---------------- Splitter (left/right) ----------------
+
+        # 1) LEFT column content → put your existing left_form into a widget
+        left_col = QtWidgets.QVBoxLayout()
+        left_col.addLayout(left_form)
+
+        left_container = QtWidgets.QWidget()
+        left_container.setLayout(left_col)
+
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)  # NEW
+        left_scroll.setWidget(left_container)
+        # Make the left column comfortably wide
+        left_scroll.setMinimumWidth(560)
+        left_scroll.setMaximumWidth(780)
+
+        # 2) RIGHT tabs must exist before we wrap them
+        # (Make sure session_editor and panel_editor were created above this)
+        self.right_tabs = QtWidgets.QTabWidget()
+        self.right_tabs.addTab(self.session_editor, "Session")
+        self.right_tabs.addTab(self.panel_editor, "Panel")
+
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)  # NEW
+        right_scroll.setWidget(self.right_tabs)
+
+        # 3) Splitter
+        splitter = QtWidgets.QSplitter()
+        splitter.addWidget(left_scroll)   # LEFT
+        splitter.addWidget(right_scroll)  # RIGHT
+
+        # Favor the LEFT pane growth so it starts larger and stays roomy
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        self._init_splitter_sizes(splitter)
+
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setHandleWidth(6)
+
+        # (then add splitter to your main layout as you already do)
+
+        # ---------------- Bottom bar ----------------
+        bottom = QtWidgets.QHBoxLayout()
+        bottom.addWidget(self.btn_prepare)
+        bottom.addWidget(self.btn_build_script)
+        bottom.addWidget(self.lbl_run_mode)
+        bottom.addStretch(1)
+        bottom.addWidget(self.btn_run_siril)
+        bottom.addWidget(self.btn_abort)
+
+        # ---------------- Main layout ----------------
+        main = QtWidgets.QVBoxLayout(self)
+        main.addWidget(splitter)
+        main.addLayout(bottom)
+        self._set_initial_list_heights(rows=6)
+
+        # ---------------- Wiring ----------------
+        self.btn_workdir.clicked.connect(self.pick_workdir)
+        self.btn_siril.clicked.connect(self.pick_siril)
+        self.cb_remember_size.toggled.connect(self.mark_dirty)
+        self.cb_force_cli.toggled.connect(self.mark_dirty)
+
+        self.cb_drizzle.toggled.connect(self._toggle_drizzle_opts)
+        self.cb_drizzle.toggled.connect(self.mark_dirty)
+        self.spin_scaling.valueChanged.connect(self.mark_dirty)
+        self.spin_pixfrac.valueChanged.connect(self.mark_dirty)
+        self.cb_kernel.currentIndexChanged.connect(self.mark_dirty)
+        self.cb_two_pass.toggled.connect(self.mark_dirty)
+        self.cb_background_extraction.toggled.connect(self.mark_dirty)
+        self.cb_distortion_correction.toggled.connect(self._on_distortion_correction_toggled)
+
+        self.cb_stack_method.currentIndexChanged.connect(self._update_stack_parameter_controls)
+        self.cb_stack_method.currentIndexChanged.connect(self.mark_dirty)
+        self.dbl_sigma_low.valueChanged.connect(self.mark_dirty)
+        self.dbl_sigma_high.valueChanged.connect(self.mark_dirty)
+        self.dbl_gesdt_outliers.valueChanged.connect(self.mark_dirty)
+        self.dbl_gesdt_significance.valueChanged.connect(self.mark_dirty)
+        self.cb_stack_32.toggled.connect(self.mark_dirty)
+        self.cb_compress.toggled.connect(self.mark_dirty)
+
+        self.pack_mode.currentIndexChanged.connect(self.mark_dirty)
+        self.pack_thresh.valueChanged.connect(self.mark_dirty)
+
+        for w in (self.ed_name, self.ed_workdir, self.ed_siril):
+            w.textChanged.connect(self.mark_dirty)
+        self.cb_use_library.toggled.connect(self.mark_dirty)
+        self.cb_allow_uncal.toggled.connect(self.mark_dirty)  # NEW
+        self.chk_nb_enabled.toggled.connect(self._on_nb_toggled)
+        self.chk_nb_enabled.toggled.connect(self.mark_dirty)
+        self.cmb_nb_palette.currentIndexChanged.connect(self.mark_dirty)
+        self.cmb_nb_final_framing.currentIndexChanged.connect(self.mark_dirty)
+        self.cmb_nb_oiii_combine.currentIndexChanged.connect(self._on_nb_oiii_policy_changed)
+        self.cmb_nb_oiii_combine.currentIndexChanged.connect(self.mark_dirty)
+        self.sld_nb_oiii_manual_ha.valueChanged.connect(self._update_nb_oiii_manual_label)
+        self.sld_nb_oiii_manual_ha.valueChanged.connect(self.mark_dirty)
+        self.cmb_nb_channel_balance.currentIndexChanged.connect(self.mark_dirty)
+        self.chk_nb_use_osc_broadband.toggled.connect(self._on_nb_broadband_toggled)
+        self.chk_nb_use_osc_broadband.toggled.connect(self.mark_dirty)
+        self.chk_nb_luminance_combine.toggled.connect(self.mark_dirty)
+        self.chk_nb_save_mono.toggled.connect(self.mark_dirty)
+
+        self.btn_add_sess.clicked.connect(self.add_session)
+        self.btn_remove_sess.clicked.connect(self.remove_session)
+        self.btn_dup_sess.clicked.connect(self.duplicate_session)
+        self.btn_remove_data_all.clicked.connect(self.remove_all_sessions_data)
+
+        self.sessions_list.currentRowChanged.connect(self.load_selected_session)
+        self.session_editor.changed.connect(self.update_current_session)
+        self.session_editor.changed.connect(self._on_frame_sources_changed)
+        self.session_editor.changed.connect(self.mark_dirty)
+        self.session_editor.changed.connect(self._on_nb_oiii_policy_changed)
+
+        self.btn_prepare.clicked.connect(self.prepare_working_dir)
+        self.btn_build_script.clicked.connect(self.build_script)
+        self.btn_run_siril.clicked.connect(self.run_siril)
+        self.btn_abort.clicked.connect(self.abort_siril)
+
+        # NEW: Mosaic & Panels signals
+        self.cmb_storage.currentIndexChanged.connect(self.mark_dirty)
+        self.cmb_storage.currentIndexChanged.connect(self._sync_storage_controls)
+        self.cmb_storage_compression.currentIndexChanged.connect(self.mark_dirty)
+        self.sp_storage_reserve.valueChanged.connect(self.mark_dirty)
+        self.chk_mosaic_enabled.toggled.connect(self._sync_storage_controls)
+        self.chk_nb_enabled.toggled.connect(self._sync_storage_controls)
+        self.chk_mosaic_enabled.toggled.connect(self._on_mosaic_toggled)
+        self.chk_mosaic_enabled.toggled.connect(self.mark_dirty)
+        self.sp_mosaic_rows.valueChanged.connect(self.mark_dirty)
+        self.sp_mosaic_cols.valueChanged.connect(self.mark_dirty)
+        #self.sp_mosaic_overlap.valueChanged.connect(self.mark_dirty)
+        self.cmb_mosaic_ref.currentIndexChanged.connect(self.mark_dirty)
+        self.dsb_mosaic_scale.valueChanged.connect(self.mark_dirty)
+        self.cmb_mosaic_reg.currentIndexChanged.connect(self.mark_dirty)
+        # Keep 2-pass UI locks consistent when user changes Mosaic registration mode
+        self.cmb_mosaic_reg.currentIndexChanged.connect(self._sync_drizzle_two_pass_locks)
+        # When overlap % changes, recompute feather if linked
+        self.sp_mosaic_overlap.valueChanged.connect(self._on_overlap_pct_changed)
+        # Keep automatic/manual feathering state and value synchronized.
+        self.chk_link_feather.toggled.connect(self._on_feather_auto_toggled)
+        # Mark dirty when user changes feather manually
+        self.sp_mosaic_feather.valueChanged.connect(self._on_manual_feather_changed)
+        self.sp_mosaic_feather.valueChanged.connect(self.mark_dirty)        
+        self.chk_mosaic_bg.toggled.connect(self.mark_dirty)
+        self.chk_mosaic_maximize.toggled.connect(self.mark_dirty)
+        self.chk_mosaic_overlap_norm.toggled.connect(self.mark_dirty)
+        #self.sp_mosaic_feather.valueChanged.connect(self.mark_dirty)
+        self.chk_mosaic_drizzle_panel.toggled.connect(self.mark_dirty)
+        self.chk_mosaic_drizzle_panel.toggled.connect(self._sync_drizzle_two_pass_locks)
+
+        self.btn_add_panel.clicked.connect(self._on_add_panel)
+        self.btn_remove_panel.clicked.connect(self._on_remove_panel)
+
+        self.btn_gen_grid.clicked.connect(self._on_generate_panels_from_grid)
+        self.sp_mosaic_rows.valueChanged.connect(self._on_grid_changed)
+        self.sp_mosaic_cols.valueChanged.connect(self._on_grid_changed)
+        self.chk_auto_grid.toggled.connect(self._on_grid_changed)
+        self.btn_preview_mosaic.clicked.connect(self._on_preview_mosaic)
+
+        # menu actions (used by MainWindow)
+        self.action_new     = QtGui.QAction("New Project", self)
+        self.action_open    = QtGui.QAction("Open Project…", self)
+        self.action_save    = QtGui.QAction("Save", self)
+        self.action_save_as = QtGui.QAction("Save As…", self)
+
+        # Initialize from model
+        self.refresh_from_model()
+        if not self.project.sessions:
+            self.project.sessions = [Session(name="Session 1")]
+            self.refresh_from_model()
+        # Default Working Directory to Siril's current dir (once) if empty
+        if not (self.project.working_dir or self.ed_workdir.text()):
+            self._suspend_dirty = True
+            try:
+                siril_dir = self._detect_siril_home_dir()
+                if not siril_dir:
+                    # fallback: user home
+                    siril_dir = os.path.expanduser("~")
+                self.ed_workdir.setText(siril_dir)
+            finally:
+                self._suspend_dirty = False
+
+        self._toggle_drizzle_opts(self.project.drizzle_enabled)
+        self._update_stack_parameter_controls(self.cb_stack_method.currentIndex())
+
+    # ---------------- helpers ----------------
+    def _detect_siril_home_dir(self) -> str | None:
+        """
+        Resolve a sensible default working directory:
+
+        1) If we're running from Siril (sirilpy connected), ask the live Siril console for `pwd`.
+        2) Otherwise, try `siril-cli` by running a tiny temp script that prints `pwd`.
+        3) Fallback to os.getcwd(), then user home as a last resort.
+
+        Returns a native-OS path string or None.
+        """
+        def _parse_pwd(out: str) -> str | None:
+            if not out:
+                return None
+            # Use the last non-empty line; strip common noise.
+            lines = [ln.strip() for ln in str(out).splitlines() if ln.strip()]
+            if not lines:
+                return None
+            last = lines[-1]
+            # Some builds prefix "CWD:"; also trim quotes.
+            last = last.replace("CWD:", "").strip().strip('"').strip("'")
+            # Normalize slashes and remove trailing separators
+            last = os.path.normpath(last)
+            return last if last else None
+
+        # --- 1) Live Siril via sirilpy (best signal of the GUI's current dir) ---
+        try:
+            if getattr(self, "siril", None) and getattr(self.siril, "iface", None):
+                out = self.siril.iface.cmd("pwd")
+                cand = _parse_pwd(out)
+                if cand and os.path.isdir(cand):
+                    return cand
+        except Exception:
+            pass
+
+        # --- 2) siril-cli fallback (works when running the app outside Siril) ---
+        try:
+            siril = find_siril_cli(getattr(self.project, "siril_cli_path", None))
+            if siril and os.path.exists(siril):
+                import tempfile, pathlib, subprocess
+                with tempfile.TemporaryDirectory() as td:
+                    td_path = pathlib.Path(td)
+                    # Minimal script to print the current working directory and exit
+                    ssf = td_path / "pwd_probe.ssf"
+                    # `pwd` prints; we add a newline to be safe
+                    ssf.write_text("pwd\n", encoding="utf-8")
+                    # Run siril-cli against the temp script; cwd doesn’t matter much,
+                    # but we prefer launching in the user home so we don’t get an odd install path.
+                    try:
+                        out = subprocess.check_output(
+                            [siril, "-s", str(ssf)],
+                            cwd=os.path.expanduser("~"),
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            timeout=10
+                        )
+                    except Exception:
+                        out = ""
+                cand = _parse_pwd(out)
+                if cand and os.path.isdir(cand):
+                    return cand
+        except Exception:
+            pass
+
+        # --- 3) Process CWD (if the app was launched from a project folder, this may be right) ---
+        try:
+            cand = os.getcwd()
+            if cand and os.path.isdir(cand):
+                return cand
+        except Exception:
+            pass
+
+        # --- 4) User home as a last resort ---
+        try:
+            cand = os.path.expanduser("~")
+            if cand and os.path.isdir(cand):
+                return cand
+        except Exception:
+            pass
+
+        if self.siril.connected:
+            self.siril.log(f"[Init] Default working dir guess: {sir_dir or '(none)'}")
+
+        return None
+
+    def _set_initial_list_heights(self, rows: int = 6):
+        """
+        Set initial visible rows for the Sessions and Panels lists.
+        On shorter screens, reduce rows to avoid pushing the window taller than the display.
+        """
+        # Detect available screen height (fallback to 1080 if unavailable)
+        try:
+            avail_h = QtGui.QGuiApplication.primaryScreen().availableGeometry().height()
+        except Exception:
+            avail_h = 1080
+
+        # Adjust target rows for shorter screens
+        # ~900px tall (common after taskbar on 1080p) -> 4 rows; <=800px -> 3 rows
+        if avail_h <= 800:
+            rows = min(rows, 3)
+        elif avail_h <= 900:
+            rows = min(rows, 4)
+
+        def _min_height_for_rows(lst: QtWidgets.QListWidget, n_rows: int) -> int:
+            # Try to get a real row height; if list is empty, estimate from font metrics
+            rh = lst.sizeHintForRow(0)
+            if rh <= 0:
+                rh = lst.fontMetrics().height() + 8  # small padding fudge
+            extra = lst.frameWidth() * 2 + 6        # borders/margins
+            return rh * n_rows + extra
+
+        # Keep row heights consistent
+        self.sessions_list.setUniformItemSizes(True)
+        self.lst_panels.setUniformItemSizes(True)
+
+        # Apply minimum heights so ~rows items are visible without scrolling initially
+        self.sessions_list.setMinimumHeight(_min_height_for_rows(self.sessions_list, rows))
+        self.lst_panels.setMinimumHeight(_min_height_for_rows(self.lst_panels, rows))
+
+        # Optional: cap maximum to avoid growing too tall on very large screens
+        # (comment out if you prefer them to grow freely)
+        max_rows = max(rows, 8)
+        self.sessions_list.setMaximumHeight(_min_height_for_rows(self.sessions_list, max_rows))
+        self.lst_panels.setMaximumHeight(_min_height_for_rows(self.lst_panels, max_rows))
+
+    def _update_stack_parameter_controls(self, idx: int):
+        needs_sigma = idx in (0, 1)
+        needs_gesdt = idx == 2
+        for w in (self.lbl_sigma_low, self.dbl_sigma_low, self.lbl_sigma_high, self.dbl_sigma_high):
+            w.setVisible(needs_sigma)
+        for w in (
+            self.lbl_gesdt_outliers,
+            self.dbl_gesdt_outliers,
+            self.lbl_gesdt_significance,
+            self.dbl_gesdt_significance,
+        ):
+            w.setVisible(needs_gesdt)
+
+    def _toggle_drizzle_opts(self, enabled: bool):
+        for w in (self.lbl_scaling, self.spin_scaling, self.lbl_pixfrac, self.spin_pixfrac, self.lbl_kernel, self.cb_kernel):
+            w.setEnabled(enabled)
+
+    def _apply_recommended_distortion_default(self) -> None:
+        """Update an unset new-project option without overriding an explicit choice."""
+        if getattr(self.project, "distortion_correction_enabled", None) is not None:
+            return
+        recommended = bool(
+            self.chk_mosaic_enabled.isChecked()
+            or len(getattr(self.project, "sessions", []) or []) > 1
+        )
+        self._setting_distortion_default = True
+        try:
+            self.cb_distortion_correction.setChecked(recommended)
+        finally:
+            self._setting_distortion_default = False
+        self._enforce_pack_compatibility()
+
+    def _on_distortion_correction_toggled(self, enabled: bool) -> None:
+        if not self._suspend_dirty and not getattr(self, "_setting_distortion_default", False):
+            # A concrete bool records the user's choice and stops automatic defaults
+            # from changing it when sessions or Mosaic Mode change later.
+            self.project.distortion_correction_enabled = bool(enabled)
+        self._enforce_pack_compatibility()
+        self.mark_dirty()
+
+    def _on_nb_toggled(self, enabled: bool):
+        self.chk_nb_save_mono.setEnabled(enabled)
+        self.cmb_nb_channel_balance.setEnabled(enabled)
+        self.cmb_nb_final_framing.setEnabled(enabled)
+        self.cmb_nb_oiii_combine.setEnabled(enabled)
+        self.cmb_nb_palette.setEnabled(enabled)
+        self.chk_nb_use_osc_broadband.setEnabled(enabled)
+        self.lbl_nb_fixed.setEnabled(enabled)
+        self._on_nb_oiii_policy_changed()
+        self._on_nb_broadband_toggled()
+
+    def _selected_nb_oiii_policy(self) -> str:
+        idx = self.cmb_nb_oiii_combine.currentIndex()
+        if 0 <= idx < len(NB_OIII_COMBINE_OPTIONS):
+            return NB_OIII_COMBINE_OPTIONS[idx][1]
+        return "MERGE_ALL"
+
+    def _estimate_nb_oiii_source_counts(self) -> dict[str, int]:
+        counts = {key: 0 for key in NB_GROUP_KEYS}
+        p = getattr(self, "project", None)
+        if not p:
+            return counts
+
+        def add_counts(owner):
+            for key in NB_GROUP_KEYS:
+                group = NarrowbandFrameSet.from_dict(getattr(owner, key, None))
+                counts[key] += len(getattr(group, "lights", []) or [])
+
+        if bool(getattr(p, "mosaic_enabled", False)):
+            for sess in getattr(p, "sessions", []) or []:
+                for panel in getattr(sess, "panels", []) or []:
+                    add_counts(panel)
+        else:
+            for sess in getattr(p, "sessions", []) or []:
+                add_counts(sess)
+        return counts
+
+    def _update_nb_oiii_weights_label(self):
+        policy = self._selected_nb_oiii_policy()
+        counts = self._estimate_nb_oiii_source_counts()
+        ha_count = counts.get("ha_oiii", 0)
+        sii_count = counts.get("sii_oiii", 0)
+        total = ha_count + sii_count
+
+        if policy == "MERGE_ALL":
+            self.lbl_nb_oiii_weights.setText(
+                f"Merge-all mode: {total} listed OIII source lights "
+                f"({ha_count} Ha/OIII, {sii_count} SII/OIII)."
+            )
+            return
+
+        if total <= 0:
+            self.lbl_nb_oiii_weights.setText("No OIII source lights are listed yet.")
+            return
+
+        if policy == "WEIGHTED_MANUAL":
+            ha_pct = clamp_percent(self.sld_nb_oiii_manual_ha.value())
+            source_note = f"project lists {ha_count} Ha/OIII and {sii_count} SII/OIII OIII source lights"
+        else:
+            ha_pct = round((ha_count / total) * 100)
+            source_note = f"from {ha_count}:{sii_count} listed OIII source lights"
+        self.lbl_nb_oiii_weights.setText(
+            f"Estimated blend: Ha/OIII {ha_pct}% / SII/OIII {100 - ha_pct}% ({source_note})."
+        )
+
+    def _update_nb_oiii_manual_label(self, *_):
+        ha_weight = clamp_percent(self.sld_nb_oiii_manual_ha.value())
+        self.lbl_nb_oiii_manual.setText(f"Ha/OIII {ha_weight}% / SII/OIII {100 - ha_weight}%")
+        if hasattr(self, "lbl_nb_oiii_weights"):
+            self._update_nb_oiii_weights_label()
+
+    def _on_nb_oiii_policy_changed(self, *_):
+        self._update_nb_oiii_manual_label()
+        manual_enabled = (
+            self.chk_nb_enabled.isChecked()
+            and self._selected_nb_oiii_policy() == "WEIGHTED_MANUAL"
+        )
+        self.nb_oiii_manual_widget.setEnabled(manual_enabled)
+        self._update_nb_oiii_weights_label()
+
+    def _on_nb_broadband_toggled(self, *_):
+        enabled = bool(self.chk_nb_enabled.isChecked() and self.chk_nb_use_osc_broadband.isChecked())
+        if self.chk_nb_enabled.isChecked() and not self.chk_nb_use_osc_broadband.isChecked():
+            self.chk_nb_luminance_combine.setChecked(False)
+        self.chk_nb_luminance_combine.setEnabled(enabled)
+
+    def _sync_drizzle_two_pass_locks(self, *_):
+        """Keep UI/behavior consistent for 2-pass registration.
+
+        There are two cases where we must keep the UI in sync:
+
+        1) Mosaic -> Drizzle per panel is enabled.
+           - Per-panel drizzle is implemented as 2-pass (register -2pass + seqapplyreg -drizzle).
+           - We therefore *force* Mosaic Registration Mode to Two-pass and lock it.
+           - We also *force* Drizzle -> Use 2-pass registration ON and lock it.
+
+        2) Mosaic is enabled and Mosaic Registration Mode is set to Two-pass.
+           - For consistency, we keep Drizzle -> Use 2-pass registration checked and locked
+             so the UI never suggests a contradictory mode.
+        """
+        per_panel = bool(self.chk_mosaic_drizzle_panel.isChecked())
+        mosaic_on = bool(self.chk_mosaic_enabled.isChecked())
+        mosaic_reg_two_pass = mosaic_on and (int(self.cmb_mosaic_reg.currentIndex()) == 0)
+
+        # --- Case 1: Per-panel drizzle forces 2-pass everywhere ---
+        if per_panel:
+            # Remember previous UI states for restoration
+            if not hasattr(self, '_prev_mosaic_reg_index'):
+                self._prev_mosaic_reg_index = int(self.cmb_mosaic_reg.currentIndex())
+            if not hasattr(self, '_prev_global_two_pass'):
+                self._prev_global_two_pass = bool(self.cb_two_pass.isChecked())
+
+            # Force 2-pass in Mosaic Registration Mode and lock
+            self.cmb_mosaic_reg.setCurrentIndex(0)  # Two-pass
+            self.cmb_mosaic_reg.setEnabled(False)
+
+            # Force global 2-pass and lock
+            self.cb_two_pass.setChecked(True)
+            self.cb_two_pass.setEnabled(False)
+            try:
+                self.cb_two_pass.setToolTip("Forced ON when Mosaic → Drizzle per panel is enabled.")
+            except Exception:
+                pass
+            return
+
+        # If we reach here, per-panel drizzle is OFF.
+        # Restore Mosaic Registration Mode selection (if we captured one)
+        if hasattr(self, '_prev_mosaic_reg_index'):
+            try:
+                self.cmb_mosaic_reg.setCurrentIndex(self._prev_mosaic_reg_index)
+            except Exception:
+                pass
+            delattr(self, '_prev_mosaic_reg_index')
+
+        # Unlock Mosaic Registration Mode (but respect Mosaic master enable)
+        self.cmb_mosaic_reg.setEnabled(mosaic_on)
+
+        # --- Case 2: Mosaic 2-pass selected -> keep Drizzle 2-pass in sync ---
+        if mosaic_reg_two_pass:
+            if not hasattr(self, '_prev_global_two_pass_by_mosaic'):
+                self._prev_global_two_pass_by_mosaic = bool(self.cb_two_pass.isChecked())
+            self.cb_two_pass.setChecked(True)
+            self.cb_two_pass.setEnabled(False)
+            try:
+                self.cb_two_pass.setToolTip("Locked ON while Mosaic Registration Mode is set to Two-pass.")
+            except Exception:
+                pass
+        else:
+            # Restore global 2-pass checkbox state (if we captured one)
+            if hasattr(self, '_prev_global_two_pass'):
+                self.cb_two_pass.setChecked(self._prev_global_two_pass)
+                delattr(self, '_prev_global_two_pass')
+            if hasattr(self, '_prev_global_two_pass_by_mosaic'):
+                self.cb_two_pass.setChecked(self._prev_global_two_pass_by_mosaic)
+                delattr(self, '_prev_global_two_pass_by_mosaic')
+            self.cb_two_pass.setEnabled(True)
+
+    def _set_mosaic_controls_enabled(self, enabled: bool):
+        widgets = [
+            # geometry / layout
+            self.sp_mosaic_rows, self.sp_mosaic_cols, self.sp_mosaic_overlap,
+            # global reference + scale + registration/stacking
+            self.cmb_mosaic_ref, self.dsb_mosaic_scale, self.cmb_mosaic_reg,
+            # self.cmb_mosaic_stack,
+            # normalization / blending
+            self.chk_mosaic_bg, self.chk_mosaic_maximize, self.chk_mosaic_overlap_norm, self.sp_mosaic_feather,
+            # drizzle scope
+            self.chk_mosaic_drizzle_panel,
+            # grid helpers
+            self.chk_auto_grid, self.btn_gen_grid, self.cmb_grid_scope, self.cmb_name_scheme,
+            # preview
+            self.btn_preview_mosaic,
+        ]
+        for w in widgets:
+            w.setEnabled(enabled)
+
+    def _on_mosaic_toggled(self, enabled: bool):
+        self._apply_recommended_distortion_default()
+
+        # Left-side panels list + buttons
+        for w in (self.lst_panels, self.btn_add_panel, self.btn_remove_panel):
+            w.setEnabled(enabled)
+
+        # Grey-out the Panels group box title and contents
+        if hasattr(self, "grp_panels"):
+            self.grp_panels.setEnabled(enabled)
+
+        # Panel metadata fields are only editable when Mosaic is ON
+        self.panel_editor.set_metadata_enabled(enabled)
+
+        # Make the rest of the Mosaic box read-only when disabled
+        self._set_mosaic_controls_enabled(enabled)
+
+        # Pack controls and plate-solving constraints
+        self._enforce_pack_compatibility()
+        self.chk_link_feather.setEnabled(enabled)
+
+        # Normalize drizzle scope without changing enabled state
+
+        # Let the per-session/per-panel UI (including the Copy Cal button)
+        # recompute its enabled state based on the new Mosaic flag.
+        self._refresh_panels_ui_for_session(self._current_session())
+
+        # Switch to the appropriate tab by default
+        try:
+            self.right_tabs.setCurrentWidget(self.panel_editor if enabled else self.session_editor)
+        except Exception:
+            pass
+
+        # If per-panel drizzle is enabled, keep forced 2-pass + locks consistent
+        self._sync_drizzle_two_pass_locks()
+        self._update_feather_from_overlap()
+
+    def _on_add_panel(self):
+        if not self.chk_mosaic_enabled.isChecked():
+            return
+
+        s = self._current_session()
+        if s is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Add Panel",
+                "Add or select a session before adding mosaic panels.",
+            )
+            self._refresh_panels_ui_for_session(None)
+            return
+
+        # NEW: generate ID using the current grid + naming scheme
+        count = len(getattr(s, "panels", []) or [])
+        cols = max(1, int(self.sp_mosaic_cols.value() or 1))
+        r = count // cols   # 0-based row
+        c = count % cols    # 0-based col
+        new_id = self._panel_name_for(r, c)
+
+        # Create the panel on the model for the current session
+        s.panels.append(Panel(panel_id=new_id))
+        self.lst_panels.addItem(new_id)
+        new_index = self.lst_panels.count() - 1
+        self.lst_panels.setCurrentRow(new_index)
+        self._loading_panel = True
+        try:
+            self.panel_editor.from_panel(s.panels[new_index])  # loads a fresh, empty Panel
+        finally:
+            self._loading_panel = False
+
+        # Focus Panel tab for editing
+        try:
+            self.right_tabs.setCurrentWidget(self.panel_editor)
+        except Exception:
+            pass
+
+        # Re-apply enable/disable rules now that we have (at least) one panel
+        s = self._current_session()
+        if s is not None:
+            mosaic_on = self.chk_mosaic_enabled.isChecked()
+            has_panels = bool(s.panels)
+            self.btn_remove_panel.setEnabled(mosaic_on and bool(s.panels))
+
+            # Panel tab frame lists: enabled when Mosaic is ON and there is at least one panel
+            self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
+            self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
+
+            # Update the "Copy Calibration Frames" button state
+            if has_panels:
+                first_id = s.panels[0].panel_id or "A1"
+                can_copy = mosaic_on and (len(s.panels) > 1)
+                self.panel_editor.set_copy_source_panel(first_id, enabled=can_copy)
+            else:
+                self.panel_editor.set_copy_source_panel(None, enabled=False)
+
+        self.mark_dirty()
+        self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+
+        # Keep the Copy Calibration Frames button state in sync
+        sess = self._current_session()
+        if sess:
+            panels = sess.panels
+            mosaic_on = self.chk_mosaic_enabled.isChecked()
+            first_id = panels[0].panel_id if panels else None
+            can_copy = mosaic_on and (len(panels) > 1)
+            self.panel_editor.set_copy_source_panel(first_id, enabled=can_copy)
+        else:
+            self.panel_editor.set_copy_source_panel(None, enabled=False)
+
+    def _on_remove_panel(self):
+        if not self.chk_mosaic_enabled.isChecked():
+            return
+
+        s = self._current_session()
+        if s is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Remove Panel",
+                "Select a session before removing mosaic panels.",
+            )
+            self._refresh_panels_ui_for_session(None)
+            return
+
+        panels = getattr(s, "panels", []) or []
+        if not panels:
+            self._refresh_panels_ui_for_session(s)
+            return
+        row = self.lst_panels.currentRow()
+        if row < 0:
+            row = 0
+        if row >= len(panels):
+            return
+
+        # Remove from UI and model
+        if row < self.lst_panels.count():
+            self.lst_panels.takeItem(row)
+        s.panels.pop(row)
+
+        # Update the editor selection / clear editor if no panels left
+        self._loading_panel = True
+        try:
+            if self.lst_panels.count() == 0:
+                self.panel_editor.from_panel(None)
+            else:
+                new_row = min(row, self.lst_panels.count() - 1)
+                self.lst_panels.setCurrentRow(new_row)
+                self.panel_editor.from_panel(s.panels[new_row] if s and 0 <= new_row < len(s.panels) else None)
+        finally:
+            self._loading_panel = False
+
+        # After removal, re-apply enable/disable rules for the Panel tab
+        mosaic_on = self.chk_mosaic_enabled.isChecked()
+        has_panels = bool(s and getattr(s, "panels", []))
+
+        # Panel frame lists: enabled only when Mosaic is ON and there is at least one panel
+        self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
+        self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
+        self.btn_remove_panel.setEnabled(mosaic_on and bool(s and s.panels))
+
+        # Update the "Copy Calibration Frames" button state
+        if has_panels:
+            first_id = s.panels[0].panel_id or "A1"
+            can_copy = mosaic_on and (len(s.panels) > 1)
+            self.panel_editor.set_copy_source_panel(first_id, enabled=can_copy)
+        else:
+            self.panel_editor.set_copy_source_panel(None, enabled=False)
+
+        self.mark_dirty()
+        self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+
+        # Keep the Copy Calibration Frames button state in sync
+        sess = self._current_session()
+        if sess:
+            panels = sess.panels
+            mosaic_on = self.chk_mosaic_enabled.isChecked()
+            if panels:
+                first_id = panels[0].panel_id
+                can_copy = mosaic_on and (len(panels) > 1)
+                self.panel_editor.set_copy_source_panel(first_id, enabled=can_copy)
+            else:
+                # No panels left → hide the button
+                self.panel_editor.set_copy_source_panel(None, enabled=False)
+        else:
+            self.panel_editor.set_copy_source_panel(None, enabled=False)
+
+        self._update_feather_from_overlap()
+
+    def _panel_name_for(self, r: int, c: int) -> str:
+        # r, c are 0-based
+        scheme = self.cmb_name_scheme.currentIndex()
+        if scheme == 0:
+            # RowLetter+ColNumber, e.g. A1, B3 …
+            return f"{chr(ord('A') + r)}{c + 1}"
+        else:
+            # R#C#, e.g. R1C2 …
+            return f"R{r + 1}C{c + 1}"
+
+    def _target_panel_ids(self) -> list[str]:
+        rows = max(1, int(self.sp_mosaic_rows.value()))
+        cols = max(1, int(self.sp_mosaic_cols.value()))
+        out = []
+        for r in range(rows):
+            for c in range(cols):
+                out.append(self._panel_name_for(r, c))
+        return out
+
+    def _ensure_grid_for_session(self, sess: Session, prune_empty: bool = False) -> tuple[int,int]:
+        """
+        Ensure session.panels match the grid (append missing).
+        If prune_empty=True, remove extra *empty* panels not in the grid.
+        Returns (added, removed)
+        """
+        want = self._target_panel_ids()
+        have = [p.panel_id for p in getattr(sess, "panels", [])]
+        added = removed = 0
+
+        # Append missing panels in order
+        for pid in want:
+            if pid not in have:
+                sess.panels.append(Panel(panel_id=pid))
+                added += 1
+
+        # Optionally prune extras that are not in the grid but only if they are empty
+        if prune_empty and len(sess.panels) > len(want):
+            keep = set(want)
+            new_list = []
+            for p in sess.panels:
+                if p.panel_id in keep:
+                    new_list.append(p)
+                else:
+                    # remove only if empty
+                    if any([p.lights, p.bias, p.darks, p.flats, p.dark_flats]):
+                        new_list.append(p)  # keep non-empty panel
+                    else:
+                        removed += 1
+            sess.panels = new_list
+
+        # Finally, sort in row-major grid order
+        order = {pid: i for i, pid in enumerate(want)}
+        sess.panels.sort(key=lambda p: order.get(p.panel_id, 10**9))
+
+        return added, removed
+
+    def _on_generate_panels_from_grid(self):
+        if not self.chk_mosaic_enabled.isChecked():
+            QtWidgets.QMessageBox.information(self, "Mosaic", "Enable Mosaic Mode first.")
+            return
+
+        scope_all = (self.cmb_grid_scope.currentIndex() == 1)
+
+        # Optional confirmation if pruning
+        prune = False
+        resp = QtWidgets.QMessageBox.question(
+            self, "Generate Panels",
+            "Generate panels from the grid?\n\n"
+            "Tip: This will add any missing panels. It will not remove non-empty panels.\n"
+            "Would you also like to remove extra *empty* panels that are outside the grid?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        prune = (resp == QtWidgets.QMessageBox.StandardButton.Yes)
+
+        sessions = self.project.sessions if scope_all else [self._current_session()]
+        sessions = [s for s in sessions if s is not None]
+
+        total_added = total_removed = 0
+        for s in sessions:
+            a, r = self._ensure_grid_for_session(s, prune_empty=prune)
+            total_added += a; total_removed += r
+
+        # Refresh left pane lists for current session
+        self._refresh_panels_ui_for_session(self._current_session())
+        self.mark_dirty()
+
+        QtWidgets.QMessageBox.information(
+            self, "Generate Panels",
+            f"Done.\nAdded: {total_added}\nRemoved (empty only): {total_removed}"
+        )
+        self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+
+    def _on_grid_changed(self, *_):
+        # Do nothing while we're restoring UI / switching sessions / loading a panel
+        if getattr(self, "_suspend_dirty", False) or getattr(self, "_loading_session", False) or getattr(self, "_loading_panel", False):
+            return
+
+        # Only act when Mosaic is ON and auto-manage is enabled
+        if not (self.chk_mosaic_enabled.isChecked() and self.chk_auto_grid.isChecked()):
+            return
+
+        s = self._current_session()
+        if s is None:
+            return
+
+        sender   = self.sender()
+        existing = bool(getattr(s, "panels", []))
+
+        # If we just turned Auto-manage ON on a session that already has panels,
+        # leave that session alone. Auto-manage will only apply to new sessions.
+        if sender is self.chk_auto_grid and existing:
+            return
+
+        # If rows/cols changed on a session that already has panels, also leave it
+        # alone. The user can explicitly use "Generate panels from grid…" instead.
+        if sender in (self.sp_mosaic_rows, self.sp_mosaic_cols) and existing:
+            return
+
+        # For sessions with no panels yet, auto-generate from the current grid
+        self._ensure_grid_for_session(s, prune_empty=False)
+        self._refresh_panels_ui_for_session(s)
+        self.mark_dirty()
+
+    def _panel_status_for_preview(self, sess: Session) -> Dict[str, Dict[str, int]]:
+        """
+        Return { panel_id: {lights: n, bias: n, darks: n, flats: n, dark_flats: n} }
+        for the given session. Missing panels will be absent from the dict.
+        """
+        out: Dict[str, Dict[str, int]] = {}
+        for pan in getattr(sess, "panels", []):
+            out[pan.panel_id or ""] = {
+                "lights":     len(getattr(pan, "lights", [])),
+                "bias":       len(getattr(pan, "bias", [])),
+                "darks":      len(getattr(pan, "darks", [])),
+                "flats":      len(getattr(pan, "flats", [])),
+                "dark_flats": len(getattr(pan, "dark_flats", [])),
+            }
+        return out
+
+    def _on_preview_mosaic(self):
+        # --- Suppress any dirty writes while we open a display-only dialog ---
+        old_suppress = getattr(self, "_suspend_dirty", False)
+        old_loading_panel = getattr(self, "_loading_panel", False)
+        self._suspend_dirty = True
+        self._loading_panel = True
+        try:
+            # Read current UI values into the model (will not mark dirty due to guards)
+            self.push_to_model()
+
+            p = self.project
+            if not p.mosaic_enabled:
+                QtWidgets.QMessageBox.information(self, "Mosaic Preview", "Enable Mosaic Mode first.")
+                return
+
+            sess = self._current_session()
+            if not sess:
+                QtWidgets.QMessageBox.information(self, "Mosaic Preview", "Select a session to preview.")
+                return
+
+            # Global panel ref not wired yet -> None
+            global_ref_pid = None
+
+            dlg = MosaicPreviewDialog(
+                rows=self.sp_mosaic_rows.value(),
+                cols=self.sp_mosaic_cols.value(),
+                overlap_pct=self.sp_mosaic_overlap.value(),
+                name_scheme=int(getattr(p, "_ui_name_scheme", 0)),
+                global_ref_pid=global_ref_pid,
+                panel_status=self._panel_status_for_preview(sess),
+                parent=self
+            )
+
+            # Title with session + optional scale
+            title = f"Preview Mosaic Layout — {sess.name}"
+            if abs(p.mosaic_canvas_scale - 1.0) > 1e-6:
+                title += f" (Scale {p.mosaic_canvas_scale:g}×)"
+            dlg.setWindowTitle(title)
+
+            # Show the preview (modal). Any resize jiggles are display-only.
+            dlg.exec()
+
+        finally:
+            # Restore guards after dialog closes
+            self._suspend_dirty = old_suppress
+            self._loading_panel = old_loading_panel
+
+    def _init_splitter_sizes(self, splitter: QtWidgets.QSplitter):
+        """
+        Pick an initial split so there's no horizontal scrolling:
+        - left gets the smaller share (≈32-38%),
+        - right keeps at least ~600px for the editors.
+        """
+        # Use current widget width if available; fall back to screen width
+        try:
+            avail_w = max(self.width(), 1000)
+            if avail_w <= 1000:
+                raise RuntimeError
+        except Exception:
+            try:
+                avail_w = QtGui.QGuiApplication.primaryScreen().availableGeometry().width()
+            except Exception:
+                avail_w = 1280
+
+        # Compute a conservative left width that won't force horizontal scrolling
+        # Start with a larger left portion; keep a safe floor for the right editor
+        left_target = int(avail_w * 0.54)              # ~54% to the left
+        left = max(560, min(780, left_target))         # clamp wider (matches new caps)
+        right = max(520, int(avail_w * 0.90) - left)   # ensure right stays usable
+        splitter.setSizes([left, right])
+
+    def _refresh_global_ref_choices(self, keep_text: str | None = None):
+        """
+        Fill the 'Global Reference' combo with:
+        • '<Session Name> / BestFrame'
+        • '<Session Name> / <PanelID>' for each panel in the session
+        If keep_text is provided (or project has a saved value), try to preserve selection.
+        """
+        p = self.project
+        cur = keep_text or (getattr(p, "mosaic_global_reference", None) or "")
+        self.cmb_mosaic_ref.blockSignals(True)
+        try:
+            self.cmb_mosaic_ref.clear()
+            # Build choices
+            items: list[str] = []
+            for s in p.sessions:
+                items.append(f"{s.name} / BestFrame")
+                for pan in getattr(s, "panels", []) or []:
+                    pid = pan.panel_id or "A1"
+                    items.append(f"{s.name} / {pid}")
+
+            # Populate
+            for it in items:
+                self.cmb_mosaic_ref.addItem(it)
+
+            # Restore selection if possible
+            if cur:
+                i = self.cmb_mosaic_ref.findText(cur)
+                if i >= 0:
+                    self.cmb_mosaic_ref.setCurrentIndex(i)
+            # If nothing selected yet but we have items, pick the first
+            if self.cmb_mosaic_ref.currentIndex() < 0 and self.cmb_mosaic_ref.count() > 0:
+                self.cmb_mosaic_ref.setCurrentIndex(0)
+        finally:
+            self.cmb_mosaic_ref.blockSignals(False)
+
+    def _set_pack_controls_enabled(self, enabled: bool):
+        for w in (self.pack_label, self.pack_mode, self.pack_thresh):
+            w.setEnabled(enabled)
+
+    def _enforce_pack_compatibility(self):
+        """Keep packed sequences off when direct FITS plate-solving is required."""
+        mosaic_on = self.chk_mosaic_enabled.isChecked()
+        distortion_on = self.cb_distortion_correction.isChecked()
+        if mosaic_on or distortion_on:
+            if self.pack_mode.currentIndex() != 0:
+                self.pack_mode.setCurrentIndex(0)
+            self._set_pack_controls_enabled(False)
+            if mosaic_on and distortion_on:
+                reason = "Mosaic Mode and distortion correction require"
+            elif mosaic_on:
+                reason = "Mosaic Mode requires"
+            else:
+                reason = "Distortion correction requires"
+            tip = (
+                f"Disabled because {reason} unpacked FITS sequences for plate-solving; "
+                "Siril 1.4 cannot use packed FITSEQ/SER sequences in this workflow."
+            )
+            self.pack_label.setToolTip(tip)
+            self.pack_mode.setToolTip(tip)
+            self.pack_thresh.setToolTip(tip)
+        else:
+            self._set_pack_controls_enabled(True)
+            self.pack_label.setToolTip("Use FITSEQ/SER to avoid open-file limits (non-mosaic only).")
+            self.pack_mode.setToolTip("Pack sequences for very large projects (non-mosaic only).")
+            self.pack_thresh.setToolTip("Threshold in Auto mode")
+            self._toggle_pack_thresh()  # existing logic re-enables threshold for “Auto”
+
+    def _toggle_pack_thresh(self, *_):
+        """Enable threshold only when 'Auto when > N' is selected (index 3)."""
+        self.pack_thresh.setEnabled(self.pack_mode.currentIndex() == 3)
+
+    def _detect_mosaic_frame_geometry(self, *, force_refresh: bool = False) -> dict:
+        """Inspect representative lights and cache geometry for auto feathering."""
+        candidates_by_owner = _mosaic_light_path_candidates(self.project)
+        signature = tuple(
+            (label, tuple(paths)) for label, paths in candidates_by_owner
+        )
+
+        cached_signature = getattr(self.project, "_mosaic_geometry_signature", None)
+        cached_result = getattr(self.project, "_mosaic_geometry_result", None)
+        if (
+            not force_refresh
+            and signature == cached_signature
+            and isinstance(cached_result, dict)
+        ):
+            return cached_result
+
+        counts: Counter = Counter()
+        unreadable: list[str] = []
+        representative_paths: dict[str, str] = {}
+        for label, paths in candidates_by_owner:
+            geometry = _first_readable_light_geometry(paths)
+            if geometry:
+                fp, width, height = geometry
+                representative_paths[label] = fp
+                counts[(width, height)] += 1
+            else:
+                unreadable.append(label)
+
+        if counts:
+            # Mixed cameras/crops are unusual. Use the smallest short edge
+            # conservatively and make that choice visible in the UI.
+            selected = min(counts, key=lambda size: (min(size), size[0] * size[1]))
+            self.project.frame_width, self.project.frame_height = selected
+        else:
+            selected = None
+            self.project.frame_width = 0
+            self.project.frame_height = 0
+
+        result = {
+            "selected": selected,
+            "counts": counts,
+            "unreadable": unreadable,
+            "representative_count": len(representative_paths),
+            "representative_paths": representative_paths,
+        }
+        self.project._mosaic_geometry_signature = signature
+        self.project._mosaic_geometry_result = result
+        return result
+
+    def _set_feather_status(self, text: str, *, warning: bool = False):
+        self.lbl_mosaic_feather_status.setText(text)
+        color = "#c27c0e" if warning else "#777777"
+        self.lbl_mosaic_feather_status.setStyleSheet(f"color: {color};")
+
+    def _update_feather_from_overlap(
+        self,
+        *,
+        show_error: bool = False,
+        force_geometry_refresh: bool = False,
+    ) -> bool:
+        mosaic_enabled = bool(
+            getattr(self, "chk_mosaic_enabled", None)
+            and self.chk_mosaic_enabled.isChecked()
+        )
+        auto_enabled = bool(self.chk_link_feather.isChecked())
+        self.sp_mosaic_feather.setEnabled(mosaic_enabled and not auto_enabled)
+
+        if not mosaic_enabled:
+            self.sp_mosaic_feather.setSpecialValueText("")
+            self._set_feather_status("")
+            return True
+        if not auto_enabled:
+            self.sp_mosaic_feather.setSpecialValueText("")
+            self._set_feather_status(
+                f"Manual: Siril will use {self.sp_mosaic_feather.value()} px."
+            )
+            return True
+
+        overlap_pct = float(self.sp_mosaic_overlap.value())
+        if overlap_pct <= 0:
+            self.sp_mosaic_feather.setSpecialValueText("")
+            self.sp_mosaic_feather.blockSignals(True)
+            self.sp_mosaic_feather.setValue(0)
+            self.sp_mosaic_feather.blockSignals(False)
+            self.project.mosaic_feather_px = 0
+            self._set_feather_status("Auto: 0 px (0% overlap).")
+            return True
+
+        geometry = self._detect_mosaic_frame_geometry(force_refresh=force_geometry_refresh)
+        selected = geometry.get("selected")
+        if not selected:
+            message = (
+                "Automatic feathering needs at least one readable FITS light frame. "
+                "Add lights or disable automatic mode and enter a pixel value manually."
+            )
+            self.sp_mosaic_feather.blockSignals(True)
+            self.sp_mosaic_feather.setSpecialValueText("Unavailable")
+            self.sp_mosaic_feather.setValue(0)
+            self.sp_mosaic_feather.blockSignals(False)
+            self.project.mosaic_feather_px = 0
+            self._set_feather_status(message, warning=True)
+            if show_error:
+                QtWidgets.QMessageBox.warning(self, "Automatic Feathering", message)
+            return False
+
+        width, height = selected
+        short_edge = min(width, height)
+        overlap_px = round(short_edge * overlap_pct / 100.0)
+        raw_feather = round(overlap_px * 0.5)
+        est_feather = calculate_mosaic_feather_px(width, height, overlap_pct)
+        self.sp_mosaic_feather.setSpecialValueText("")
+        self.sp_mosaic_feather.blockSignals(True)
+        self.sp_mosaic_feather.setValue(est_feather)
+        self.sp_mosaic_feather.blockSignals(False)
+        self.project.mosaic_feather_px = est_feather
+
+        clamp_note = ""
+        if est_feather != raw_feather:
+            clamp_note = f"; limited to {est_feather} px"
+        status = (
+            f"Auto: {est_feather} px ({overlap_pct:g}% overlap x {short_edge} px / 2; "
+            f"frame {width} x {height}{clamp_note})."
+        )
+
+        counts = geometry.get("counts", Counter())
+        issues: list[str] = []
+        if len(counts) > 1:
+            sizes = ", ".join(
+                f"{w}x{h} ({count})" for (w, h), count in sorted(counts.items())
+            )
+            issues.append(
+                f"Mixed light-frame sizes detected: {sizes}. "
+                "Using the smallest short edge conservatively."
+            )
+        unreadable = geometry.get("unreadable", [])
+        if unreadable:
+            issues.append(
+                "Could not read representative FITS geometry for: " + ", ".join(unreadable) + "."
+            )
+        if issues:
+            warning = " ".join(issues + [status])
+            self._set_feather_status(warning, warning=True)
+            if show_error:
+                QtWidgets.QMessageBox.warning(self, "Mosaic Frame Geometry", warning)
+        else:
+            self._set_feather_status(status)
+        return True
+
+    def _on_overlap_pct_changed(self, *_):
+        self._update_feather_from_overlap()
+        self.mark_dirty()
+
+    def _on_feather_auto_toggled(self, *_):
+        self._update_feather_from_overlap()
+        self.mark_dirty()
+
+    def _on_manual_feather_changed(self, *_):
+        if not self.chk_link_feather.isChecked():
+            self._update_feather_from_overlap()
+
+    def _on_frame_sources_changed(self, *_):
+        if self._loading_session or getattr(self, "_loading_panel", False):
+            return
+        self._update_feather_from_overlap()
+
+    def _confirm(self, text: str, title: str = "Please confirm") -> bool:
+        """
+        Modal Yes/No dialog. Returns True if user clicks Yes.
+        """
+        resp = QtWidgets.QMessageBox.question(
+            self, title, text,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return resp == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _info(self, text: str, title: str = "Info") -> None:
+        """
+        Modal OK dialog for informational notices.
+        """
+        QtWidgets.QMessageBox.information(self, title, text)
+
+    def mark_dirty(self, *_):
+        if self._suspend_dirty or self._loading_session or getattr(self, "_loading_panel", False):
+            return
+        self._dirty = True
+        self.status_message.emit("Project has unsaved changes.")
+
+    # ---------------- Model <-> UI ----------------
+    def refresh_from_model(self):
+        self._suspend_dirty = True
+        try:
+            p = self.project
+            mode_map = {"off": 0, "fitseq": 1, "ser": 2, "auto": 3}
+            pm_idx = mode_map.get((getattr(p, "pack_sequences_mode", "off") or "off").lower(), 0)
+
+            self.ed_name.setText(p.name or "")
+            self.ed_workdir.setText(p.working_dir or "")
+            self.cb_use_library.setChecked(p.use_master_library)
+            self.cb_allow_uncal.setChecked(bool(getattr(p, "allow_uncalibrated", False)))  # NEW
+            self.cb_remember_size.setChecked(bool(getattr(p, "remember_window_size", False)))
+            self.ed_siril.setText(p.siril_cli_path or "")
+            self.cb_force_cli.setChecked(bool(getattr(p, "force_cli", False)))
+            self.chk_nb_enabled.setChecked(bool(getattr(p, "nb_extraction_enabled", False)))
+            self.chk_nb_save_mono.setChecked(bool(getattr(p, "nb_save_mono_outputs", True)))
+            balance_mode = normalize_nb_channel_balance_mode(
+                getattr(p, "nb_channel_balance_mode", None),
+                getattr(p, "nb_normalize_channels", True),
+            )
+            balance_tokens = [token for _label, token in NB_CHANNEL_BALANCE_OPTIONS]
+            self.cmb_nb_channel_balance.setCurrentIndex(
+                balance_tokens.index(balance_mode) if balance_mode in balance_tokens else 0
+            )
+            palette = str(getattr(p, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK")
+            palette_tokens = [token for _label, token in NB_PALETTE_OPTIONS]
+            self.cmb_nb_palette.setCurrentIndex(palette_tokens.index(palette) if palette in palette_tokens else 0)
+            framing_mode = normalize_nb_final_framing_mode(getattr(p, "nb_final_framing_mode", None))
+            framing_tokens = [token for _label, token in NB_FINAL_FRAMING_OPTIONS]
+            self.cmb_nb_final_framing.setCurrentIndex(
+                framing_tokens.index(framing_mode) if framing_mode in framing_tokens else 0
+            )
+            oiii_policy = normalize_nb_oiii_combine_policy(getattr(p, "nb_oiii_merge_policy", None))
+            oiii_policy_tokens = [token for _label, token in NB_OIII_COMBINE_OPTIONS]
+            self.cmb_nb_oiii_combine.setCurrentIndex(
+                oiii_policy_tokens.index(oiii_policy) if oiii_policy in oiii_policy_tokens else 0
+            )
+            self.sld_nb_oiii_manual_ha.setValue(clamp_percent(getattr(p, "nb_oiii_manual_ha_weight", 50)))
+            self._on_nb_oiii_policy_changed()
+            self.chk_nb_use_osc_broadband.setChecked(bool(getattr(p, "nb_use_osc_broadband", False)))
+            self.chk_nb_luminance_combine.setChecked(bool(getattr(p, "nb_luminance_combine", False)))
+            self._on_nb_toggled(self.chk_nb_enabled.isChecked())
+
+            self.cb_drizzle.setChecked(p.drizzle_enabled)
+            self.spin_scaling.setValue(float(p.drizzle_scaling or 1.0))
+            self.spin_pixfrac.setValue(float(p.drizzle_pixfrac or 1.0))
+            kernels = ["square", "point", "turbo", "gaussian", "lanczos2", "lanczos3"]
+            self.cb_kernel.setCurrentIndex(max(0, kernels.index(p.drizzle_kernel) if p.drizzle_kernel in kernels else 0))
+            self.cb_two_pass.setChecked(p.two_pass)
+            self.cb_background_extraction.setChecked(bool(getattr(p, "background_extraction_enabled", False)))
+            self.cb_distortion_correction.setChecked(distortion_correction_is_enabled(p))
+
+            sm_idx = self.cb_stack_method.findText(p.stack_method or "Winsorized Rejection")
+            if sm_idx < 0:
+                sm_idx = 0
+            self.cb_stack_method.setCurrentIndex(sm_idx)
+            self._update_stack_parameter_controls(sm_idx)
+
+            self.dbl_sigma_low.setValue(float(p.reject_sigma_low or 3.0))
+            self.dbl_sigma_high.setValue(float(p.reject_sigma_high or 3.0))
+            gesdt_outliers, gesdt_significance = normalized_gesdt_parameters(
+                getattr(p, "gesdt_outliers", 0.3),
+                getattr(p, "gesdt_significance", 0.05),
+            )
+            self.dbl_gesdt_outliers.setValue(gesdt_outliers)
+            self.dbl_gesdt_significance.setValue(gesdt_significance)
+            self.cb_stack_32.setChecked(bool(getattr(p, "stack_32bit", False)))
+            self.cb_compress.setChecked(bool(getattr(p, "compress_intermediates", False)))
+            self.cmb_storage.setCurrentIndex(max(0, self.cmb_storage.findData(p.storage_policy)))
+            self.cmb_storage_compression.setCurrentIndex(max(0, self.cmb_storage_compression.findData(p.low_disk_compression)))
+            self.sp_storage_reserve.setValue(p.storage_reserve_gib)
+            self._sync_storage_controls()
+
+            self.pack_mode.setCurrentIndex(pm_idx)
+            self.pack_thresh.setValue(int(getattr(p, "pack_threshold", 2000)))
+            self.pack_thresh.setEnabled(pm_idx == 3)
+
+            # --- Mosaic ---
+            self.chk_mosaic_enabled.setChecked(p.mosaic_enabled)
+            self.chk_link_feather.setEnabled(p.mosaic_enabled)
+            self._enforce_pack_compatibility()
+
+            # Restore scheme and auto-grid first (prevents briefly using the wrong scheme)
+            self.cmb_name_scheme.setCurrentIndex(int(getattr(p, "_ui_name_scheme", 0)))
+            self.chk_auto_grid.setChecked(bool(getattr(p, "_ui_mosaic_auto_grid", False)))
+            self.cmb_grid_scope.setCurrentIndex(int(getattr(p, "_ui_grid_scope", 0)))
+
+            # Then restore geometry values
+            self.sp_mosaic_rows.setValue(p.mosaic_grid_rows)
+            self.sp_mosaic_cols.setValue(p.mosaic_grid_cols)
+            self.sp_mosaic_overlap.setValue(p.mosaic_overlap_percent)
+
+            self._refresh_global_ref_choices()
+
+            self.dsb_mosaic_scale.setValue(p.mosaic_canvas_scale)
+            self.cmb_mosaic_reg.setCurrentText(p.mosaic_registration_mode)
+
+            self.chk_mosaic_bg.setChecked(p.panel_background_extraction)
+            self.chk_mosaic_maximize.setChecked(getattr(p, 'mosaic_maximize_framing', True))
+            self.chk_mosaic_overlap_norm.setChecked(p.mosaic_overlap_norm)
+            self.sp_mosaic_feather.setValue(p.mosaic_feather_px)
+            self.chk_link_feather.setChecked(p.link_feather_to_overlap)
+            self.chk_mosaic_drizzle_panel.setChecked(p.mosaic_drizzle_per_panel)
+            self._update_feather_from_overlap()            
+
+            # sessions list
+            self.sessions_list.clear()
+            for s in p.sessions:
+                self.sessions_list.addItem(s.name)
+            if p.sessions:
+                self.sessions_list.setCurrentRow(0)
+                self._loading_session = True
+                try:
+                    self.session_editor.from_session(p.sessions[0])
+                finally:
+                    self._loading_session = False
+
+            # panels: show for the selected session
+            self._refresh_panels_ui_for_session(self._current_session())
+
+            # toggle Panels availability
+            self._on_mosaic_toggled(p.mosaic_enabled)
+
+            # Keep drizzle-related UI consistent (locks/forced 2-pass when needed)
+            self._sync_drizzle_two_pass_locks()
+
+            # sigma visibility
+            self._update_stack_parameter_controls(self.cb_stack_method.currentIndex())
+        finally:
+            self._suspend_dirty = False
+        # Keep them mutually exclusive visually after loading
+
+
+    def push_to_model(self):
+        p = self.project
+        p.name = self.ed_name.text() or "New Project"
+        p.working_dir = self.ed_workdir.text() or None
+        p.use_master_library = self.cb_use_library.isChecked()
+        p.allow_uncalibrated = self.cb_allow_uncal.isChecked()  # NEW
+        p.remember_window_size = self.cb_remember_size.isChecked()
+
+        p.drizzle_enabled = self.cb_drizzle.isChecked()
+        p.drizzle_scaling = float(self.spin_scaling.value())
+        p.drizzle_pixfrac = float(self.spin_pixfrac.value())
+        p.drizzle_kernel  = self.cb_kernel.currentText()
+        p.background_extraction_enabled = self.cb_background_extraction.isChecked()
+        p.two_pass        = self.cb_two_pass.isChecked()
+        if p.distortion_correction_enabled is not None:
+            p.distortion_correction_enabled = self.cb_distortion_correction.isChecked()
+
+        # Store exactly what the user picked in the combobox
+        p.stack_method = self.cb_stack_method.currentText()   # Winsorized | Sigma | GESDT | Mean | Median
+
+        p.reject_sigma_low   = float(self.dbl_sigma_low.value())
+        p.reject_sigma_high  = float(self.dbl_sigma_high.value())
+        p.gesdt_outliers     = float(self.dbl_gesdt_outliers.value())
+        p.gesdt_significance = float(self.dbl_gesdt_significance.value())
+        p.stack_32bit        = self.cb_stack_32.isChecked()
+        p.compress_intermediates = self.cb_compress.isChecked()
+        p.storage_policy = self.cmb_storage.currentData()
+        p.low_disk_compression = self.cmb_storage_compression.currentData()
+        p.storage_reserve_gib = self.sp_storage_reserve.value()
+        p.pack_sequences_mode = self.pack_mode.currentText().split()[0].lower()  # off|fitseq|ser|auto
+        p.pack_threshold      = int(self.pack_thresh.value())
+
+        p.siril_cli_path = self.ed_siril.text() or None
+        p.force_cli      = self.cb_force_cli.isChecked()
+        p.nb_extraction_enabled = self.chk_nb_enabled.isChecked()
+        p.nb_save_mono_outputs = self.chk_nb_save_mono.isChecked()
+        balance_index = self.cmb_nb_channel_balance.currentIndex()
+        if 0 <= balance_index < len(NB_CHANNEL_BALANCE_OPTIONS):
+            p.nb_channel_balance_mode = NB_CHANNEL_BALANCE_OPTIONS[balance_index][1]
+        else:
+            p.nb_channel_balance_mode = "MEDIAN_MAD"
+        p.nb_normalize_channels = p.nb_channel_balance_mode != "NONE"
+        palette_index = self.cmb_nb_palette.currentIndex()
+        if 0 <= palette_index < len(NB_PALETTE_OPTIONS):
+            p.nb_output_palette = NB_PALETTE_OPTIONS[palette_index][1]
+        else:
+            p.nb_output_palette = "SHO_WITH_HOO_FALLBACK"
+        framing_index = self.cmb_nb_final_framing.currentIndex()
+        if 0 <= framing_index < len(NB_FINAL_FRAMING_OPTIONS):
+            p.nb_final_framing_mode = NB_FINAL_FRAMING_OPTIONS[framing_index][1]
+        else:
+            p.nb_final_framing_mode = "MIN"
+        oiii_policy_index = self.cmb_nb_oiii_combine.currentIndex()
+        if 0 <= oiii_policy_index < len(NB_OIII_COMBINE_OPTIONS):
+            p.nb_oiii_merge_policy = NB_OIII_COMBINE_OPTIONS[oiii_policy_index][1]
+        else:
+            p.nb_oiii_merge_policy = "MERGE_ALL"
+        p.nb_oiii_manual_ha_weight = clamp_percent(self.sld_nb_oiii_manual_ha.value())
+        p.nb_resample_mode = "ha"
+        p.nb_drizzle_policy = "disabled"
+        p.nb_use_osc_broadband = self.chk_nb_use_osc_broadband.isChecked()
+        p.nb_luminance_combine = self.chk_nb_luminance_combine.isChecked()
+
+        # --- Mosaic (write back) ---
+        p.mosaic_enabled = self.chk_mosaic_enabled.isChecked()
+        p.mosaic_grid_rows = self.sp_mosaic_rows.value()
+        p.mosaic_grid_cols = self.sp_mosaic_cols.value()
+        p.mosaic_overlap_percent = self.sp_mosaic_overlap.value()
+        p.mosaic_global_reference = self.cmb_mosaic_ref.currentText().strip() or None
+        p.mosaic_canvas_scale = float(self.dsb_mosaic_scale.value())
+        p.mosaic_registration_mode = self.cmb_mosaic_reg.currentText()
+        # Map UI to tokens Siril builder will expect later
+        # map_stack = {"Mean":"mean", "Winsorized":"wrej", "Sigma":"rej", "Median":"median"}
+        p.mosaic_stack_method = p.stack_method
+        p.panel_background_extraction = self.chk_mosaic_bg.isChecked()
+        p.mosaic_maximize_framing = self.chk_mosaic_maximize.isChecked()
+        p.mosaic_overlap_norm = self.chk_mosaic_overlap_norm.isChecked()
+        p.mosaic_feather_px = self.sp_mosaic_feather.value()
+        p.link_feather_to_overlap = self.chk_link_feather.isChecked()
+        p.mosaic_drizzle_per_panel = self.chk_mosaic_drizzle_panel.isChecked()
+
+        p.pack_sequences_mode = self.pack_mode.currentText().split()[0].lower()
+        p.pack_threshold      = int(self.pack_thresh.value())
+
+        # Mosaic mutual exclusion with packing
+        if (
+            (p.mosaic_enabled or distortion_correction_is_enabled(p))
+            and p.pack_sequences_mode != "off"
+        ):
+            p.pack_sequences_mode = "off"
+
+        p._ui_mosaic_auto_grid = self.chk_auto_grid.isChecked()
+        p._ui_name_scheme = self.cmb_name_scheme.currentIndex()
+        p._ui_grid_scope = self.cmb_grid_scope.currentIndex()
+
+        # Ensure latest Panel editor data is written to model
+        self.update_current_panel()
+
+        # Only aggregate panels -> session lists when Mosaic Mode is OFF.
+        # When Mosaic Mode is ON, keep session lists independent so they don't get
+        # saved/loaded with panel data.
+        if not p.mosaic_enabled:
+            for s in p.sessions:
+                if getattr(s, "panels", []):
+                    agg = {ft: [] for ft in FRAME_TYPES}
+                    for pan in s.panels:
+                        agg["lights"]     += list(getattr(pan, "lights", []))
+                        agg["bias"]       += list(getattr(pan, "bias", []))
+                        agg["darks"]      += list(getattr(pan, "darks", []))
+                        agg["flats"]      += list(getattr(pan, "flats", []))
+                        agg["dark_flats"] += list(getattr(pan, "dark_flats", []))
+                    s.lights = agg["lights"]
+                    s.bias   = agg["bias"]
+                    s.darks  = agg["darks"]
+                    s.flats  = agg["flats"]
+                    s.dark_flats = agg["dark_flats"]
+                    nb_agg = {key: {ft: [] for ft in NB_FRAME_TYPES} for key in NB_GROUP_KEYS}
+                    for pan in s.panels:
+                        for key in NB_GROUP_KEYS:
+                            group = NarrowbandFrameSet.from_dict(getattr(pan, key, None))
+                            for frame_type in NB_FRAME_TYPES:
+                                nb_agg[key][frame_type] += list(getattr(group, frame_type, []))
+                    s.ha_oiii = NarrowbandFrameSet(**nb_agg["ha_oiii"])
+                    s.sii_oiii = NarrowbandFrameSet(**nb_agg["sii_oiii"])
+
+    # ---------------- pickers ----------------
+    def pick_workdir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Working Directory")
+        if d:
+            self.ed_workdir.setText(d)
+
+    def pick_siril(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select siril-cli executable")
+        if f:
+            self.ed_siril.setText(f)
+
+    def _renumber_sessions_after_removal(self, deleted_session_name: str):
+        """
+        Keep remaining sessions named Session 1..N after a deletion.
+
+        When a session used the default working folder (no custom Working Subdir),
+        rename that folder too so prepared data stays attached to the renumbered
+        session. If a folder cannot be moved safely, preserve the old folder name
+        as Working Subdir for that session.
+        """
+        p = self.project
+        name_map: dict[str, str] = {}
+        moves: list[tuple[Session, str, Path, Path]] = []
+        work = Path(p.working_dir).resolve() if getattr(p, "working_dir", None) else None
+
+        def within_work(path: Path) -> bool:
+            if work is None:
+                return False
+            try:
+                path.resolve().relative_to(work)
+                return True
+            except ValueError:
+                return False
+
+        for idx, sess in enumerate(getattr(p, "sessions", []) or [], start=1):
+            old_name = getattr(sess, "name", "") or f"Session {idx}"
+            new_name = f"Session {idx}"
+            if old_name == new_name:
+                continue
+            name_map[old_name] = new_name
+            if work and not getattr(sess, "work_subdir", None):
+                old_root = (work / old_name).resolve()
+                new_root = (work / new_name).resolve()
+                if old_root != new_root:
+                    moves.append((sess, old_name, old_root, new_root))
+            sess.name = new_name
+
+        if getattr(p, "panels", None):
+            remapped = []
+            for link in p.panels:
+                if not isinstance(link, dict):
+                    remapped.append(link)
+                    continue
+                sess_name = link.get("session")
+                if sess_name == deleted_session_name:
+                    continue
+                if sess_name in name_map:
+                    link = dict(link)
+                    link["session"] = name_map[sess_name]
+                remapped.append(link)
+            p.panels = remapped
+
+        ref = getattr(p, "mosaic_global_reference", None)
+        if ref:
+            sess_name, sep, item = ref.partition("/")
+            if sep:
+                sess_name = sess_name.strip()
+                item = item.strip()
+                if sess_name == deleted_session_name:
+                    p.mosaic_global_reference = None
+                elif sess_name in name_map:
+                    p.mosaic_global_reference = f"{name_map[sess_name]} / {item}"
+
+        warnings = []
+        for sess, old_name, old_root, new_root in moves:
+            if not old_root.exists():
+                continue
+            try:
+                if not within_work(old_root) or not within_work(new_root):
+                    sess.work_subdir = old_name
+                    warnings.append(f"{old_root} -> {new_root}: outside working directory")
+                    continue
+                if new_root.exists():
+                    sess.work_subdir = old_name
+                    warnings.append(f"{old_root} -> {new_root}: target already exists")
+                    continue
+                old_root.rename(new_root)
+            except Exception as e:
+                sess.work_subdir = old_name
+                warnings.append(f"{old_root} -> {new_root}: {e}")
+
+        for idx, sess in enumerate(getattr(p, "sessions", []) or []):
+            item = self.sessions_list.item(idx)
+            if item:
+                item.setText(sess.name)
+
+        if warnings:
+            shown = "\n".join(warnings[:8])
+            more = "" if len(warnings) <= 8 else f"\n...and {len(warnings) - 8} more"
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Renumber Sessions",
+                "Some session folders could not be renamed. Their old folder names were kept as Working Subdir.\n\n"
+                f"{shown}{more}",
+            )
+
+    # ---------------- sessions ----------------
+    def add_session(self):
+        new_sess = Session(name=f"Session {len(self.project.sessions)+1}")
+        self.project.sessions.append(new_sess)
+        self._apply_recommended_distortion_default()
+        self.sessions_list.addItem(new_sess.name)
+        self.sessions_list.setCurrentRow(self.sessions_list.count()-1)
+
+        self._loading_session = True
+        try:
+            self.session_editor.from_session(new_sess)
+        finally:
+            self._loading_session = False
+
+        # NEW: auto-generate panels for this session when mosaic + auto-grid are on
+        if self.chk_mosaic_enabled.isChecked() and self.chk_auto_grid.isChecked():
+            # make sure the model has the right panel set
+            self._ensure_grid_for_session(new_sess, prune_empty=False)
+
+        # NEW: refresh the Panels UI for the new current session
+        self._refresh_panels_ui_for_session(new_sess)
+
+        # NEW: sync Copy Calibration Frames button for the new session
+        panels = getattr(new_sess, "panels", [])
+        if panels:
+            first_id = panels[0].panel_id or "A1"
+            can_copy = self.chk_mosaic_enabled.isChecked() and (len(panels) > 1)
+            self.panel_editor.set_copy_source_panel(first_id, enabled=can_copy)
+        else:
+            self.panel_editor.set_copy_source_panel(None, enabled=False)
+
+        self.mark_dirty()
+        self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+
+    def remove_session(self):
+        row = self.sessions_list.currentRow()
+        if row < 0:
+            return
+
+        sess = self.project.sessions[row]
+        work = self.project.working_dir
+        sess_root = Path(work) / (sess.work_subdir or sess.name) if work else None
+
+        msg = "Remove this session from the project and delete its on-disk data?\n"
+        if sess_root:
+            msg += f"\n{sess_root}"
+
+        if QtWidgets.QMessageBox.question(
+            self,
+            "Remove Session",
+            msg,
+        ) != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        # Delete on-disk data for this session (if any)
+        if sess_root and sess_root.exists():
+            try:
+                shutil.rmtree(sess_root)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Remove Session",
+                    f"Failed to delete:\n{sess_root}\n\n{e}",
+                )
+
+        # Remove the session from the model + list widget
+        self.project.sessions.pop(row)
+        self.sessions_list.takeItem(row)
+        self._renumber_sessions_after_removal(sess.name)
+
+        if self.project.sessions:
+            # Select the first remaining session and refresh its editors
+            self.sessions_list.setCurrentRow(0)
+
+            self._loading_session = True
+            try:
+                self.session_editor.from_session(self.project.sessions[0])
+            finally:
+                self._loading_session = False
+
+            # Refresh panels list / editor for the new current session
+            self._refresh_panels_ui_for_session(self._current_session())
+        else:
+            # Projects need one editable session, but let the normal delete/data
+            # cleanup finish first so Session 1 behaves like every other session.
+            new_sess = Session(name="Session 1")
+            self.project.sessions.append(new_sess)
+            self.sessions_list.addItem(new_sess.name)
+            self.sessions_list.setCurrentRow(0)
+
+            self._loading_session = True
+            try:
+                self.session_editor.from_session(new_sess)
+            finally:
+                self._loading_session = False
+
+            self._refresh_panels_ui_for_session(new_sess)
+            QtWidgets.QMessageBox.information(
+                self,
+                "Session Recreated",
+                "A project must contain at least one session.\n\n"
+                "An empty Session 1 has been recreated.",
+            )
+
+        self.mark_dirty()
+        self._apply_recommended_distortion_default()
+        self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+        self._update_feather_from_overlap()
+
+    def duplicate_session(self):
+        row = self.sessions_list.currentRow()
+        if row < 0: return
+        orig = self.project.sessions[row]
+        copy = Session.from_dict(orig.to_dict())
+        copy.name = f"{orig.name} (copy)"
+        self.project.sessions.insert(row+1, copy)
+        self._apply_recommended_distortion_default()
+        self.sessions_list.insertItem(row+1, copy.name)
+        self.sessions_list.setCurrentRow(row+1)
+        self._loading_session = True
+        try: self.session_editor.from_session(copy)
+        finally: self._loading_session = False
+        self.mark_dirty()
+        self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+
+    def remove_all_sessions_data(self):
+        # Operational cleanup: do not mark project dirty
+        was_dirty = getattr(self, "_dirty", False)
+        was_suspended = getattr(self, "_suspend_dirty", False)
+        self._suspend_dirty = True
+        try:
+            self.push_to_model()
+            p = self.project
+            if not p.working_dir:
+                QtWidgets.QMessageBox.warning(self, "Remove Data", "Please set a working directory first.")
+                return
+
+            work = Path(p.working_dir).resolve()
+            targets = [work / (s.work_subdir or s.name) for s in p.sessions]
+            low_disk_root, completed_runs, protected_runs = _completed_low_disk_runs(work)
+            completed_bytes = sum(size for _path, size in completed_runs)
+
+            dialog = QtWidgets.QMessageBox(self)
+            dialog.setIcon(QtWidgets.QMessageBox.Icon.Question)
+            dialog.setWindowTitle("Remove Data (All Sessions)")
+            dialog.setText("Delete on-disk data for ALL sessions (configs kept)?")
+            run_word = "run" if len(completed_runs) == 1 else "runs"
+            details = (
+                f"{len(completed_runs)} completed low-disk {run_word} can also be removed "
+                f"({_format_storage_size(completed_bytes)}).\n"
+                "This includes logs, checkpoints, worker files, and cached flats. "
+                "Final images and configured source subs are preserved."
+            )
+            if protected_runs:
+                protected_word = "bundle" if len(protected_runs) == 1 else "bundles"
+                details += (
+                    f"\n\n{len(protected_runs)} unfinished, invalid, or unsafe low-disk "
+                    f"{protected_word} will be kept."
+                )
+            dialog.setInformativeText(details)
+            dialog.setStandardButtons(
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            )
+            dialog.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
+            remove_low_disk = QtWidgets.QCheckBox(
+                f"Also remove completed low-disk run data ({_format_storage_size(completed_bytes)})"
+            )
+            remove_low_disk.setChecked(bool(completed_runs))
+            remove_low_disk.setEnabled(bool(completed_runs))
+            if not completed_runs:
+                remove_low_disk.setText("No completed low-disk run data found")
+            dialog.setCheckBox(remove_low_disk)
+            if dialog.exec() != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+            ok = fail = 0
+            for t in targets:
+                try:
+                    if t.exists():
+                        shutil.rmtree(t)
+                    ok += 1
+                except Exception:
+                    fail += 1
+
+            low_disk_ok = low_disk_fail = 0
+            if remove_low_disk.isChecked():
+                for run_dir, _size in completed_runs:
+                    try:
+                        # Recheck status and path shape immediately before destructive cleanup.
+                        current_root, current_runs, _protected = _completed_low_disk_runs(work)
+                        current_paths = {path for path, _bytes in current_runs}
+                        if current_root != low_disk_root or run_dir not in current_paths:
+                            raise ValueError("Run is no longer eligible for completed-run cleanup")
+                        shutil.rmtree(run_dir)
+                        low_disk_ok += 1
+                    except Exception:
+                        low_disk_fail += 1
+
+                # Remove the managed container when its persistent lock file is
+                # the only entry left. A live Windows lock safely makes this fail.
+                try:
+                    remaining = list(low_disk_root.iterdir()) if low_disk_root.exists() else []
+                    if remaining and all(path.name == "active.lock" and path.is_file() for path in remaining):
+                        remaining[0].unlink()
+                        low_disk_root.rmdir()
+                    elif not remaining and low_disk_root.exists():
+                        low_disk_root.rmdir()
+                except Exception:
+                    low_disk_fail += 1
+
+            result = f"Done.\nSession folders OK: {ok}\nSession folders failed: {fail}"
+            if remove_low_disk.isChecked():
+                result += (
+                    f"\nCompleted low-disk runs removed: {low_disk_ok}"
+                    f"\nLow-disk cleanup failures: {low_disk_fail}"
+                )
+            if protected_runs:
+                result += f"\nProtected low-disk runs kept: {len(protected_runs)}"
+            QtWidgets.QMessageBox.information(self, "Remove Data", result)
+        finally:
+            self._suspend_dirty = was_suspended
+            self._dirty = was_dirty
+            # Keep the visible status consistent with the restored dirty flag.
+            # In particular, Remove Data must not leave a stale unsaved-changes
+            # message behind when the project was clean before the operation.
+            self.status_message.emit("Project has unsaved changes." if was_dirty else "")
+
+    def load_selected_session(self, row: int):
+        if 0 <= row < len(self.project.sessions):
+            self._loading_session = True
+            try: self.session_editor.from_session(self.project.sessions[row])
+            finally: self._loading_session = False
+
+            # refresh Panels for this session
+            self._refresh_panels_ui_for_session(self._current_session())
+            self._refresh_global_ref_choices(self.project.mosaic_global_reference)
+
+    def update_current_session(self):
+        if self._loading_session:
+            return
+        row = self.sessions_list.currentRow()
+        if 0 <= row < len(self.project.sessions):
+            old = self.project.sessions[row]
+            new = self.session_editor.to_session()
+            # Preserve panels from the existing session
+            new.panels = getattr(old, "panels", [])
+            self.project.sessions[row] = new
+            self.sessions_list.item(row).setText(new.name)
+            self.mark_dirty()
+
+    def _gather_session_files(self, session: Session) -> Dict[str, list[str]]:
+        """
+        Return a dict of frame lists for the given session.
+        If Mosaic Mode is ON and the session has panels, gather files from panels.
+        Otherwise, return the session-level lists (legacy behavior).
+        """
+        p = self.project
+        buckets: Dict[str, list[str]] = {ft: [] for ft in FRAME_TYPES}
+
+        if p.mosaic_enabled and getattr(session, "panels", []):
+            # Aggregate per-panel lists (but keep session frame lists independent on disk)
+            for pan in session.panels:
+                buckets["lights"]     += list(getattr(pan, "lights", []))
+                buckets["bias"]       += list(getattr(pan, "bias", []))
+                buckets["darks"]      += list(getattr(pan, "darks", []))
+                buckets["flats"]      += list(getattr(pan, "flats", []))
+                buckets["dark_flats"] += list(getattr(pan, "dark_flats", []))
+        else:
+            # Legacy per-session lists
+            buckets["lights"]     = list(getattr(session, "lights", []))
+            buckets["bias"]       = list(getattr(session, "bias", []))
+            buckets["darks"]      = list(getattr(session, "darks", []))
+            buckets["flats"]      = list(getattr(session, "flats", []))
+            buckets["dark_flats"] = list(getattr(session, "dark_flats", []))
+
+        # De-duplicate per frame type, preserve order
+        for key in buckets:
+            seen = set()
+            dedup = []
+            for f in buckets[key]:
+                if f not in seen:
+                    dedup.append(f); seen.add(f)
+            buckets[key] = dedup
+
+        return buckets
+
+    def _iter_panel_files(self, session: Session):
+        """
+        Yield (panel, frame_type, Path) for all files in all panels of a session.
+        """
+        for pan in getattr(session, "panels", []):
+            for ft in FRAME_TYPES:
+                for f in getattr(pan, ft, []) or []:
+                    yield pan, ft, Path(f)
+
+    # ---------------- prepare / build / run / abort ----------------
+    def prepare_working_dir(self):
+        # Do not let this operational action mark the project dirty
+        was_dirty = getattr(self, "_dirty", False)
+        self._suspend_dirty = True
+        try:
+            self.push_to_model()  # read UI → model without affecting dirty
+            p = self.project
+            if not p.working_dir:
+                QtWidgets.QMessageBox.warning(self, "Prepare", "Please set a working directory.")
+                return
+            work = Path(p.working_dir).resolve()
+            # Ensure the working directory exists to avoid FileNotFoundError when opening the log.
+            try:
+                # If the path exists but is not a directory, stop gracefully.
+                if work.exists() and not work.is_dir():
+                    QtWidgets.QMessageBox.critical(self, "Prepare", f"Working Directory path exists but is not a folder:\n{work}")
+                    return
+                work.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Prepare", f"Cannot create Working Directory:\n{work}\n\n{e}")
+                return
+            if p.storage_policy == "min_disk":
+                if not p.mosaic_enabled or p.nb_extraction_enabled:
+                    QtWidgets.QMessageBox.warning(self, "Prepare", "Select Keep intermediates for non-mosaic or narrowband processing.")
+                    return
+                QtWidgets.QMessageBox.information(self, "Prepare",
+                    "The working directory is ready. Low disk usage creates input aliases as each stage starts; no separate session copies are needed. Build the script next.")
+                return
+            entries = []
+            for sess in p.sessions:
+                if getattr(p, "mosaic_enabled", False):
+                    # panel-aware gather
+                    for pan in getattr(sess, "panels", []) or []:
+                        pid = pan.panel_id or "A1"
+                        base = Path(sess.work_subdir or sess.name) / pid
+                        for ft in FRAME_TYPES:
+                            for f in getattr(pan, ft, []):
+                                entries.append((str(base), ft, Path(f)))
+                        for key in NB_GROUP_KEYS:
+                            group = NarrowbandFrameSet.from_dict(getattr(pan, key, None))
+                            group_base = base / NB_GROUP_FOLDERS[key]
+                            for ft in NB_FRAME_TYPES:
+                                for f in getattr(group, ft, []):
+                                    entries.append((str(group_base), ft, Path(f)))
+                else:
+                    # classic gather
+                    for ft in FRAME_TYPES:
+                        for f in getattr(sess, ft, []):
+                            base = Path(sess.work_subdir or sess.name)
+                            entries.append((str(base), ft, Path(f)))
+                    for key in NB_GROUP_KEYS:
+                        group = NarrowbandFrameSet.from_dict(getattr(sess, key, None))
+                        group_base = Path(sess.work_subdir or sess.name) / NB_GROUP_FOLDERS[key]
+                        for ft in NB_FRAME_TYPES:
+                            for f in getattr(group, ft, []):
+                                entries.append((str(group_base), ft, Path(f)))
+
+            if not entries:
+                QtWidgets.QMessageBox.information(self, "Prepare", "No files to prepare.")
+                return
+
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = work / f"prepare_{ts}.log"
+            ok = fail = 0
+            total = len(entries)
+            with open(log_path, "w", encoding="utf-8") as lf:
+                for i, (base, ft, src) in enumerate(entries, start=1):
+                    dst = work / base / ft / src.name
+                    good, msg = safe_link_or_copy(src, dst)
+                    ok += int(good)
+                    fail += int(not good)
+                    if self.siril.connected:
+                        self.siril.log(msg)
+                        self.siril.progress("Preparing…", i / total)
+                    print(msg, file=lf)
+                    QtWidgets.QApplication.processEvents()
+            if self.siril.connected:
+                self.siril.progress_reset()
+
+            QtWidgets.QMessageBox.information(
+                self, "Prepare",
+                f"Done.\nOK: {ok}\nFailed: {fail}\n\nLog: {log_path}"
+            )
+            # Refresh derived feathering after preparation as an additional safety check.
+            try:
+                self._update_feather_from_overlap()
+            except Exception as e:
+                print(f"Automatic feathering refresh error: {e}")
+        finally:
+            # restore original dirty state and lift the guard
+            self._suspend_dirty = False
+            self._dirty = was_dirty
+
+    # --- Helpers: determines what masters this session will actually have access to ---
+
+    # --- ProjectWidget helpers: library master lookup -----------------
+    def _find_library_master(self, kind: str, sess) -> Optional[str]:
+        """
+        Return a path to a library master for `kind` ('bias'|'dark'|'flat') or None.
+        Looks under project.master_library_dir for common Siril master names.
+        You can customize the patterns to match your library.
+        """
+        p = self.project
+        lib_root = Path(getattr(p, "master_library_dir", "") or "")
+        if not lib_root or not lib_root.exists():
+            return None
+
+        # Try a few common names. Add your own if needed.
+        patterns = {
+            "bias": ["master_bias*.fit", "bias_stacked*.fit", "pp_bias_stacked*.fit"],
+            "dark": ["master_dark*.fit", "dark_stacked*.fit", "pp_dark_stacked*.fit"],
+            "flat": ["master_flat*.fit", "flat_stacked*.fit", "pp_flat_stacked*.fit"],
+        }.get(kind.lower(), [])
+
+        for pat in patterns:
+            for cand in lib_root.glob(pat):
+                return cand.as_posix()
+
+        # Optional: allow subfolders per kind
+        sub = lib_root / kind.lower()
+        if sub.exists():
+            for cand in sub.glob("*.fit*"):
+                return cand.as_posix()
+
+        return None
+
+    def _lib_has_master(self, kind: str, sess, p) -> bool:
+        """
+        If 'Use Siril Master Library' is ON, assume Siril can provide the master
+        via $defbias/$defdark/$defflat at runtime. We can’t verify those here,
+        so we optimistically return True. (Optional local folder scan kept as best-effort.)
+        """
+        if getattr(p, "use_master_library", False):
+            return True  # trust Siril’s Master Library preference
+
+        # Optional: keep your local scan if you configured one
+        if hasattr(self, "_find_library_master"):
+            return bool(self._find_library_master(kind, sess))
+        return False
+
+    def _session_calib_availability(self, sess, p):
+        """
+        Returns a dict describing what this session can actually use, considering
+        overrides AND library. Adjust attribute names if yours differ.
+        """
+        has_bias_override = bool(getattr(sess, "master_bias", None))
+        has_dark_override = bool(getattr(sess, "master_dark", None))
+        has_flat_override = bool(getattr(sess, "master_flat", None))
+        has_df_override   = bool(getattr(sess, "master_dark_flat", None))
+
+        has_bias_lib = self._lib_has_master("bias", sess, p)
+        has_dark_lib = self._lib_has_master("dark", sess, p)
+        has_flat_lib = self._lib_has_master("flat", sess, p)
+        has_df_lib   = self._lib_has_master("dark_flat", sess, p)
+
+        # Raw flats present (we can build a master flat from them)
+        has_raw_flats = bool(getattr(sess, "flats", []) or getattr(sess, "dark_flats", []))
+
+        return {
+            "has_bias": has_bias_override or has_bias_lib,
+            "has_dark": has_dark_override or has_dark_lib,
+            "has_master_flat": has_flat_override or has_flat_lib,
+            "has_master_darkflat": has_df_override or has_df_lib,
+            "has_raw_flats": has_raw_flats,
+        }
+
+    def _validate_calibration_or_warn(self, p, *, show_nb_fallback_notice: bool = True) -> bool:
+        """
+        Return True if calibration coverage is sufficient (or user accepted proceeding),
+        False if the user cancels.
+
+        Rules:
+        • Non-mosaic (per session): DARKS and FLATS and (BIAS or DARK-FLATS)
+        • Mosaic (per panel with lights): DARKS OR [ FLATS and (BIAS or DARK-FLATS) ]
+
+        When 'Use Siril Master Library' is ON, we assume Siril provides $defbias/$defdark/$defflat
+        (and dark-flats as needed) at runtime; we treat those as available here.
+        """
+        sessions = list(getattr(p, "sessions", []) or [])
+        if not sessions:
+            return True
+
+        use_lib = bool(getattr(p, "use_master_library", False))
+        is_mosaic = bool(getattr(p, "mosaic_enabled", False))
+
+        def has_any(seq) -> bool:
+            return bool(list(seq or []))
+
+        if bool(getattr(p, "nb_extraction_enabled", False)):
+            missing = []
+            has_ha_oiii = False
+            has_sii_oiii = False
+
+            def check_nb_unit(label: str, owner, sess, panel=None):
+                nonlocal has_ha_oiii, has_sii_oiii
+                for key in NB_GROUP_KEYS:
+                    group = NarrowbandFrameSet.from_dict(getattr(owner, key, None))
+                    if not group.lights:
+                        continue
+                    if key == "ha_oiii":
+                        has_ha_oiii = True
+                    if key == "sii_oiii":
+                        has_sii_oiii = True
+
+                    md, mf, mb, mdf = _resolve_cal_paths(p, sess, panel=panel)
+                    has_dark_any = (
+                        bool(getattr(group, "master_dark", None))
+                        or bool(md)
+                        or bool(group.darks)
+                        or bool(getattr(sess, "darks", []) or [])
+                        or use_lib
+                    )
+                    if panel is not None:
+                        has_dark_any = has_dark_any or bool(getattr(panel, "darks", []) or [])
+                    has_flat_any = bool(getattr(group, "master_flat", None)) or bool(mf) or bool(group.flats) or use_lib
+                    has_bias_or_df = (
+                        bool(getattr(group, "master_bias", None))
+                        or bool(getattr(group, "master_dark_flat", None))
+                        or bool(mb or mdf)
+                        or bool(group.bias)
+                        or bool(group.dark_flats)
+                        or bool(getattr(sess, "bias", []) or [])
+                        or bool(getattr(sess, "dark_flats", []) or [])
+                        or use_lib
+                    )
+                    if panel is not None:
+                        has_bias_or_df = has_bias_or_df or bool(getattr(panel, "bias", []) or []) or bool(getattr(panel, "dark_flats", []) or [])
+
+                    reasons = []
+                    if not has_dark_any:
+                        reasons.append("no usable darks")
+                    if not has_flat_any:
+                        reasons.append("no flats for " + NB_GROUP_LABELS[key])
+                    if group.flats and not has_bias_or_df:
+                        reasons.append("raw flats present but no bias/dark-flats")
+                    if reasons:
+                        missing.append(f"- {label} / {NB_GROUP_LABELS[key]}: " + " and ".join(reasons))
+
+            if is_mosaic:
+                for sess in sessions:
+                    for pan in getattr(sess, "panels", []) or []:
+                        label = f"{getattr(sess, 'name', 'Session')} / {getattr(pan, 'panel_id', 'Panel')}"
+                        check_nb_unit(label, pan, sess, panel=pan)
+            else:
+                for sess in sessions:
+                    check_nb_unit(getattr(sess, "name", "Session"), sess, sess, panel=None)
+
+            if not has_ha_oiii:
+                self._info(
+                    "Ha/OIII lights are required for narrowband extraction.\n\n"
+                    "Add Ha/OIII lights in the Session or Panel filter tabs, then prepare the working directory again.",
+                    "Narrowband Extraction",
+                )
+                return False
+
+            palette = str(getattr(p, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK").upper()
+            if not has_sii_oiii and palette in ("SHO", "HSO"):
+                self._info(
+                    f"{palette} output requires SII/OIII lights.\n\n"
+                    "Add SII/OIII lights in the Session or Panel filter tabs, or select HOO / SHO with HOO fallback.",
+                    "Narrowband Extraction",
+                )
+                return False
+
+            if (
+                not has_sii_oiii
+                and palette == "SHO_WITH_HOO_FALLBACK"
+                and show_nb_fallback_notice
+            ):
+                self._info(
+                    "No SII/OIII lights were found. The generated narrowband script will use HOO fallback "
+                    "from the Ha/OIII data.",
+                    "Narrowband Extraction",
+                )
+
+            if not missing:
+                return True
+
+            if getattr(p, "allow_uncalibrated", False):
+                self._info(
+                    "Proceeding with missing narrowband calibration items for:\n\n"
+                    + "\n".join(missing)
+                    + "\n\nTip: filter-specific flats are recommended for Ha/OIII and SII/OIII data.",
+                    "Narrowband Calibration",
+                )
+                return True
+
+            return self._confirm(
+                "Calibration items are missing for some narrowband inputs:\n\n"
+                + "\n".join(missing)
+                + "\n\nFilter-specific flats are recommended. Proceed anyway?",
+                "Narrowband Calibration",
+            )
+
+        # -------- Mosaic path: validate per panel that actually has lights --------
+        if is_mosaic:
+            missing = []   # list of strings describing panels with missing calibration requirements
+
+            for sess in sessions:
+                panels = list(getattr(sess, "panels", []) or [])
+                if not panels:
+                    continue
+
+                for pan in panels:
+                    lights = list(getattr(pan, "lights", []) or [])
+                    if not lights:
+                        continue  # nothing to calibrate for this panel
+
+                    # Resolve cal paths (panel → session → library)
+                    md = mf = mb = mdf = None
+                    try:
+                        md, mf, mb, mdf = _resolve_cal_paths(p, sess, panel=pan)
+                    except Exception:
+                        md  = getattr(pan, "master_dark", None) or getattr(sess, "master_dark", None)
+                        mf  = getattr(pan, "master_flat", None) or getattr(sess, "master_flat", None)
+                        mb  = getattr(pan, "master_bias", None) or getattr(sess, "master_bias", None)
+                        mdf = (getattr(pan, "master_dark_flat", None) or getattr(pan, "master_darkflat", None)
+                            or getattr(sess, "master_dark_flat", None) or getattr(sess, "master_darkflat", None))
+
+                    use_lib            = bool(getattr(p, "use_master_library", False))
+                    has_dark_any       = bool(md) or use_lib
+                    has_master_flat    = bool(mf) or use_lib
+                    has_raw_flats      = bool(getattr(pan, "flats", []) or [])
+                    has_bias_or_df     = bool(mb or mdf) or use_lib
+
+                    # Missing conditions we want to surface in the same Yes/No prompt
+                    no_flats                 = (not has_master_flat) and (not has_raw_flats)
+                    raw_flats_no_support     = has_raw_flats and (not has_bias_or_df)
+                    no_darks                 = not has_dark_any
+
+                    # If any of those are true, add a single line item describing *all* reasons for this panel
+                    if no_flats or raw_flats_no_support or no_darks:
+                        pid = getattr(pan, "panel_id", None) or getattr(pan, "id", None) or "Panel"
+                        reasons = []
+                        if no_darks:
+                            reasons.append("no usable darks")
+                        if no_flats:
+                            reasons.append("no flats")
+                        if raw_flats_no_support:
+                            reasons.append("raw flats present but no bias/dark-flats")
+                        missing.append(f"- {getattr(sess,'name','Session')} / {pid}: " + " and ".join(reasons))
+
+            if not missing:
+                return True
+
+            if getattr(p, "allow_uncalibrated", False):
+                self._info(
+                    "Proceeding with missing calibration items for:\n\n" + "\n".join(missing) +
+                    "\n\nTip: attach per-panel/session masters or enable the Master Library."
+                )
+                return True
+
+            return self._confirm(
+                "Calibration items are missing for some panels:\n\n"
+                + "\n".join(missing)
+                + "\n\nYou can:\n"
+                + " • Attach per-panel/session master dark/flat (or dark-flat / bias), or\n"
+                + " • Enable/fix the Master Library, or\n"
+                + " • Check “Allow no calibration frames” to proceed anyway.\n\n"
+                + "Proceed anyway?"
+            )
+
+        # -------- Non-mosaic path: validate per session --------
+        missing = []
+
+        for sess in sessions:
+            lights = list(getattr(sess, "lights", []) or [])
+            if not lights:
+                continue  # nothing to calibrate
+
+            # Raw frames
+            flats       = list(getattr(sess, "flats", []) or [])
+            dark_flats  = list(getattr(sess, "dark_flats", []) or [])
+            darks       = list(getattr(sess, "darks", []) or [])
+
+            # Masters (accept both spellings for dark-flat)
+            m_bias      = getattr(sess, "master_bias", None)
+            m_dark      = getattr(sess, "master_dark", None)
+            m_flat      = getattr(sess, "master_flat", None)
+            m_dark_flat = getattr(sess, "master_dark_flat", None) or getattr(sess, "master_darkflat", None)
+
+            use_lib            = bool(getattr(p, "use_master_library", False))
+            has_dark_any       = bool(m_dark) or bool(darks) or use_lib
+            has_master_flat    = bool(m_flat) or use_lib
+            has_raw_flats      = bool(flats)
+            has_bias_or_df     = bool(m_bias or m_dark_flat or dark_flats) or use_lib
+
+            # Missing conditions to surface in the single Yes/No prompt
+            no_flats             = (not has_master_flat) and (not has_raw_flats)
+            raw_flats_no_support = has_raw_flats and (not has_bias_or_df)
+            no_darks             = not has_dark_any
+
+            if no_flats or raw_flats_no_support or no_darks:
+                reasons = []
+                if no_darks:
+                    reasons.append("no usable darks")
+                if no_flats:
+                    reasons.append("no flats")
+                if raw_flats_no_support:
+                    reasons.append("raw flats present but no bias/dark-flats")
+                pretty = getattr(sess, "name", "Session")
+                missing.append(f"- {pretty}: " + " and ".join(reasons))
+
+        if not missing:
+            return True
+
+        if getattr(p, "allow_uncalibrated", False):
+            self._info(
+                "Proceeding with missing calibration items for:\n\n"
+                + "\n".join(missing)
+                + "\n\nTip: attach per-session masters or enable the Master Library."
+            )
+            return True
+
+        return self._confirm(
+            "Calibration items are missing for some sessions:\n\n"
+            + "\n".join(missing)
+            + "\n\nYou can:\n"
+            + " • Attach per-session master dark/flat (or dark-flat / bias), or\n"
+            + " • Enable/fix the Master Library, or\n"
+            + " • Check “Allow no calibration frames” to proceed anyway.\n\n"
+            + "Proceed anyway?"
+        )
+
+    def build_script(self):
+        # Preserve current dirty state — building an SSF is not a project save
+        was_dirty = getattr(self, "_dirty", False)
+        self._suspend_dirty = True
+        try:
+            self.push_to_model()  # copy UI → model (must NOT clear _dirty)
+            p = self.project
+            if getattr(p, "mosaic_enabled", False) and getattr(p, "link_feather_to_overlap", True):
+                # Never build with a stale pixel value while automatic mode is selected.
+                if not self._update_feather_from_overlap(
+                    show_error=True,
+                    force_geometry_refresh=True,
+                ):
+                    return
+                self.push_to_model()
+                p = self.project
+            proceed = self._validate_calibration_or_warn(p, show_nb_fallback_notice=True)
+            if not proceed:
+                return         
+            # --- NEW: warn if any mosaic panels have no lights ---
+            if getattr(p, "mosaic_enabled", False) and not getattr(p, "nb_extraction_enabled", False):
+                missing = []
+                for s in p.sessions:
+                    for pan in getattr(s, "panels", []) or []:
+                        if not getattr(pan, "lights", []):
+                            missing.append(f"{s.name} / {pan.panel_id or 'A1'}")
+                if missing:
+                    msg = (
+                        "The following panels have no LIGHT frames:\n\n"
+                        + "\n".join(missing)
+                        + "\n\nContinue and skip these panels?"
+                    )
+                    resp = QtWidgets.QMessageBox.question(
+                        self,
+                        "Missing Lights in Panels",
+                        msg,
+                        QtWidgets.QMessageBox.StandardButton.Yes
+                        | QtWidgets.QMessageBox.StandardButton.No,
+                        QtWidgets.QMessageBox.StandardButton.No,
+                    )
+                    if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+                        return
+            # --- END NEW ---
+            out = Path(p.working_dir) / "run_project.ssf"
+            builder = SirilCommandBuilder(p)
+            script_text = builder.build()
+            bundle = getattr(builder, "storage_bundle", None)
+            if bundle:
+                bundle.write()
+            if not isinstance(script_text, str) or not script_text.strip():
+                QtWidgets.QMessageBox.critical(self, "Build Siril Script",
+                                            "Generated script is empty.")
+                return
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(script_text, encoding="utf-8")
+            if self.siril.connected:
+                self.siril.log(f"[script] Wrote {out} ({len(script_text.splitlines())} lines)")
+            QtWidgets.QMessageBox.information(
+                self, "Build Siril Script", f"Script written to:\n{out}" +
+                (f"\n\nEstimated peak image footprint: {bundle.plan['estimated_peak_bytes'] / 2**30:.1f} GiB (provisional)."
+                 f"\nFree-space reserve: {p.storage_reserve_gib} GiB."
+                 "\nStage budgets are checked again while running. Use Run / Resume to retry this bundle; Build creates a new run."
+                 if bundle else "")
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Build Siril Script",
+                                        f"Failed to build:\n{e}")
+        finally:
+            # Restore whatever the dirty state was before building
+            self._suspend_dirty = False 
+            self._dirty = was_dirty
+
+    def _sync_storage_controls(self, *_):
+        managed = self.cmb_storage.currentData() == "min_disk"
+        supported = self.chk_mosaic_enabled.isChecked() and not self.chk_nb_enabled.isChecked()
+        self.cmb_storage_compression.setEnabled(managed and supported)
+        self.sp_storage_reserve.setEnabled(managed and supported)
+        self.cb_compress.setEnabled(not managed)
+        self.btn_run_siril.setText("Run / Resume in Siril" if managed else "Run in Siril")
+        if managed:
+            self.btn_prepare.setToolTip(
+                "Creates or validates the project working directory.\n"
+                "Low-disk mosaic input aliases and scratch folders are created on demand "
+                "as each processing stage runs.\n"
+                "Build a new Siril script after preparation."
+            )
+        else:
+            self.btn_prepare.setToolTip(
+                "Creates the required temporary directory structure for the project.\n"
+                "Copies or links image files into per-session folders and initializes "
+                "the preparation log.\n"
+                "Run this before building the Siril script."
+            )
+
+    def _set_storage_busy(self, busy):
+        if busy:
+            self._storage_busy = True
+            self._storage_controls = []
+            types = (QtWidgets.QAbstractButton, QtWidgets.QLineEdit, QtWidgets.QComboBox,
+                     QtWidgets.QAbstractSpinBox, QtWidgets.QAbstractItemView)
+            for widget in self.findChildren(QtWidgets.QWidget):
+                if isinstance(widget, types) and widget is not self.btn_abort:
+                    self._storage_controls.append((widget, widget.isEnabled()))
+                    widget.setEnabled(False)
+            for action in (self.action_new, self.action_open, self.action_save, self.action_save_as):
+                action.setEnabled(False)
+            self.btn_abort.setEnabled(True)
+        else:
+            for widget, enabled in getattr(self, "_storage_controls", []):
+                widget.setEnabled(enabled)
+            for action in (self.action_new, self.action_open, self.action_save, self.action_save_as):
+                action.setEnabled(True)
+            self._storage_busy = False
+            self.btn_abort.setEnabled(False)
+            self._sync_storage_controls()
+
+    def _run_storage_api(self, manifest):
+        self._managed_manifest = manifest
+        self._managed_started_ns = time.time_ns()
+        self._set_storage_busy(True)
+        self.lbl_run_mode.setText("Run mode: Siril API / low disk usage")
+        self._storage_thread = _StorageThread(manifest, self.siril.iface, self, started_ns=self._managed_started_ns)
+        self._storage_thread.status.connect(lambda text: self.lbl_run_mode.setText(text) if text.startswith("STAGE ") else None)
+        def finished():
+            error = self._storage_thread.error
+            plan = None
+            self._set_storage_busy(False)
+            try:
+                if error:
+                    raise RuntimeError(error)
+                plan = json.loads(manifest.read_text(encoding="utf-8"))
+                state = check_storage_completion(manifest, self._managed_started_ns)
+                self.siril.iface.cmd("cd " + LowDiskMosaicPlan.quote(plan["work"]))
+                self.siril.iface.cmd("load " + LowDiskMosaicPlan.quote(plan["final"]))
+                elapsed_seconds = state.get("elapsed_seconds")
+                if elapsed_seconds is None:
+                    started_ns = int(state.get("started_ns", self._managed_started_ns))
+                    finished_ns = int(state.get("finished_ns", time.time_ns()))
+                    elapsed_seconds = max(0.0, (finished_ns - started_ns) / 1_000_000_000)
+                elapsed_txt = StorageRuntime.format_elapsed(elapsed_seconds)
+                self.siril.log(f"[low-disk] Processing completed in {elapsed_txt}.")
+                self.lbl_run_mode.setText("Low-disk run completed")
+                QtWidgets.QMessageBox.information(self, "Run complete",
+                    f"Processing completed in {elapsed_txt}.\n"
+                    f"Measured peak owned files: {state.get('peak_bytes', 0) / 2**30:.1f} GiB.\n\n"
+                    f"Log: {manifest.parent / 'run.log'}")
+            except Exception as exc:
+                if plan:
+                    try:
+                        self.siril.iface.cmd("cd " + LowDiskMosaicPlan.quote(plan["work"]))
+                    except Exception:
+                        pass
+                self.lbl_run_mode.setText("Low-disk run stopped")
+                QtWidgets.QMessageBox.critical(self, "Run stopped",
+                    f"{exc}\n\nCompleted panels are retained. Run again to resume the same bundle.\nLog: {manifest.parent / 'run.log'}")
+            self._managed_manifest = None
+            self._storage_thread = None
+        self._storage_thread.finished.connect(finished)
+        self._storage_thread.start()
+
+
+    def run_siril(self):
+        from datetime import datetime
+
+        # Do NOT let a run clear the dirty flag
+        was_dirty = bool(getattr(self, "_dirty", False))
+        self._suspend_dirty = True
+        try:
+            self.push_to_model()
+        finally:
+            self._suspend_dirty = False
+        p = self.project
+        if not p.working_dir:
+            QtWidgets.QMessageBox.warning(self, "Run", "Please set a working directory.")
+            return
+        script_path = Path(p.working_dir) / "run_project.ssf"
+        if not script_path.exists():
+            QtWidgets.QMessageBox.warning(self, "Run", "Script not found. Click 'Build Siril Script' first.")
+            return
+        proceed = self._validate_calibration_or_warn(p, show_nb_fallback_notice=False)
+        if not proceed:
+            return
+        self.lbl_run_mode.setText("Run mode: deciding…")
+        self.lbl_run_mode.setStyleSheet("color: #666666; font-style: italic;")
+    
+        try:
+            managed_manifest = storage_manifest_for_script(script_path, p)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Run", str(exc))
+            return
+        self._managed_manifest = managed_manifest
+        self._managed_started_ns = time.time_ns()
+
+        # --- Decide API vs CLI ---
+        force_cli = bool(getattr(p, "force_cli", False))
+        api_available = getattr(self, "siril", None) and getattr(self.siril, "iface", None)
+
+        if managed_manifest and api_available and not force_cli:
+            self._run_storage_api(managed_manifest)
+            return
+
+        # --- PREFERRED: run inside Siril via Python API (unless force_cli is set) ---
+        if api_available and not force_cli:
+            try:
+                # One place to say which mode we're using
+                if self.siril.connected:
+                    self.siril.log("[run] In-Siril execution selected (using Siril Python API).")
+
+                # Compute project directory and log what we are about to run
+                proj_dir = Path(self.project.working_dir or p.working_dir).as_posix()
+                if self.siril.connected:
+                    self.siril.log(f'[run] Executing SSF inside Siril: cd \"{proj_dir}\" ; @run_project.ssf')
+
+                # cd into the project working directory then run the script by name
+                self.siril.iface.cmd(f'cd \"{proj_dir}\"')
+                self.siril.iface.cmd('@run_project.ssf')
+
+                # Update run-mode label
+                if hasattr(self, "lbl_run_mode"):
+                    self.lbl_run_mode.setText("Run mode: Siril Python API (in-process)")
+                    self.lbl_run_mode.setStyleSheet("color: #2e7d32;")
+
+                # Let the user know this is fire-and-forget from the GUI perspective
+                if self.siril.connected:
+                    self.siril.log(
+                        "[run] run_project.ssf submitted to Siril. "
+                        "Follow progress in Siril's log/progress bar; use Siril's Stop button to abort."
+                    )
+
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Run (Siril API)",
+                    "Siril has started run_project.ssf using the Python API.\n\n"
+                    "Watch Siril's progress bar and log window for completion.\n"
+                    "To abort, click the Stop button in Siril.",
+                )
+                # Do not change dirty state here
+                return
+            except Exception as e:
+                # If in-Siril run failed, note and fall back to CLI
+                if self.siril.connected:
+                    self.siril.log(f"[run] In-Siril execution failed, will try CLI. Error: {e}")
+                if hasattr(self, "lbl_run_mode"):
+                    self.lbl_run_mode.setText("Run mode: Siril Python API failed → falling back to CLI")
+                    self.lbl_run_mode.setStyleSheet("color: #f57c00;")
+
+        # If we reach here, we will run via CLI. Reset run-mode label baseline if present.
+        if hasattr(self, "lbl_run_mode"):
+            self.lbl_run_mode.setText("Run mode: siril-cli (pending launch)")
+            self.lbl_run_mode.setStyleSheet("color: #666666; font-style: italic;")
+
+        # --- FALLBACK: run via siril-cli (your existing behavior) ---
+        siril = find_siril_cli(p.siril_cli_path)
+        if not siril:
+            f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Locate siril-cli")
+            if not f:
+                QtWidgets.QMessageBox.critical(self, "Run", "siril-cli not found.")
+                return
+            siril = f
+            # marks dirty (expected)
+            self.ed_siril.setText(f)
+
+        # Version (for log / drizzle guard)
+        ver = get_siril_version(siril)
+        self._run_siril_verstr = (
+            f"{ver[0]}.{ver[1]}.{ver[2]}" if ver is not None else "unknown"
+        )
+
+        # Update run-mode label for CLI
+        if hasattr(self, "lbl_run_mode"):
+            if self._run_siril_verstr != "unknown":
+                self.lbl_run_mode.setText(f"Run mode: siril-cli ({self._run_siril_verstr})")
+            else:
+                self.lbl_run_mode.setText("Run mode: siril-cli")
+            self.lbl_run_mode.setStyleSheet("color: #1565c0;")
+
+        # Drizzle still explicitly requires 1.4+ (no GUI/CLI comparison anymore)
+        if ver is not None and p.drizzle_enabled and (ver[0], ver[1]) < (1, 4):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Siril Version",
+                f"Detected siril-cli {self._run_siril_verstr}. Drizzle requires 1.4+.",
+            )
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = Path(p.working_dir) / f"siril_run_{ts}.log"
+
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if platform.system() == "Windows" else 0
+        try:
+            if managed_manifest:
+                # Carry the UI launch time through CLI/Python startup so an early Abort survives.
+                runtime = StorageRuntime(managed_manifest, None)
+                launch = runtime.safe_path(managed_manifest.parent / f"launch_{self._managed_started_ns}.ssf", inside=False)
+                lines = script_path.read_text(encoding="utf-8-sig").splitlines()
+                lines = [line + f" --started={self._managed_started_ns}" if line.startswith("pyscript ") else line for line in lines]
+                launch.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                script_path = launch
+            self._run_started_at = datetime.now()
+            with open(log_path, "a", encoding="utf-8", newline="") as lf:
+                lf.write(f"=== Multi-Night Stacking run started at {self._run_started_at.isoformat()} ===\n")
+                lf.write(f"Siril CLI   : {siril}\n")
+                lf.write(f"Siril Version: {self._run_siril_verstr}\n")
+                lf.write(f"Working Dir : {p.working_dir}\n")
+                lf.write(f"Script      : {script_path}\n\n")
+
+            self._proc = subprocess.Popen(
+                [siril, "-s", str(script_path)],
+                cwd=str(p.working_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",       # <<< add
+                errors="replace",       # <<< add (prevents crashes on weird bytes)
+                bufsize=1,
+                creationflags=creationflags,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Run", f"Failed to launch siril-cli: {e}")
+            return
+
+        if managed_manifest:
+            self._set_storage_busy(True)
+
+        # Toggle buttons during run
+        self.btn_run_siril.setEnabled(False)
+        self.btn_abort.setEnabled(True)
+        self.btn_prepare.setEnabled(False)
+        self.btn_build_script.setEnabled(False)
+
+        if self.siril.connected:
+            self.siril.log(f"[siril-cli] Launching: {siril} -s {script_path}")
+            self.siril.log(f"[siril-cli] Siril Version: {self._run_siril_verstr}")
+            self.siril.log(f"[siril-cli] CWD: {p.working_dir}")
+            self.siril.log(f"[siril-cli] Log: {log_path}")
+
+        # Reader thread (unchanged from your current code)
+        self._reader = _ProcReader(self._proc, log_path, self.siril, parent=self)
+        self._last_pct = -1.0
+        self._last_emit = 0.0
+        self._progress_interval = 0.22
+        self._progress_min_delta = 0.3
+
+        def on_lines(lines: list[str]):
+            if not self.siril.connected:
+                return
+            now = time.monotonic()
+            maybe_emit = (now - self._last_emit) >= self._progress_interval
+            for ln in lines:
+                self.siril.log(ln.rstrip())
+                m = re.search(r"progress:\s.*?(\d{1,3}(?:\.\d+)?)\s*%", ln)
+                if m:
+                    try: pct = float(m.group(1))
+                    except ValueError: pct = None
+                    if pct is not None:
+                        delta_ok = (self._last_pct < 0) or (abs(pct - self._last_pct) >= self._progress_min_delta)
+                        if delta_ok or maybe_emit:
+                            self._last_pct = pct
+                            self._last_emit = now
+                            try:
+                                self.siril.progress("Running siril-cli…", max(0.0, min(1.0, pct / 100.0)))
+                            except Exception:
+                                pass
+
+        def on_finished(rc: int):
+            managed_error = None
+            if managed_manifest:
+                try:
+                    check_storage_completion(managed_manifest, self._managed_started_ns)
+                except Exception as exc:
+                    managed_error = str(exc)
+                    rc = rc or 1
+                self._set_storage_busy(False)
+                self._managed_manifest = None
+            if self.siril.connected:
+                try:
+                    self.siril.progress("Done", 1.0)
+                except Exception:
+                    pass
+                self.siril.progress_reset()
+            self.btn_run_siril.setEnabled(True)
+            self.btn_abort.setEnabled(False)
+            self.btn_prepare.setEnabled(True)
+            self.btn_build_script.setEnabled(True)
+
+            end_dt = datetime.now()
+            start_dt = self._run_started_at
+            self._run_started_at = None
+            def _fmt_elapsed(start_dt, end_dt):
+                try:
+                    total = int((end_dt - start_dt).total_seconds())
+                    h = total // 3600
+                    m = (total % 3600) // 60
+                    s = total % 60
+                    if h: return f"{h}h {m}m {s}s"
+                    if m: return f"{m}m {s}s"
+                    return f"{s}s"
+                except Exception:
+                    return "n/a"
+            elapsed_txt = _fmt_elapsed(start_dt, end_dt) if start_dt else "n/a"
+            try:
+                with open(log_path, "a", encoding="utf-8", newline="") as lf:
+                    lf.write(f"\n=== Finished at {end_dt.isoformat()} (elapsed {elapsed_txt}) ===\n")
+            except Exception:
+                pass
+
+            if self.siril.connected:
+                self.siril.log(f"[siril-cli] Finished (rc={rc}) in {elapsed_txt} — Siril {self._run_siril_verstr}.")
+
+            if rc == 0:
+                try:
+                    proj_slug = safe_slug(self.project.name)
+                    work_dir = Path(self.project.working_dir)
+                    final_candidates = []
+                    if bool(getattr(self.project, "nb_extraction_enabled", False)):
+                        palette = str(getattr(self.project, "nb_output_palette", "SHO_WITH_HOO_FALLBACK") or "SHO_WITH_HOO_FALLBACK").upper()
+                        if palette == "HOO":
+                            labels = ["HOO"]
+                        elif palette == "HSO":
+                            labels = ["HSO"]
+                        elif palette == "SHO":
+                            labels = ["SHO"]
+                        else:
+                            labels = ["SHO", "HOO"]
+                        final_candidates.extend(work_dir / f"{proj_slug}_{label}_final.fit" for label in labels)
+                    final_candidates.append(work_dir / f"{proj_slug}_final.fit")
+                    final_path = next((path for path in final_candidates if path.exists()), final_candidates[0])
+                    if final_path.exists() and getattr(self.siril, "iface", None):
+                        self.siril.iface.cmd(f'load "{final_path.as_posix()}"')
+                        self.siril.log(f"[viewer] Loaded final image: {final_path}")
+                except Exception as e:
+                    if self.siril.connected:
+                        self.siril.log(f"[viewer] Failed to load final image: {e}")
+                QtWidgets.QMessageBox.information(self, "Run (CLI)", f"Processing finished in {elapsed_txt}.\n\nLog saved to:\n{log_path}")
+            else:
+                QtWidgets.QMessageBox.critical(self, "Run (CLI)", f"siril-cli exited with code {rc} after {elapsed_txt}.\n{managed_error or ''}\n\nLog:\n{log_path}")
+
+            self._proc = None
+            self._reader = None
+            if not getattr(self, "_dirty", False) and was_dirty:
+                self._dirty = True
+
+        self._reader.got_lines.connect(on_lines)
+        self._reader.finished_ok.connect(on_finished)
+        self._reader.start()
+
+    def abort_siril(self):
+        manifest = getattr(self, "_managed_manifest", None)
+        if manifest and getattr(self, "_storage_busy", False):
+            runtime = StorageRuntime(manifest, None)
+            cancel = runtime.safe_path(manifest.parent / "cancel.request", inside=False)
+            cancel.write_text(str(time.time_ns()), encoding="utf-8")
+            self.lbl_run_mode.setText("Stop requested; retaining this stage. Siril's Stop button can interrupt the active command.")
+            self.btn_abort.setEnabled(False)
+            return
+        if not self._proc:
+            QtWidgets.QMessageBox.information(self, "Abort", "No siril-cli process is running.")
+            return
+        ans = QtWidgets.QMessageBox.question(
+            self, "Abort Run",
+            "Stop the current Siril job?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if ans != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if platform.system() == "Windows":
+                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                self._proc.send_signal(signal.SIGINT)
+            if hasattr(self, "_reader") and self._reader:
+                self._reader.stop()
+        except Exception:
+            pass
+        # Escalation remains the same as you already had…
+
+
+    def _escalate_abort(self):
+        if not self._proc: return
+        try:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                QtCore.QTimer.singleShot(800, self._kill_abort)
+        except Exception:
+            self._kill_abort()
+
+    def _kill_abort(self):
+        if not self._proc: return
+        try:
+            if self._proc.poll() is None:
+                self._proc.kill()
+        except Exception: pass
+        self._proc = None
+        if self._run_timer: self._run_timer.stop()
+        if self.siril.connected:
+            self.siril.progress_reset()
+            self.siril.log("[abort] Process killed.")
+        self.btn_run_siril.setEnabled(True)
+        self.btn_abort.setEnabled(False)
+        self.btn_prepare.setEnabled(True)
+        self.btn_build_script.setEnabled(True)
+        QtWidgets.QMessageBox.information(self, "Abort", "Processing aborted.")
+
+
+    # ------------------------
+    # Panel helpers (new)
+    # ------------------------
+    def _current_session(self):
+        idx = self.sessions_list.currentRow()
+        return self.project.sessions[idx] if 0 <= idx < len(self.project.sessions) else None
+
+    def _current_session_has_panels(self):
+        s = self._current_session()
+        return bool(s and s.panels)
+
+    def _refresh_panels_ui_for_session(self, sess):
+        # Start by clearing the editor to avoid stale carry-over
+        self._loading_panel = True
+        try:
+            self.panel_editor.from_panel(None)
+        finally:
+            self._loading_panel = False
+
+        self.lst_panels.clear()
+        mosaic_on = self.chk_mosaic_enabled.isChecked()
+        has_session = sess is not None
+        self.lst_panels.setEnabled(mosaic_on and has_session)
+        self.btn_add_panel.setEnabled(mosaic_on and has_session)
+        self.btn_remove_panel.setEnabled(False)
+
+        if not sess:
+            # No session selected
+            # - Session frame lists are disabled because there is no backing model object
+            self.session_editor.set_frame_groups_enabled(False)
+            # - Panel frame lists disabled, no copy button
+            self.panel_editor.set_metadata_enabled(False)
+            self.panel_editor.set_frame_groups_enabled(False)
+            self.panel_editor.set_copy_source_panel(None, enabled=False)
+            return
+
+        # Populate left-hand panels list
+        for p in getattr(sess, "panels", []):
+            self.lst_panels.addItem(p.panel_id or "")
+
+        has_panels = bool(sess.panels)
+
+        if has_panels:
+            self.lst_panels.setCurrentRow(0)
+            # Load first panel under guard
+            self._loading_panel = True
+            try:
+                self.panel_editor.from_panel(sess.panels[0])
+            finally:
+                self._loading_panel = False
+
+            # Configure the 'copy calibration frames' button based on panel count
+            first_id = sess.panels[0].panel_id or "A1"
+            can_copy = mosaic_on and (len(sess.panels) > 1)
+            self.panel_editor.set_copy_source_panel(first_id, enabled=can_copy)
+        else:
+            # No panels: hide/disable the copy button
+            self.panel_editor.set_copy_source_panel(None, enabled=False)
+
+        # --- Final enable/disable rules ---
+
+        # Session tab frame lists:
+        #   always greyed out when Mosaic is enabled,
+        #   enabled when Mosaic is OFF.
+        self.session_editor.set_frame_groups_enabled(not mosaic_on)
+
+        # Panel tab frame lists:
+        #   enabled only when Mosaic is ON AND there is at least one panel.
+        #   Otherwise greyed out.
+        self.panel_editor.set_metadata_enabled(mosaic_on and has_panels)
+        self.panel_editor.set_frame_groups_enabled(mosaic_on and has_panels)
+        self.btn_remove_panel.setEnabled(mosaic_on and has_session and has_panels)
+
+    def load_selected_panel(self, row: int):
+        s = self._current_session()
+        self._loading_panel = True
+        try:
+            if not s or not (0 <= row < len(s.panels)):
+                self.panel_editor.from_panel(None)
+                return
+            self.panel_editor.from_panel(s.panels[row])
+        finally:
+            self._loading_panel = False
+
+    def update_current_panel(self):
+        # Ignore writes while we’re programmatically updating the editor
+        if getattr(self, "_loading_panel", False):
+            return
+
+        s = self._current_session()
+        row = self.lst_panels.currentRow()
+        if not s or not (0 <= row < len(s.panels)):
+            return
+
+        s.panels[row] = self.panel_editor.to_panel()
+        # keep the list label in sync
+        self.lst_panels.item(row).setText(s.panels[row].panel_id or f"A{row+1}")
+        self.mark_dirty()
+
+    def _on_copy_cals_from_first_panel(self):
+        """Copy calibration frame lists from the first panel to all other panels in the session.
+
+        This operates on Bias, Darks, Flats and Dark Flats only – Lights are not affected.
+        """
+        sess = self._current_session()
+        if not sess:
+            return
+
+        panels = getattr(sess, "panels", [])
+        if len(panels) < 2:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Copy Calibration Frames",
+                "You need at least two panels in the current session to use this feature.",
+            )
+            return
+
+        src = panels[0]
+
+        # Copy calibration frame lists (make new lists, do not share references)
+        for pan in panels[1:]:
+            pan.bias = list(src.bias)
+            pan.darks = list(src.darks)
+            pan.flats = list(src.flats)
+            pan.dark_flats = list(src.dark_flats)
+
+        # Refresh the currently selected panel in the editor so the user sees the change
+        row = self.lst_panels.currentRow()
+        if 0 <= row < len(panels):
+            self._loading_panel = True
+            try:
+                self.panel_editor.from_panel(panels[row])
+            finally:
+                self._loading_panel = False
+
+        self.mark_dirty()
+
+    # ---------------- file I/O ----------------
+    def new_project(self):
+        self.project = Project()
+        self.project.sessions = [Session(name="Session 1")]
+        self.refresh_from_model()
+        self._dirty = True
+
+    def open_project(self) -> bool:
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Project", filter="Project (*.json)")
+        if not f:
+            return False
+        try:
+            self.project = Project.from_dict(json.loads(Path(f).read_text(encoding="utf-8")))
+            self.project.project_file = f
+            if not self.project.sessions:
+                self.project.sessions = [Session(name="Session 1")]
+            self.refresh_from_model()
+            self._dirty = False
+            return True
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Open Project", f"Failed: {e}")
+            return False
+
+    def load_project_file(self, path: str) -> bool:
+        """Load a project JSON from a path (no dialogs). Returns True on success."""
+        try:
+            txt = Path(path).read_text(encoding="utf-8")
+            data = json.loads(txt)
+            proj = Project.from_dict(data)
+            # ensure at least one session
+            if not getattr(proj, "sessions", None):
+                proj.sessions = [Session(name="Session 1")]
+            self.project = proj
+            self.project.project_file = path
+            self._project_path = path
+            self._dirty = False
+            # refresh UI from model
+            self.refresh_from_model()
+            return True
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Open Project", f"Failed to load:\n{e}")
+            return False
+
+    def save_project(self) -> bool:
+        if not self.project.project_file:
+            return self.save_project_as()
+        self.push_to_model()
+        try:
+            project_data = self.project.to_dict()
+            Path(self.project.project_file).write_text(
+                json.dumps(project_data, indent=2), encoding="utf-8"
+            )
+            # Once saved, the resolved default becomes an explicit project choice.
+            self.project.distortion_correction_enabled = bool(
+                project_data["distortion_correction_enabled"]
+            )
+            self._dirty = False
+            return True
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save Project", f"Failed: {e}")
+            return False
+
+    def save_project_as(self) -> bool:
+        # Pick a reasonable starting folder
+        start_dir = ""
+        if getattr(self, "_project_path", None):
+            start_dir = os.path.dirname(self._project_path)
+        elif getattr(self.project, "working_dir", None):
+            start_dir = self.project.working_dir
+
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Project As", start_dir, "Project (*.json)"
+        )
+        if not f:
+            return False
+        if not f.lower().endswith(".json"):
+            f += ".json"
+
+        # Update both pointers so downstream code sees the path
+        self.project.project_file = f
+        self._project_path = f
+
+        # Delegate the actual write (and _dirty reset) to save_project()
+        return self.save_project()
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self._suppress_resize_dirty = True
+        self.setWindowTitle("OSC Multi-Night Stacking (Siril 1.4) Version 3.0.1")
+
+        self.proj_widget = ProjectWidget()
+        self.setCentralWidget(self.proj_widget)
+
+        self.status = self.statusBar()
+        self.proj_widget.status_message.connect(self.status.showMessage)
+
+        # --- Menu setup ---
+        m = self.menuBar()
+        file_menu = m.addMenu("&File")
+        file_menu.addAction(self.proj_widget.action_new)
+        file_menu.addAction(self.proj_widget.action_open)
+        file_menu.addAction(self.proj_widget.action_save)
+        file_menu.addAction(self.proj_widget.action_save_as)
+
+        # --- Add Exit action ---
+        exit_action = QtGui.QAction("E&xit", self)
+        exit_action.setShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit))  # or "Ctrl+Q"
+        exit_action.setMenuRole(QtGui.QAction.MenuRole.QuitRole)
+        exit_action.triggered.connect(self.close)
+        file_menu.addSeparator()
+        file_menu.addAction(exit_action)
+
+
+        # --- Connect menu actions ---
+        self.proj_widget.action_new.triggered.connect(self.on_file_new)
+        self.proj_widget.action_open.triggered.connect(self.on_file_open)
+        self.proj_widget.action_save.triggered.connect(self.proj_widget.save_project)
+        self.proj_widget.action_save_as.triggered.connect(self.proj_widget.save_project_as)
+
+        # After layout is set up
+        QtCore.QTimer.singleShot(0, self._rebalance_after_show)
+
+        # existing About action creation can remain as-is, just avoid creating a second Help menu
+        help_menu = m.addMenu("&Help")  # you already have one; keep a single instance
+        about_action = QtGui.QAction("About", self)
+        help_menu.addAction(about_action)
+        about_action.triggered.connect(lambda: QtWidgets.QMessageBox.information(
+            self, "About",
+            "OSC Multi-Night Stacking for Siril 1.4 (PyQt6) Version 3.0.1\n"
+            "• Drizzle: Scaling, Pixel Fraction, Kernel\n"
+            "• 2-pass registration toggle\n"
+            "• Global stacking options (winsorized, sigma, or GESDT rejection; mean; median)\n"
+            "• Ha/OIII and SII/OIII narrowband extraction with SHO/HSO/HOO output\n"
+            "• 32-bit output for final stack and intermediate file compression toggles\n"
+            "• Siril console logging via sirilpy\n"
+            "• Abort Run button (graceful stop)\n"
+            "• Final stack copied, mirrored, and opened in Siril"
+        ))
+
+        # ---- Help → Quick Start Instructions ----
+        menubar = self.menuBar()
+        help_menu = None
+        for act in menubar.actions():
+            if act.text().replace("&", "").lower() == "help":
+                help_menu = act.menu()
+                break
+        if help_menu is None:
+            help_menu = menubar.addMenu("&Help")
+
+        act_quickstart = QtGui.QAction("Quick Start Instructions", self)
+        act_quickstart.setShortcut(QtGui.QKeySequence("F1"))
+        act_quickstart.triggered.connect(self.show_quick_start)
+
+        # Insert near the top of Help
+        if help_menu.actions():
+            help_menu.insertAction(help_menu.actions()[0], act_quickstart)
+        else:
+            help_menu.addAction(act_quickstart)
+
+        # Optional: hook for future auto-show (still self-contained)
+        QtCore.QTimer.singleShot(0, self.maybe_autoshow_quickstart)
+
+        # existing About action creation can remain as-is, just avoid creating a second Help menu
+
+        # Size adaptively to the screen (works well on 1080p laptops)
+        avail = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        w = min(1450, int(avail.width() * 0.95))
+        h = min(880,  int(avail.height() * 0.9))
+        self.resize(w, h)
+        # Center on screen after initial sizing
+        frame_geom = self.frameGeometry()
+        center_point = QtGui.QGuiApplication.primaryScreen().availableGeometry().center()
+        frame_geom.moveCenter(center_point)
+        self.move(frame_geom.topLeft())
+        self._apply_remembered_window_size()
+        
+        # Size adaptively to the screen (works well on 1080p laptops)
+        avail = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        w = min(1450, int(avail.width() * 0.95))
+        h = min(880,  int(avail.height() * 0.9))
+        self.resize(w, h)
+
+        # Center on screen after initial sizing
+        frame_geom = self.frameGeometry()
+        center_point = QtGui.QGuiApplication.primaryScreen().availableGeometry().center()
+        frame_geom.moveCenter(center_point)
+        self.move(frame_geom.topLeft())
+
+        self._apply_remembered_window_size()
+
+        # turn back on after first paint cycle so user resizes will mark dirty
+        QtCore.QTimer.singleShot(0, lambda: setattr(self, "_suppress_resize_dirty", False))
+
+
+    def maybe_save(self)->bool:
+        pw=self.proj_widget
+        if not getattr(pw,"_dirty",False): return True
+        btn=QtWidgets.QMessageBox.question(self,"Unsaved changes",
+             "You have unsaved changes. Save before closing?",
+             QtWidgets.QMessageBox.StandardButton.Save|QtWidgets.QMessageBox.StandardButton.Discard|QtWidgets.QMessageBox.StandardButton.Cancel,
+             QtWidgets.QMessageBox.StandardButton.Save)
+        if btn==QtWidgets.QMessageBox.StandardButton.Save:
+            pw.save_project(); return not getattr(pw,"_dirty",False)
+        if btn==QtWidgets.QMessageBox.StandardButton.Discard: return True
+        return False
+    
+    def closeEvent(self, e: QtGui.QCloseEvent):
+        if getattr(self.proj_widget, "_storage_busy", False):
+            QtWidgets.QMessageBox.information(self, "Processing", "A managed run is active. Use Abort Run and wait for the current command to stop before closing.")
+            e.ignore()
+            return
+        if not self.maybe_save():
+            e.ignore()              # cancel close
+            return
+        super().closeEvent(e)       # allow normal close + cleanup
+
+    # ------------------------------
+    # File menu handlers
+    # ------------------------------
+
+    # ---- Quick Start plumbing (no persistence yet) ----
+    def show_quick_start(self):
+        dlg = QuickStartDialog(QUICK_START_MD, self)
+        dlg.exec()
+
+    def _should_autoshow_quickstart(self) -> bool:
+        """
+        Placeholder for future startup behavior. Returns False to keep
+        everything self-contained now. If approved later, switch this to
+        read a QSettings flag or an env var/CLI flag.
+        """
+        return False
+
+    def maybe_autoshow_quickstart(self):
+        if self._should_autoshow_quickstart():
+            dlg = QuickStartDialog(QUICK_START_MD, self)
+            dlg.setModal(False)
+            dlg.show()
+
+    def on_file_new(self):
+        """Create a new empty project after prompting to save unsaved changes."""
+        if not self.maybe_save():
+            return
+        self.proj_widget.project = Project()
+        if not getattr(self.proj_widget.project, "sessions", None):
+            self.proj_widget.project.sessions = [Session(name="Session 1")]
+        self.proj_widget._project_path = None
+        self.proj_widget._dirty = False
+        self.proj_widget.refresh_from_model()
+        self.status.showMessage("Created new project", 4000)
+
+    def on_file_open(self):
+        """Prompt to save, then open a project file."""
+        if not self.maybe_save():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Project", "", "Project JSON (*.json)"
+        )
+        if not path:
+            return
+        ok = self.proj_widget.load_project_file(path)
+        if ok:
+            self.proj_widget._project_path = path
+            self.proj_widget._dirty = False
+            self.proj_widget.refresh_from_model()
+            self._apply_remembered_window_size()
+            self.status.showMessage(f"Opened project: {os.path.basename(path)}", 4000)
+
+    def _rebalance_after_show(self):
+        # Re-run sizing once we have a real window size
+        try:
+            # Find the splitter in the project widget
+            splitters = self.proj_widget.findChildren(QtWidgets.QSplitter)
+            if splitters:
+                self.proj_widget._init_splitter_sizes(splitters[0])
+        except Exception:
+            pass
+
+    def _apply_remembered_window_size(self):
+        p = getattr(self.proj_widget, "project", None)
+        try:
+            if p and getattr(p, "remember_window_size", False) and p.window_w and p.window_h:
+                self._suppress_resize_dirty = True
+                try:
+                    self.resize(int(p.window_w), int(p.window_h))
+                finally:
+                    # allow user-driven resizes to mark dirty afterwards
+                    QtCore.QTimer.singleShot(0, lambda: setattr(self, "_suppress_resize_dirty", False))
+        except Exception:
+            pass
+
+    def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
+        try:
+            p = getattr(self.proj_widget, "project", None)
+
+            # Ignore “phantom” resizes while a modal dialog (e.g., Preview) is open
+            if QtWidgets.QApplication.activeModalWidget() is not None:
+                super().resizeEvent(e)
+                return
+
+            if p and getattr(p, "remember_window_size", False):
+                sz = e.size()
+                new_w, new_h = int(sz.width()), int(sz.height())
+                old_w = int(p.window_w) if p.window_w else 0
+                old_h = int(p.window_h) if p.window_h else 0
+
+                # Ignore tiny jiggles (<= 4 px) that often happen on dialog show/close
+                if abs(new_w - old_w) <= 4 and abs(new_h - old_h) <= 4:
+                    super().resizeEvent(e)
+                    return
+
+                changed = (new_w != old_w) or (new_h != old_h)
+                p.window_w, p.window_h = new_w, new_h
+
+                # Only mark dirty for meaningful, user-driven resizes
+                if changed and not getattr(self, "_suppress_resize_dirty", False):
+                    try:
+                        self.proj_widget.mark_dirty()
+                        # optional: self.status.showMessage("Window size changed (will be saved).", 2500)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        super().resizeEvent(e)
+
+def main():
+    try:
+        QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception: pass
+    app=QtWidgets.QApplication(sys.argv); w=MainWindow(); w.show(); sys.exit(app.exec())
+
+if __name__=="__main__": main()
