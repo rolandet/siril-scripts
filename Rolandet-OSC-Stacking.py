@@ -1414,15 +1414,77 @@ class StorageRuntime:
         if self.cancel_path.exists():
             raise InterruptedError("Run cancelled; completed panel stacks have been retained")
 
-    def command(self, line):
-        self.cancelled()
-        if not line.strip() or line.lstrip().startswith("#"):
-            return
+    def _interface_command(self, line):
         self.log("COMMAND " + line)
         try:
             self.iface.cmd(line)
         finally:
             self.capture_log()
+
+    def _plate_solve_alternates(self):
+        """Return a bounded, well-spaced set of alternate frames for a failed solve."""
+        commands = self.current.get("commands", []) if self.current else []
+        try:
+            load_index = max(i for i, value in enumerate(commands) if value.startswith("load "))
+            load_arg = shlex.split(commands[load_index])[1]
+            cd_arg = next(shlex.split(value)[1] for value in reversed(commands[:load_index])
+                          if value.startswith("cd "))
+        except (IndexError, StopIteration, ValueError):
+            return None, []
+        loaded = Path(load_arg)
+        if not loaded.is_absolute():
+            loaded = Path(cd_arg) / loaded
+        match = re.fullmatch(r"(.+)_\d+", loaded.name)
+        if not match:
+            return None, []
+        sequence = loaded.with_name(match.group(1))
+        frames = self.inventory({"kind": "sequence", "path": str(sequence)})
+        if len(frames) < 2:
+            return sequence.name, []
+        # Try broadly separated frames rather than walking through a cloudy run in order.
+        fractions = (0.5, 0.75, 0.25, 1.0, 0.625, 0.875, 0.375, 0.125)
+        indexes = []
+        for fraction in fractions:
+            index = min(len(frames) - 1, max(0, round((len(frames) - 1) * fraction)))
+            if index and index not in indexes:
+                indexes.append(index)
+        return sequence.name, [(index + 1, frames[index]) for index in indexes]
+
+    def _retry_plate_solve(self, line, original_error):
+        sequence, candidates = self._plate_solve_alternates()
+        if not candidates:
+            return False
+        last_error = original_error
+        for reference, frame in candidates:
+            self.cancelled()
+            self.safe_path(frame)
+            self.log(f"Plate solve failed on the first frame; trying reference frame {reference}: {frame.name}")
+            try:
+                self._interface_command('load "' + frame.as_posix() + '"')
+                self._interface_command('parse $RA:ra$_$DEC:dec$')
+                self._interface_command(line)
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                continue
+            self._interface_command(f"setref {sequence} {reference}")
+            self.log(f"Plate solve recovered with {frame.name}; registration reference set to frame {reference}")
+            return True
+        raise RuntimeError(
+            f"Plate solving failed on the first frame and {len(candidates)} alternate frames "
+            f"from sequence {sequence}: {last_error}"
+        ) from last_error
+
+    def command(self, line):
+        self.cancelled()
+        if not line.strip() or line.lstrip().startswith("#"):
+            return
+        try:
+            self._interface_command(line)
+        except Exception as exc:
+            if not line.startswith("platesolve ") or not self._retry_plate_solve(line, exc):
+                raise
         self.cancelled()
 
     def inventory(self, artifact):

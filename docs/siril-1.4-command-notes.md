@@ -54,7 +54,7 @@ Resolution: do not rely on guessed command parameters. Validate against Siril 1.
 ## Current gotchas
 
 - Mosaic mode intentionally disables pack sequences because Siril 1.4 cannot plate-solve packed FITSEQ/SER sequences in this workflow.
-- Enabling distortion correction also disables pack sequences. The script must load `<sequence>_00001` for `platesolve -force -disto=platesolve_data.wcs`, then applies the saved SIP model with `register <sequence> ... -disto=file platesolve_data.wcs`.
+- Enabling distortion correction also disables pack sequences. Generated scripts initially load `<sequence>_00001` for `platesolve -force -disto=platesolve_data.wcs`, then apply the saved SIP model with `register <sequence> ... -disto=file platesolve_data.wcs`. Managed low-disk runs can replace that initial reference as described below.
 - Normal multi-session distortion correction runs after `merge ... all_sessions`; the solve/register sequence is `load all_sessions_00001`, `parse $RA:ra$_$DEC:dec$`, `platesolve -force -disto=platesolve_data.wcs`, then `register all_sessions ... -disto=file platesolve_data.wcs`.
 - Mosaic Phase 2 `seqplatesolve mosaic -force -nocache` is required for panel stitching and is independent of the user-controllable per-panel distortion-correction setting.
 - Drizzle per panel intentionally forces two-pass registration and uses `seqapplyreg` for drizzle output.
@@ -113,6 +113,7 @@ The following areas should be revalidated before major changes:
 - Verbose child Python stdout/stderr can fill the pipes while Siril waits for `pyscript`. Runtime diagnostics and third-party Python warnings go to run files; native Siril command logging remains available.
 - Library `%s` expansion trims leading/trailing spaces and replaces internal spaces with underscores. Common numeric/header substitutions and documented aliases are fingerprinted. Unsupported expressions are never guessed for reuse or recovery.
 - Mosaic canvas budgeting uses the solved RGB images' **two-dimensional** celestial WCS (`WCS(..., naxis=2)`), with allowance for uncertainty. It does not modify registration geometry.
+- When a managed distortion solve fails on frame 1, the runtime may load a bounded set of alternate sequence members and repeat `parse` plus `platesolve`. After a successful alternate solve it emits `setref <sequence> <one-based-image-number>` before `register`, so star matching and the distortion model use the same viable reference frame.
 
 Sources: [commands and argument quoting](https://siril.readthedocs.io/en/stable/Commands.html), [FITS compression](https://siril.readthedocs.io/en/stable/file-formats/FITS.html#compression), [path parsing](https://siril.readthedocs.io/en/stable/Pathparsing.html), [Python API](https://siril.readthedocs.io/en/stable/Python-API.html). Failure propagation and buffered-pipe behavior were verified with the installed Windows Siril 1.4.4.
 

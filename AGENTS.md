@@ -10,6 +10,8 @@ The current active development script is:
 osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py
 ```
 
+`Rolandet-OSC-Stacking.py` is the distribution mirror uploaded to the upstream `siril-scripts` GitLab repository. Keep it source-equivalent to the active v3.0.1 script: every code change to either file must be applied to both, and the synchronization test must pass.
+
 `osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
 `README.md` is user-maintained. Do not overwrite it or replace its existing content. For repository overview/context, use `docs/repo-overview.md`.
@@ -35,10 +37,11 @@ The user often processes OSC data from multiple nights, including lights, darks,
 Before considering a code change complete:
 
 1. Run Python syntax checks.
-2. Test script generation against sample directory structures when available.
-3. Review generated Siril commands for Siril 1.4 compatibility.
-4. Confirm no unsupported commands such as `echo` are emitted into Siril scripts.
-5. Confirm output filenames and working directories are safe for Windows.
+2. Confirm `Rolandet-OSC-Stacking.py` and the active v3.0.1 script pass the synchronization test.
+3. Test script generation against sample directory structures when available.
+4. Review generated Siril commands for Siril 1.4 compatibility.
+5. Confirm no unsupported commands such as `echo` are emitted into Siril scripts.
+6. Confirm output filenames and working directories are safe for Windows.
 
 For documentation-only changes, do not run the app or execute Siril.
 

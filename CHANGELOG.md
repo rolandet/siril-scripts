@@ -28,6 +28,7 @@ All notable user-facing changes to this project should be documented here.
 
 ### Changed
 
+- Synchronized `Rolandet-OSC-Stacking.py`, the upstream Siril distribution script, with the active v3.0.1 implementation and added an automated source-equivalence guard for future changes.
 - `Remove Data (All Sessions)` now offers a checked-by-default option to delete completed `.osc_low_disk` run bundles, reports their size, removes the empty managed container, and protects unfinished, invalid, or unsafe bundles.
 - Renamed the legacy compression checkbox to `Compress Intermediates (Siril settings)`: its existing behavior uses Siril preferences and does not itself guarantee lossless floating-point compression.
 
@@ -60,6 +61,7 @@ All notable user-facing changes to this project should be documented here.
 
 ### Fixed
 
+- Fixed low-disk distortion registration stopping when the first frame of a night has too few detectable stars. The managed runner now tries a bounded set of well-spaced frames and makes the successfully plate-solved frame the Siril registration reference.
 - Restored Siril's current working directory to the project root after low-disk managed runs instead of leaving the receipt directory active.
 - Added total elapsed-time reporting to low-disk Siril API runs. The duration is now persisted in `state.json` and `run.log`, written to the Siril log, and shown in the completion dialog.
 - Updated the `Prepare Working Directory` tooltip to describe on-demand input aliases and scratch folders when `Low disk usage` is selected, while retaining the immediate per-session preparation description for `Keep intermediates`.

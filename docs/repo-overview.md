@@ -10,6 +10,8 @@ The current active development application script is:
 osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py
 ```
 
+`Rolandet-OSC-Stacking.py` is the source-equivalent distribution filename intended for the upstream `siril-scripts` GitLab repository. Changes to the active v3.0.1 script must also be applied there; `tests/test_script_sync.py` enforces normalized source equality.
+
 `osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
 `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py` is preserved as the pre-storage-optimization version. New storage work belongs in v3.0.1.

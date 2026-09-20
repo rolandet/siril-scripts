@@ -280,4 +280,6 @@ Choose **Uncompressed** or **Lossless GZIP2 (no quantization)** separately from 
 
 Use **Run / Resume in Siril** to retry the same bundle. Completed panels are reused only when their hashes and input/settings signatures match. Incomplete panels restart from raw inputs; Build starts a new run. Unknown library expressions disable flat reuse and require a new build for a retry. Keep intermediates remains useful for experimenting with already registered subframes.
 
+If the first frame of a night cannot be plate-solved for distortion correction, the managed runner tries up to eight well-spaced frames from that sequence. A successful alternate becomes the Siril registration reference. If none solves, the stage stops without deleting its prerequisites and reports the sequence-level failure.
+
 `state.json`, `run.log`, `python.log` and small sequence/WCS checkpoint records remain in each bundle. **Remove Data (All Sessions)** offers a checked-by-default option to remove completed bundles and reports their total size; unfinished, invalid, and unsafe bundles are retained. Abort requests stop at a command boundary; Siril's Stop button can interrupt an active API command. A failure never triggers an automatic retry through another execution mode.

@@ -215,6 +215,36 @@ class StorageRuntimeTests(unittest.TestCase):
             resumed.run()
             self.assertEqual(resumed.state['status'], 'complete')
 
+    def test_failed_first_plate_solve_retries_and_sets_registration_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bundle, _ = fixture(Path(tmp), panels=1)
+            runtime = runtime_for(bundle)
+            stage = next(s for s in bundle.stages if s['label'].endswith('night registration'))
+            runtime.current = stage
+            source = Path(stage['outputs'][0]['selected_from'])
+            source.parent.mkdir(parents=True, exist_ok=True)
+            for number in range(1, 5):
+                fits.writeto(source.with_name(f'{source.name}_{number:05d}.fit'),
+                             np.ones((3, 16, 24), dtype='float32'))
+            original = runtime.iface.cmd
+            attempts = 0
+
+            def fail_first(command):
+                nonlocal attempts
+                if command.startswith('platesolve '):
+                    attempts += 1
+                    if attempts == 1:
+                        runtime.iface.commands.append(command)
+                        raise RuntimeError('Not enough stars')
+                return original(command)
+
+            runtime.iface.cmd = fail_first
+            runtime.command('platesolve -force -disto=platesolve_data.wcs')
+            self.assertEqual(attempts, 2)
+            self.assertTrue(any(c.startswith('load "') and c.endswith('_00003.fit"')
+                                for c in runtime.iface.commands))
+            self.assertIn(f'setref {source.name} 3', runtime.iface.commands)
+
     def test_cancel_after_command_cannot_commit_or_clean_its_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, b, _ = fixture(Path(tmp), panels=1)
