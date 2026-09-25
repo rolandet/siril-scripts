@@ -9057,6 +9057,7 @@ class ProjectWidget(QtWidgets.QWidget):
                 project_data["distortion_correction_enabled"]
             )
             self._dirty = False
+            self.status_message.emit("Project saved.")
             return True
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save Project", f"Failed: {e}")

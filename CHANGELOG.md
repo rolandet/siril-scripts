@@ -61,6 +61,7 @@ All notable user-facing changes to this project should be documented here.
 
 ### Fixed
 
+- Saving a project now replaces the stale "Project has unsaved changes" status with "Project saved" after the file is written successfully.
 - Fixed low-disk distortion registration stopping when the first frame of a night has too few detectable stars. The managed runner now tries a bounded set of well-spaced frames and makes the successfully plate-solved frame the Siril registration reference.
 - Restored Siril's current working directory to the project root after low-disk managed runs instead of leaving the receipt directory active.
 - Added total elapsed-time reporting to low-disk Siril API runs. The duration is now persisted in `state.json` and `run.log`, written to the Siril log, and shown in the completion dialog.
