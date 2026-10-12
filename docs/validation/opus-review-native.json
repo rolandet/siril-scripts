@@ -1,0 +1,75 @@
+{
+  "siril": "1.4.4",
+  "calibration": [
+    {
+      "case": "raw bias",
+      "passed": true,
+      "shape": [
+        32,
+        48
+      ]
+    },
+    {
+      "case": "raw dark flat",
+      "passed": true,
+      "shape": [
+        32,
+        48
+      ]
+    },
+    {
+      "case": "compressed raw masters",
+      "passed": true,
+      "shape": [
+        32,
+        48
+      ]
+    },
+    {
+      "case": "quoted bias and dark",
+      "passed": true,
+      "shape": [
+        32,
+        48
+      ]
+    },
+    {
+      "case": "quoted flat and dark",
+      "passed": true,
+      "shape": [
+        32,
+        48
+      ]
+    }
+  ],
+  "canvas_scaling": [
+    {
+      "scale": 0.5,
+      "passed": true,
+      "shape": [
+        3,
+        16,
+        24
+      ]
+    },
+    {
+      "scale": 1.0,
+      "passed": true,
+      "shape": [
+        3,
+        32,
+        48
+      ]
+    },
+    {
+      "scale": 2.0,
+      "passed": true,
+      "shape": [
+        3,
+        64,
+        96
+      ]
+    }
+  ],
+  "passed": true
+}

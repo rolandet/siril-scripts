@@ -2,7 +2,7 @@
 
 ## Known issues and risky existing behavior
 
-- Mosaic canvas scaling currently saves `mosaic_final_scaled.fit`, but final promotion loads `mosaic_final.fit`. Treat this as existing behavior unless the user asks to change it.
+- Canvas Scale now applies to normal OSC mosaic finals. Narrowband mosaics use separate channel-stitching code and do not yet apply this setting.
 - The About dialog text appears to contain `winorized` instead of `winsorized`.
 - `MainWindow.__init__` appears to contain duplicated initial window sizing/centering logic.
 - The stack-method combo currently has four visible items, while `_stack_method_map` includes five indices. Generated stack commands use `map_stack_method()` and current text, but the stale map is a cleanup candidate.

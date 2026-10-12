@@ -2288,6 +2288,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # (Optional future auto-show hook; currently a no-op)
         QtCore.QTimer.singleShot(0, self.maybe_autoshow_quickstart)
+        QtCore.QTimer.singleShot(0, self.show_version_notice)
 
         self.resize(1100, 780)
 
@@ -2309,6 +2310,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         super().closeEvent(e)       # allow normal close + cleanup
 
+
+    def show_version_notice(self):
+        QtWidgets.QMessageBox.information(
+            self, "New version available",
+            "You are using OSC Multi-Night Stacking version 1.2.\n\n"
+            "We recommend switching to Rolandet-OSC-Stacking.py, the updated "
+            "version of this script. It includes calibration fixes, mosaic stacking, "
+            "Ha/OIII and SII/OIII extraction, and optional low disk usage.\n\n"
+            "Click OK to continue using version 1.2."
+        )
 
     def show_quick_start(self):
         dlg = QuickStartDialog(QUICK_START_MD, self)

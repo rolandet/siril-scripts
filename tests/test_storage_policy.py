@@ -2,6 +2,7 @@ import copy
 import importlib.util
 import json
 import os
+import runpy
 import shutil
 import sys
 import tempfile
@@ -19,7 +20,7 @@ sys.modules[SPEC.name] = M
 SPEC.loader.exec_module(M)
 
 
-def fixture(root, nights=2, panels=2):
+def fixture(root, nights=2, panels=2, canvas_scale=1.0):
     raw = root / 'raw'
     raw.mkdir()
     header = fits.Header({'BAYERPAT': 'RGGB', 'INSTRUME': 'Test', 'GAIN': 100, 'OFFSET': 8})
@@ -34,7 +35,7 @@ def fixture(root, nights=2, panels=2):
     project = M.Project(name='Test Mosaic', working_dir=str(root / 'work'), mosaic_enabled=True,
                         storage_policy='min_disk', use_master_library=False, allow_uncalibrated=True,
                         panel_background_extraction=True, distortion_correction_enabled=True,
-                        link_feather_to_overlap=False)
+                        link_feather_to_overlap=False, mosaic_canvas_scale=canvas_scale)
     project.sessions = [M.Session(name=f'Night {n}', master_bias=str(bias),
         panels=[M.Panel(panel_id=f'P{i}', lights=list(lights), flats=list(flats)) for i in range(panels)])
         for n in range(nights)]
@@ -218,7 +219,12 @@ class StorageRuntimeTests(unittest.TestCase):
     def test_failed_first_plate_solve_retries_and_sets_registration_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, bundle, _ = fixture(Path(tmp), panels=1)
-            runtime = runtime_for(bundle)
+            # Exercise the exported worker's globals, not just the application's
+            # imports: this catches omitted standard-library imports in worker.py.
+            worker = runpy.run_path(str(bundle.folder / "worker.py"))
+            runtime = worker["StorageRuntime"](bundle.manifest_path, None, reserve_bytes=0)
+            runtime.iface = FakeSiril(runtime)
+            runtime.log = lambda message: None
             stage = next(s for s in bundle.stages if s['label'].endswith('night registration'))
             runtime.current = stage
             source = Path(stage['outputs'][0]['selected_from'])
@@ -244,6 +250,20 @@ class StorageRuntimeTests(unittest.TestCase):
             self.assertTrue(any(c.startswith('load "') and c.endswith('_00003.fit"')
                                 for c in runtime.iface.commands))
             self.assertIn(f'setref {source.name} 3', runtime.iface.commands)
+
+    def test_scaled_outputs_are_owned_and_promoted_in_managed_runs(self):
+        for panels in (1, 2):
+            with self.subTest(panels=panels), tempfile.TemporaryDirectory() as tmp:
+                project, bundle, _ = fixture(Path(tmp), panels=panels, canvas_scale=0.5)
+                stage = bundle.stages[-1]
+                scaled = bundle.root / "mosaic" / "mosaic_final_scaled.fit"
+                self.assertIn(str(scaled), [a["path"] for a in stage["outputs"]])
+                mirror = stage["commands"].index("mirrorx -bottomup")
+                self.assertEqual(stage["commands"][mirror - 1], 'load "mosaic_final_scaled.fit"')
+                runtime = runtime_for(bundle)
+                runtime.run()
+                self.assertTrue(Path(bundle.plan["final"]).is_file())
+                self.assertTrue((Path(project.working_dir) / "Night 0" / "P0" / "process" / scaled.name).is_file())
 
     def test_cancel_after_command_cannot_commit_or_clean_its_input(self):
         with tempfile.TemporaryDirectory() as tmp:

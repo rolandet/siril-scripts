@@ -99,3 +99,9 @@ Also run exported SSF failure/receipt tests and the `_StorageThread` API path ag
 `--controlled-no-dither` is a test-only comparison switch: with `--background on`, it appends `-nodither` to both baseline and managed `seqsubsky` commands. It is never enabled by the application. Use this to investigate random background dithering, not to change production image settings.
 
 For the native API/Abort/recovery check, launch `pyscript "<repo>/tests/integration_storage_api.py" "<small-project.json>" "<new-output-directory>"` inside Siril. Read the resulting `report.json` and require `passed: true`, because Siril 1.4.4 ignores Python exit status. Supply absolute paths when launching CLI scripts; Siril starts in its configured working directory.
+
+## Calibration and Canvas Scale regression checks
+
+`tests/test_review_fixes.py` covers raw-master fallback and explicit-master priority, paths with spaces in OSC/mosaic/NB/broadband commands, dependency import order and installer failure, final scaled-image selection, and live working-directory lookup without launching the CLI. Storage tests exercise alternate plate-solving through the generated worker's own imports and verify scaled-output ownership/promotion for one and two panels.
+
+For an opt-in native smoke test, run `python -B tests/integration_review_fixes.py --config <config.1.4.ini> --report <new-report.json>` with Siril's Python environment. It creates synthetic FITS in a checked temporary directory, uses private config copies, and checks five calibration cases plus scales 0.5, 1.0, and 2.0. Flat fixtures have spatial variation because Siril normalization cannot operate on zero-MAD constant flats. No user image data is read. This smoke test stops before star registration and does not replace native multi-night mosaic validation.

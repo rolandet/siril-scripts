@@ -62,6 +62,8 @@ Calibration frame priority is:
 
 The validator warns for missing darks, missing flats, and raw flats that lack bias or dark-flat support. The user can explicitly allow uncalibrated processing.
 
+In standard non-mosaic OSC processing, freshly stacked raw darks are used when no explicit dark master is resolved. Raw dark-flats, then raw biases, support flat calibration when no explicit flat-calibration master is resolved. These generated masters precede automatic `$defdark` / `$defbias` fallbacks. The existing preference for a freshly calibrated `pp_flat_stacked` over a supplied flat is preserved. Explicit calibration paths are emitted as quoted whole option tokens so spaces in Windows folders are supported.
+
 ## Non-mosaic generated Siril pipeline
 
 For standard multi-session processing, the generated `.ssf` script:
@@ -240,6 +242,8 @@ If `astropy` is not available, geometry preflight is skipped.
 
 ## Running Siril
 
+When `sirilpy` is available, startup calls `ensure_installed("PyQt6", "astropy")` before importing those dependencies. The standalone CLI-fallback application can still run without `sirilpy` using already installed Python dependencies. Live Siril working-directory detection uses `get_siril_wd()`. Exported low-disk workers ensure Astropy is installed separately and include their own `shlex` import for alternate plate-solve references.
+
 The Run action:
 
 - Requires `run_project.ssf` to exist.
@@ -264,7 +268,7 @@ Abort behavior is intended for CLI runs. On Windows it sends `CTRL_BREAK_EVENT`;
 - The final image is intentionally mirrored with `mirrorx -bottomup` before saving.
 - The script currently uses a single-file application structure.
 - Build and run operations intentionally preserve dirty-state behavior where noted in code.
-- Current mosaic canvas scaling saves `mosaic_final_scaled.fit`, but final promotion still loads `mosaic_final.fit`; treat this as existing behavior unless changing it explicitly.
+- OSC mosaic canvas scaling saves `mosaic_final_scaled.fit` and promotes that image to the project final when the scale differs from 1.0. This applies to single-panel, multi-panel, and managed low-disk OSC outputs.
 - The About dialog text appears to contain a typo: `winorized` instead of `winsorized`.
 - There is duplicated initial window sizing/centering code in `MainWindow.__init__`; this is harmless but could be cleaned later.
 

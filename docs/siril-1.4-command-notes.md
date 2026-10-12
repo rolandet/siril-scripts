@@ -123,3 +123,15 @@ The exported launcher first enters an empty failure directory. Only a successful
 Siril/CFITSIO on Windows rejected a staged FITS path at the long-path boundary during validation. Managed run/session names are short; building rejects staged input paths of 260 or more characters and asks for a shorter working directory.
 
 `seqsubsky` adds dithering by default. The validation harness can add the documented `-nodither` option to **both test paths** to isolate storage/compression behavior; production commands keep the existing dithering behavior.
+
+## October 2026 review fixes
+
+- All explicit OSC, mosaic, narrowband, and broadband calibration paths quote the whole option token, for example `calibrate light "-dark=C:/Calibration Masters/dark master.fit" "-flat=C:/Calibration Masters/flat master.fit" -cfa`. Automatic library variables and simple local generated-master names retain their existing syntax.
+- Standard non-mosaic OSC processing now uses its freshly generated `dark_stacked` for light calibration and `df_stacked` or `bias_stacked` for flat calibration before automatic library fallbacks. Dark-flats use `-dark=df_stacked`; biases use `-bias=bias_stacked`. Resolved explicit masters retain priority.
+- Canvas Scale keeps the existing `resample <factor>` command, then promotes `mosaic_final_scaled.fit` through the final `mirrorx -bottomup` and project save. A scale of 1.0 continues to promote `mosaic_final.fit`.
+- `SirilInterface.cmd()` executes commands but does not return printed console text. Use `get_siril_wd()` to request the live working directory.
+- Call `sirilpy.ensure_installed` before importing external dependencies in Siril. The application requests PyQt6 and Astropy; the standalone exported worker only needs Astropy. Worker installer output is suppressed before runtime initialization so it cannot fill Siril's buffered Python pipes; failures still propagate and prevent completion.
+
+Validated against installed Windows Siril 1.4.4 and its `sirilpy` implementation. Synthetic native checks confirmed bias/dark-flat subtraction, dark subtraction and flat division, compressed generated masters, quoted master paths, and final dimensions/orientation at scales 0.5, 1.0, and 2.0. See `validation/opus-review-native.json` and `tests/integration_review_fixes.py`.
+
+Sources: [calibration and resampling commands](https://siril.readthedocs.io/en/stable/Commands.html), [working-directory and dependency APIs](https://siril.readthedocs.io/en/stable/Python-API.html).

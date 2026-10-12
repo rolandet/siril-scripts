@@ -39,6 +39,16 @@ import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+
+# Siril supplies its package installer; standalone launches keep using their
+# existing Python environment when sirilpy is unavailable.
+try:
+    import sirilpy as s
+except Exception:
+    s = None
+if s is not None:
+    s.ensure_installed("PyQt6", "astropy")
+
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from collections import Counter
@@ -264,12 +274,6 @@ def preflight_geometry(lights_dir: Path, process_dir: Path,
     if mf_g and mf_g != (W, H):
         logger(f"[preflight] WARNING: master flat {master_flat.name} is {mf_g[0]}x{mf_g[1]} "
                f"but lights are {W}x{H}")
-
-# Optional: Siril Python API
-try:
-    import sirilpy as s
-except Exception:
-    s = None
 
 FRAME_TYPES = ["lights", "bias", "darks", "flats", "dark_flats"]
 NB_FRAME_TYPES = list(FRAME_TYPES)
@@ -813,6 +817,10 @@ def safe_slug(name: str) -> str:
 def siril_arg(p: str) -> str:
     """Return a Siril-friendly path (POSIX slashes), no quotes, keep extension."""
     return Path(p).as_posix()
+
+def siril_path_option(option: str, path) -> str:
+    """Quote the entire option token so Siril preserves paths with spaces."""
+    return f'"{option}={siril_arg(path)}"'
 
 def safe_link_or_copy(src: Path, dst: Path) -> Tuple[bool, str]:
     """Try symlink -> hardlink -> copy."""
@@ -1867,8 +1875,14 @@ def storage_runtime_entry():
     """Exported SSF entrypoint; failure never enters a previous receipt folder."""
     manifest = Path(sys.argv[1]).absolute()
     started = next((int(arg.split("=", 1)[1]) for arg in sys.argv[2:] if arg.startswith("--started=")), None)
-    runtime = StorageRuntime(manifest, None, started_ns=started)
     import sirilpy
+    import contextlib
+    # pip can be verbose; avoid filling the launcher's buffered Python pipes.
+    # Installer exceptions still propagate and prevent a completion receipt.
+    with open(os.devnull, "w") as quiet:
+        with contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+            sirilpy.ensure_installed("astropy")
+    runtime = StorageRuntime(manifest, None, started_ns=started)
     iface = sirilpy.SirilInterface()
     iface.connect()
     try:
@@ -2027,16 +2041,8 @@ class LowDiskMosaicPlan:
         for line in lines:
             if not line.strip() or line.lstrip().startswith("#") or line.startswith("requires "):
                 continue
-            # Quote explicit calibration paths before tokenizing the legacy command.
+            # The shared emitter quotes whole calibration option tokens.
             if line.startswith("calibrate "):
-                masters_to_quote = {Path(getattr(sess.panels[0], field)).as_posix()
-                    for sess in shadow.sessions
-                    for field in ("master_dark", "master_flat", "master_bias", "master_darkflat")
-                    if getattr(sess.panels[0], field, None)}
-                for value in sorted(masters_to_quote, key=len, reverse=True):
-                    for flag in ("-dark=", "-bias=", "-flat="):
-                        pattern = r'(?<!\S)' + re.escape(flag + value) + r'(?=\s|$)'
-                        line = re.sub(pattern, lambda match: '"' + match[0] + '"', line)
                 for arg in shlex.split(line):
                     if arg.startswith(("-dark=", "-bias=", "-flat=")):
                         value = arg.split("=", 1)[1]
@@ -2185,7 +2191,7 @@ class LowDiskMosaicPlan:
             commands = ["cd " + self.quote(mosaic), "setcompress 0"] + commands[split2:]
         outputs = [self.artifact(mosaic / "mosaic_final.fit", "file"),
                    self.artifact(mosaic / final_name, "file")]
-        if len(self.finals) > 1 and abs(self.project.mosaic_canvas_scale - 1) > 1e-6:
+        if abs(self.project.mosaic_canvas_scale - 1) > 1e-6:
             outputs.append(self.artifact(mosaic / "mosaic_final_scaled.fit", "file"))
         destinations = [str(Path(self.finals[0]).parent / "mosaic_final.fit"), str(self.work / final_name)]
         if len(outputs) > 2:
@@ -2239,7 +2245,7 @@ class LowDiskMosaicPlan:
         self.folder.mkdir(parents=True, exist_ok=False)
         (self.folder / "failure_gate").mkdir()
         self.manifest_path.write_text(json.dumps(self.plan, indent=2), encoding="utf-8")
-        header = "import hashlib, json, math, os, re, shutil, stat, sys, time\nfrom pathlib import Path\n"
+        header = "import hashlib, json, math, os, re, shlex, shutil, stat, sys, time\nfrom pathlib import Path\n"
         definitions = {node.name: node for node in ast.parse(_STORAGE_LOADED_SOURCE).body
                        if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
         worker = header + "\n\n".join(ast.get_source_segment(_STORAGE_LOADED_SOURCE, definitions[name])
@@ -2388,7 +2394,7 @@ class SirilCommandBuilder:
         if produced_flat:
             return " -flat=pp_flat_stacked"
         if getattr(sess, "master_flat", None):
-            return f" -flat={siril_arg(sess.master_flat)}"
+            return " " + siril_path_option("-flat", sess.master_flat)
         if p.use_master_library:
             return " -flat=$defflat"
         return ""
@@ -2460,17 +2466,17 @@ class SirilCommandBuilder:
         g_mdf = to_path_or_none(getattr(group, "master_dark_flat", None))
         g_mb = to_path_or_none(getattr(group, "master_bias", None))
         if g_mdf:
-            return f'-dark={g_mdf.as_posix()}'
+            return siril_path_option('-dark', g_mdf.as_posix())
         if g_mb:
-            return f'-bias={g_mb.as_posix()}'
+            return siril_path_option('-bias', g_mb.as_posix())
         if mdf:
-            return f'-dark={mdf.as_posix()}'
+            return siril_path_option('-dark', mdf.as_posix())
         if mb:
-            return f'-bias={mb.as_posix()}'
+            return siril_path_option('-bias', mb.as_posix())
         if "darkflat" in shared_masters:
-            return f'-dark={shared_masters["darkflat"]}'
+            return siril_path_option('-dark', shared_masters["darkflat"])
         if "bias" in shared_masters:
-            return f'-bias={shared_masters["bias"]}'
+            return siril_path_option('-bias', shared_masters["bias"])
         if p.use_master_library:
             return "-bias=$defbias"
         return None
@@ -2492,23 +2498,23 @@ class SirilCommandBuilder:
         flat_used = False
 
         if g_md:
-            parts.append(f'-dark={g_md.as_posix()}')
+            parts.append(siril_path_option('-dark', g_md.as_posix()))
             use_dark_cc = True
         elif md:
-            parts.append(f'-dark={md.as_posix()}')
+            parts.append(siril_path_option('-dark', md.as_posix()))
             use_dark_cc = True
         elif "dark" in shared_masters:
-            parts.append(f'-dark={shared_masters["dark"]}')
+            parts.append(siril_path_option('-dark', shared_masters["dark"]))
             use_dark_cc = True
         elif p.use_master_library:
             parts.append("-dark=$defdark")
             use_dark_cc = True
 
         if g_mf:
-            parts.append(f'-flat={g_mf.as_posix()}')
+            parts.append(siril_path_option('-flat', g_mf.as_posix()))
             flat_used = True
         elif mf:
-            parts.append(f'-flat={mf.as_posix()}')
+            parts.append(siril_path_option('-flat', mf.as_posix()))
             flat_used = True
         elif made_pp_flat:
             parts.append("-flat=pp_flat_stacked")
@@ -2533,13 +2539,13 @@ class SirilCommandBuilder:
     ) -> Optional[str]:
         md, mf, mb, mdf = _resolve_cal_paths(p, sess, panel=panel)
         if mdf:
-            return f'-dark={mdf.as_posix()}'
+            return siril_path_option('-dark', mdf.as_posix())
         if mb:
-            return f'-bias={mb.as_posix()}'
+            return siril_path_option('-bias', mb.as_posix())
         if "darkflat" in shared_masters:
-            return f'-dark={shared_masters["darkflat"]}'
+            return siril_path_option('-dark', shared_masters["darkflat"])
         if "bias" in shared_masters:
-            return f'-bias={shared_masters["bias"]}'
+            return siril_path_option('-bias', shared_masters["bias"])
         if p.use_master_library:
             return "-bias=$defbias"
         return None
@@ -2558,10 +2564,10 @@ class SirilCommandBuilder:
         flat_used = False
 
         if md:
-            parts.append(f'-dark={md.as_posix()}')
+            parts.append(siril_path_option('-dark', md.as_posix()))
             use_dark_cc = True
         elif "dark" in shared_masters:
-            parts.append(f'-dark={shared_masters["dark"]}')
+            parts.append(siril_path_option('-dark', shared_masters["dark"]))
             use_dark_cc = True
         elif p.use_master_library:
             parts.append("-dark=$defdark")
@@ -2571,7 +2577,7 @@ class SirilCommandBuilder:
             parts.append("-flat=pp_flat_stacked")
             flat_used = True
         elif mf:
-            parts.append(f'-flat={mf.as_posix()}')
+            parts.append(siril_path_option('-flat', mf.as_posix()))
             flat_used = True
         elif p.use_master_library:
             parts.append("-flat=$defflat")
@@ -2640,9 +2646,9 @@ class SirilCommandBuilder:
         )
 
         parts = self._nb_broadband_light_calibration_parts(p, sess, panel, shared_masters, made_pp_flat)
-        if "-dark=$defdark" not in parts and not any(x.startswith("-dark=") for x in parts):
+        if "-dark=$defdark" not in parts and not any(x.lstrip('"').startswith("-dark=") for x in parts):
             _warn(L, f"{unit_label} / OSC broadband: no dark for lights")
-        if "-flat=$defflat" not in parts and not any(x.startswith("-flat=") for x in parts):
+        if "-flat=$defflat" not in parts and not any(x.lstrip('"').startswith("-flat=") for x in parts):
             _warn(L, f"{unit_label} / OSC broadband: no flat for lights")
         L.append(" ".join(parts))
 
@@ -2847,9 +2853,9 @@ class SirilCommandBuilder:
         )
 
         parts = self._nb_light_calibration_parts(p, sess, panel, group, effective_masters, made_pp_flat)
-        if "-dark=$defdark" not in parts and not any(x.startswith("-dark=") for x in parts):
+        if "-dark=$defdark" not in parts and not any(x.lstrip('"').startswith("-dark=") for x in parts):
             _warn(L, f"{unit_label} / {NB_GROUP_LABELS[group_key]}: no dark for NB lights")
-        if "-flat=$defflat" not in parts and not any(x.startswith("-flat=") for x in parts):
+        if "-flat=$defflat" not in parts and not any(x.lstrip('"').startswith("-flat=") for x in parts):
             _warn(L, f"{unit_label} / {NB_GROUP_LABELS[group_key]}: no flat for NB lights")
         L.append(" ".join(parts))
         L.append("seqextract_HaOIII pp_light -resample=ha")
@@ -3796,15 +3802,19 @@ class SirilCommandBuilder:
                 _md, _mf, _mb, _mdf = _resolve_cal_paths(self.project, sess, panel=None)
 
                 # Builder only logs; validator already prompted the user
-                if not (_mdf or _mb or p.use_master_library):
+                if not (_mdf or _mb or have_raw_dflats or have_raw_bias or p.use_master_library):
                     _warn(L, f"{sess.name}: calibrating flats WITHOUT bias/dark-flat (validator already warned)")
 
                 flat_cal_parts = ["calibrate", "flat"]
                 if _mdf:
                     # Dark-flat provided: in Siril this is passed with -dark= (it’s just a dark matched to flat exposure)
-                    flat_cal_parts.append(f'-dark={_mdf.as_posix()}')
+                    flat_cal_parts.append(siril_path_option('-dark', _mdf.as_posix()))
                 elif _mb:
-                    flat_cal_parts.append(f'-bias={_mb.as_posix()}')
+                    flat_cal_parts.append(siril_path_option('-bias', _mb.as_posix()))
+                elif have_raw_dflats:
+                    flat_cal_parts.append("-dark=df_stacked")
+                elif have_raw_bias:
+                    flat_cal_parts.append("-bias=bias_stacked")
                 elif p.use_master_library:
                     # Best-effort library bias; Siril exposes $defbias, not a dark-flat variable
                     flat_cal_parts.append("-bias=$defbias")
@@ -3845,7 +3855,7 @@ class SirilCommandBuilder:
             use_lib = bool(getattr(p, "use_master_library", False))
 
             # What do we actually have available?
-            has_dark = bool(md) or use_lib
+            has_dark = bool(md) or have_raw_darks or use_lib
             has_flat = bool(mf) or bool(made_pp_flat) or use_lib
 
             if not has_dark and not has_flat:
@@ -3860,7 +3870,10 @@ class SirilCommandBuilder:
 
             # DARK
             if md:
-                parts.append(f'-dark={md.as_posix()}')
+                parts.append(siril_path_option('-dark', md.as_posix()))
+                use_dark_cc = True
+            elif have_raw_darks:
+                parts.append("-dark=dark_stacked")
                 use_dark_cc = True
             elif use_lib:
                 parts.append("-dark=$defdark")
@@ -3874,7 +3887,7 @@ class SirilCommandBuilder:
                 parts.append('-flat=pp_flat_stacked')
                 flat_used = True
             elif mf:
-                parts.append(f'-flat={mf.as_posix()}')
+                parts.append(siril_path_option('-flat', mf.as_posix()))
                 flat_used = True
             elif use_lib:
                 parts.append("-flat=$defflat")
@@ -4157,9 +4170,9 @@ class SirilCommandBuilder:
 
                     cal_flat = ["calibrate", "flat"]
                     if mdf:
-                        cal_flat.append(f'-dark={Path(mdf).as_posix()}')
+                        cal_flat.append(siril_path_option('-dark', Path(mdf).as_posix()))
                     elif mb:
-                        cal_flat.append(f'-bias={Path(mb).as_posix()}')
+                        cal_flat.append(siril_path_option('-bias', Path(mb).as_posix()))
                     elif bool(getattr(p, "use_master_library", False)):
                         cal_flat.append("-bias=$defbias")
                     L.append(" ".join(cal_flat))
@@ -4203,7 +4216,7 @@ class SirilCommandBuilder:
                 # DARK
                 use_dark_cc = False
                 if md:
-                    parts.append(f'-dark={md.as_posix()}')
+                    parts.append(siril_path_option('-dark', md.as_posix()))
                     use_dark_cc = True
                 elif use_lib:
                     parts.append("-dark=$defdark")
@@ -4215,7 +4228,7 @@ class SirilCommandBuilder:
                     parts.append('-flat=pp_flat_stacked')
                     flat_used = True                
                 elif mf:
-                    parts.append(f'-flat={mf.as_posix()}')
+                    parts.append(siril_path_option('-flat', mf.as_posix()))
                     flat_used = True
                 elif use_lib:
                     parts.append("-flat=$defflat")
@@ -4390,6 +4403,19 @@ def emit_phase2_mosaic(
     - Stack to mosaic_final.fit, optionally resample, mirror + write {project}_final.fit at project root.
     """
 
+    def scale_mosaic_final() -> str:
+        try:
+            canvas_scale = float(getattr(p, "mosaic_canvas_scale", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            canvas_scale = 1.0
+        if abs(canvas_scale - 1.0) <= 1e-6:
+            return "mosaic_final.fit"
+        L.append('load "mosaic_final.fit"')
+        L.append(f"resample {canvas_scale:g}")
+        L.append('save "mosaic_final_scaled.fit"')
+        L.append("")
+        return "mosaic_final_scaled.fit"
+
     # Gather only the produced panel finals (skip any panels without output)
     finals = [f for f in (produced or []) if f]
 
@@ -4419,7 +4445,8 @@ def emit_phase2_mosaic(
         L.append('save "mosaic_final.fit"')
 
         proj_slug = safe_slug(getattr(p, "name", "project"))
-        L.append('load "mosaic_final.fit"')
+        final_source = scale_mosaic_final()
+        L.append(f'load "{final_source}"')
         L.append('mirrorx -bottomup')
         final_abs = (work / f"{proj_slug}_final.fit").as_posix()
         L.append(f'save "{final_abs}"')
@@ -4493,20 +4520,12 @@ def emit_phase2_mosaic(
     L.append(" ".join(cmd))
     L.append("")
 
-    # Optional canvas scaling
-    try:
-        canvas_scale = float(getattr(p, "mosaic_canvas_scale", 1.0) or 1.0)
-    except Exception:
-        canvas_scale = 1.0
-    if abs(canvas_scale - 1.0) > 1e-6:
-        L.append('load "mosaic_final.fit"')
-        L.append(f"resample {canvas_scale:g}")
-        L.append('save "mosaic_final_scaled.fit"')
-        L.append("")
+    # Optional canvas scaling; promote the selected image in either panel case.
+    final_source = scale_mosaic_final()
 
     # Promote mosaic final to project root and load it
     proj_slug = safe_slug(getattr(p, "name", "project"))
-    L.append('load "mosaic_final.fit"')
+    L.append(f'load "{final_source}"')
     L.append('mirrorx -bottomup')
     final_abs = (work / f"{proj_slug}_final.fit").as_posix()
     L.append(f'save "{final_abs}"')
@@ -6282,7 +6301,7 @@ class ProjectWidget(QtWidgets.QWidget):
         """
         Resolve a sensible default working directory:
 
-        1) If we're running from Siril (sirilpy connected), ask the live Siril console for `pwd`.
+        1) If we're running from Siril (sirilpy connected), use its working-directory API.
         2) Otherwise, try `siril-cli` by running a tiny temp script that prints `pwd`.
         3) Fallback to os.getcwd(), then user home as a last resort.
 
@@ -6305,8 +6324,8 @@ class ProjectWidget(QtWidgets.QWidget):
         # --- 1) Live Siril via sirilpy (best signal of the GUI's current dir) ---
         try:
             if getattr(self, "siril", None) and getattr(self.siril, "iface", None):
-                out = self.siril.iface.cmd("pwd")
-                cand = _parse_pwd(out)
+                out = self.siril.iface.get_siril_wd()
+                cand = os.path.normpath(out) if out else None
                 if cand and os.path.isdir(cand):
                     return cand
         except Exception:

@@ -6,6 +6,7 @@ All notable user-facing changes to this project should be documented here.
 
 ### Added
 
+- Added a startup notice to `osc-multi-night-stacking-v1.2.py` recommending `Rolandet-OSC-Stacking.py`; dismissing it continues into the existing v1.2 application.
 - Created `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py` for the storage improvements; preserved v3.0 unchanged.
 - Added opt-in `Low disk usage` for normal OSC mosaics on Siril 1.4.4: finish each panel across its nights, validate outputs, then remove run-owned temporary sequences. Both registration stages and all image-processing settings are retained.
 - Added within-run, within-session reuse of identical flat calculations, isolated scratch bundles, source/master fingerprints, atomic checkpoints, completed-panel recovery, and free-space checks with a configurable reserve (20 GiB by default).
@@ -61,6 +62,12 @@ All notable user-facing changes to this project should be documented here.
 
 ### Fixed
 
+- Fixed standard OSC non-mosaic calibration ignoring freshly stacked raw darks, biases, and dark-flats. Explicit master choices retain priority; generated masters are used before automatic Master Library variables.
+- Fixed calibration paths containing spaces in OSC, mosaic, narrowband, and broadband commands by quoting the entire `-dark=`, `-bias=`, or `-flat=` option.
+- Fixed exported low-disk workers missing the `shlex` import required to retry distortion plate-solving on alternate frames.
+- Added Siril's `ensure_installed` dependency setup before importing PyQt6 and Astropy; exported workers also ensure Astropy is available before creating the runtime.
+- Fixed OSC mosaic Canvas Scale being ignored when promoting the final image. Single-panel and multi-panel outputs now use the scaled image, including managed low-disk output promotion.
+- Fixed live Siril working-directory detection to use `get_siril_wd()` instead of expecting console output from `cmd("pwd")`.
 - Saving a project now replaces the stale "Project has unsaved changes" status with "Project saved" after the file is written successfully.
 - Fixed low-disk distortion registration stopping when the first frame of a night has too few detectable stars. The managed runner now tries a bounded set of well-spaced frames and makes the successfully plate-solved frame the Siril registration reference.
 - Restored Siril's current working directory to the project root after low-disk managed runs instead of leaving the receipt directory active.
