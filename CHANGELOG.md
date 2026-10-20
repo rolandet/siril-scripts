@@ -6,6 +6,7 @@ All notable user-facing changes to this project should be documented here.
 
 ### Added
 
+- Added live low-disk startup feedback with verified file counts, GiB read, and elapsed time, plus calibration-library and resume-check status in the application and Siril progress display.
 - Added a startup notice to `osc-multi-night-stacking-v1.2.py` recommending `Rolandet-OSC-Stacking.py`; dismissing it continues into the existing v1.2 application.
 - Created `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py` for the storage improvements; preserved v3.0 unchanged.
 - Added opt-in `Low disk usage` for normal OSC mosaics on Siril 1.4.4: finish each panel across its nights, validate outputs, then remove run-owned temporary sequences. Both registration stages and all image-processing settings are retained.

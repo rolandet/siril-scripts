@@ -1175,14 +1175,55 @@ class StorageRuntime:
         self.current = None
 
     @staticmethod
-    def fingerprint(path):
+    def fingerprint(path, on_bytes=None):
         p = Path(path)
         st = p.stat()
         h = hashlib.sha256()
         with p.open("rb") as stream:
             for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                 h.update(block)
+                if on_bytes is not None:
+                    on_bytes(len(block))
         return {"path": str(p.resolve()), "size": st.st_size, "sha256": h.hexdigest()}
+
+    def verification_status(self, message, fraction=-1.0):
+        self.log("VERIFY " + message)
+        # Use Siril's API rather than stdout: exported pyscript pipes are buffered.
+        try:
+            self.iface.update_progress(message, fraction)
+        except Exception:
+            pass  # Feedback must not change verification or processing behavior.
+
+    def fingerprint_inputs(self, names, label):
+        names = list(names)
+        completed = checked_bytes = 0
+        started = last_update = time.monotonic()
+
+        def report(force=False):
+            nonlocal last_update
+            now = time.monotonic()
+            if not force and now - last_update < 1.0:
+                return
+            self.verification_status(
+                f"{label}: {completed:,}/{len(names):,} files; "
+                f"{checked_bytes / 2**30:.1f} GiB checked; "
+                f"elapsed {self.format_elapsed(now - started)}",
+                completed / len(names) if names else 1.0)
+            last_update = now
+
+        def on_bytes(size):
+            nonlocal checked_bytes
+            checked_bytes += size
+            report()
+
+        result = {}
+        report(force=True)
+        for name in names:
+            result[name] = self.fingerprint(name, on_bytes=on_bytes)
+            completed += 1
+            report()
+        report(force=True)
+        return result
 
     def safe_path(self, path, *, leaf_link=False, inside=True):
         """Validate every parent; never follow a directory junction during cleanup."""
@@ -1261,6 +1302,8 @@ class StorageRuntime:
     def library_dependencies(self, settings):
         """Fingerprint simple, exact library expansions; never guess expressions."""
         found, unresolved = set(), []
+        checked_headers = 0
+        started = last_update = time.monotonic()
         groups = {g["directory"]: g for g in self.plan["inputs"]}
         token = re.compile(r"\$([A-Za-z0-9_-]+):(%(?:0?\d+)?(?:\.\d+)?[sdf])\$")
         for stage in self.plan["stages"]:
@@ -1299,6 +1342,13 @@ class StorageRuntime:
                             raise
                         except (KeyError, TypeError, ValueError, StopIteration):
                             unresolved.append(template)
+                        checked_headers += 1
+                        now = time.monotonic()
+                        if now - last_update >= 1.0:
+                            self.verification_status(
+                                f"Resolving calibration library: {checked_headers:,} headers checked; "
+                                f"elapsed {self.format_elapsed(now - started)}")
+                            last_update = now
         return found, unresolved
 
     def probe_symlinks(self):
@@ -1741,19 +1791,21 @@ class StorageRuntime:
                 self.safe_path(folder).mkdir(parents=True, exist_ok=True)
             self.log("BEGIN " + self.plan["id"])
             self.command("requires 1.4.4")
-            dependencies = {}
+            self.verification_status("Preparing input verification...")
             for name in self.plan["protected"]:
                 self.protected.add(str(Path(name).absolute()))
                 self.protected.add(str(Path(name).resolve(strict=True)))
                 if Path(name).resolve().is_relative_to(self.root):
                     raise ValueError("An input/master cannot be inside this run's scratch directory")
-                dependencies[name] = self.fingerprint(name)
+            dependencies = self.fingerprint_inputs(self.plan["protected"], "Verifying inputs")
+            self.verification_status("Checking Siril settings and resolving calibration library...")
             settings = self.configuration()
             library, unresolved = self.library_dependencies(settings)
             for name in library:
                 self.protected.add(name)
                 self.protected.add(str(Path(name).resolve()))
-                dependencies[name] = self.fingerprint(name)
+            if library:
+                dependencies.update(self.fingerprint_inputs(sorted(library), "Verifying calibration masters"))
             self.library_resolved = not unresolved
             if unresolved:
                 self.log("Library expression cannot be fingerprinted: flat reuse and panel resume disabled")
@@ -1768,7 +1820,13 @@ class StorageRuntime:
             self.dependency_stats = {n: (Path(n).stat().st_size, Path(n).stat().st_mtime_ns) for n in dependencies}
             self.state["configuration"] = settings
             self.write_state()
-            complete = {key for key, value in self.state["panels"].items() if self.output_valid(value)}
+            complete = set()
+            for index, (key, value) in enumerate(self.state["panels"].items()):
+                self.verification_status(
+                    f"Checking completed panels for resume: {index}/{len(self.state['panels'])}")
+                if self.output_valid(value):
+                    complete.add(key)
+            self.verification_status("Input verification complete; preparing processing stages...")
             # Restart incomplete panels from raw inputs, preserving completed panel products.
             incomplete = [name for name, rec in self.state["owned"].items()
                           if rec["panel"] not in complete and rec["panel"] != "__shared__"]
@@ -5811,8 +5869,11 @@ class ProjectWidget(QtWidgets.QWidget):
 
         # Run mode label
         self.lbl_run_mode = QtWidgets.QLabel("Run mode: not started")
+        self.lbl_run_mode.setWordWrap(True)
+        self.lbl_run_mode.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                       QtWidgets.QSizePolicy.Policy.Preferred)
         self.lbl_run_mode.setToolTip(
-            "Shows whether the last run used the Siril Python API or siril-cli."
+            "Shows the run mode, input verification progress, and current processing stage."
         )
         self.lbl_run_mode.setStyleSheet("color: #666666; font-style: italic;")
 
@@ -6158,14 +6219,14 @@ class ProjectWidget(QtWidgets.QWidget):
         bottom = QtWidgets.QHBoxLayout()
         bottom.addWidget(self.btn_prepare)
         bottom.addWidget(self.btn_build_script)
-        bottom.addWidget(self.lbl_run_mode)
         bottom.addStretch(1)
         bottom.addWidget(self.btn_run_siril)
         bottom.addWidget(self.btn_abort)
 
         # ---------------- Main layout ----------------
         main = QtWidgets.QVBoxLayout(self)
-        main.addWidget(splitter)
+        main.addWidget(splitter, 1)
+        main.addWidget(self.lbl_run_mode)
         main.addLayout(bottom)
         self._set_initial_list_heights(rows=6)
 
@@ -8494,13 +8555,19 @@ class ProjectWidget(QtWidgets.QWidget):
             self.btn_abort.setEnabled(False)
             self._sync_storage_controls()
 
+    def _on_storage_status(self, text):
+        if text.startswith("VERIFY "):
+            self.lbl_run_mode.setText(text[len("VERIFY "):])
+        elif text.startswith("STAGE "):
+            self.lbl_run_mode.setText(text)
+
     def _run_storage_api(self, manifest):
         self._managed_manifest = manifest
         self._managed_started_ns = time.time_ns()
         self._set_storage_busy(True)
-        self.lbl_run_mode.setText("Run mode: Siril API / low disk usage")
+        self.lbl_run_mode.setText("Preparing input verification...")
         self._storage_thread = _StorageThread(manifest, self.siril.iface, self, started_ns=self._managed_started_ns)
-        self._storage_thread.status.connect(lambda text: self.lbl_run_mode.setText(text) if text.startswith("STAGE ") else None)
+        self._storage_thread.status.connect(self._on_storage_status)
         def finished():
             error = self._storage_thread.error
             plan = None

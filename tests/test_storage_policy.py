@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -183,6 +184,30 @@ class StoragePolicyTests(unittest.TestCase):
 
 
 class StorageRuntimeTests(unittest.TestCase):
+    def test_verification_updates_within_a_file_without_changing_its_checksum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bundle, _ = fixture(Path(tmp), panels=1)
+            runtime = runtime_for(bundle)
+            source = Path(tmp) / 'large input.bin'
+            payload = b'123456789' * (1024 * 1024)
+            source.write_bytes(payload)
+            updates = []
+            runtime.iface.update_progress = lambda message, fraction: updates.append((message, fraction))
+            # Advance simulated time per chunk; no real delay or full image run.
+            with patch.object(M.time, 'monotonic', side_effect=[i * 0.4 for i in range(20)]):
+                result = runtime.fingerprint_inputs([str(source)], 'Verifying inputs')
+            self.assertEqual(result[str(source)], {
+                'path': str(source.resolve()), 'size': len(payload),
+                'sha256': hashlib.sha256(payload).hexdigest()})
+            self.assertEqual(len(updates), 3)  # Initial, throttled in-file update, completion.
+            self.assertIn('0/1 files', updates[1][0])
+            self.assertIn('elapsed 1s', updates[1][0])
+            self.assertIn('1/1 files', updates[-1][0])
+            self.assertEqual(updates[-1][1], 1.0)
+            # A missing/disconnected progress API must not prevent verification.
+            runtime.iface.update_progress = lambda *args: (_ for _ in ()).throw(RuntimeError('disconnected'))
+            self.assertEqual(runtime.fingerprint_inputs([str(source)], 'Verifying inputs'), result)
+
     def test_success_reuses_flats_cleans_sequences_preserves_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, b, _ = fixture(Path(tmp))
