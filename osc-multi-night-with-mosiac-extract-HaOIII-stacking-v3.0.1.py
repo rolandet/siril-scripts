@@ -5982,13 +5982,14 @@ class ProjectWidget(QtWidgets.QWidget):
         self.sp_mosaic_cols = QtWidgets.QSpinBox();  self.sp_mosaic_cols.setRange(1, 20)
         self.sp_mosaic_overlap = QtWidgets.QSpinBox(); self.sp_mosaic_overlap.setRange(0, 50); self.sp_mosaic_overlap.setSuffix(" %")
         gl = QtWidgets.QHBoxLayout()
+        gl.setContentsMargins(0, 0, 0, 0)
         gl.addWidget(QtWidgets.QLabel("Rows"));    gl.addWidget(self.sp_mosaic_rows)
         gl.addSpacing(8)
         gl.addWidget(QtWidgets.QLabel("Columns")); gl.addWidget(self.sp_mosaic_cols)
         gl.addSpacing(8)
         gl.addWidget(QtWidgets.QLabel("Overlap")); gl.addWidget(self.sp_mosaic_overlap)
-        glw = QtWidgets.QWidget(); glw.setLayout(gl)
-        mosaic_form.addWidget(glw, 1, 1, 1, 3)
+        # Let the grid size this row directly, without a wrapper's extra margins.
+        mosaic_form.addLayout(gl, 1, 1, 1, 3)
 
         mosaic_form.addWidget(QtWidgets.QLabel("Global Reference:"), 2, 0)
         self.cmb_mosaic_ref = QtWidgets.QComboBox(); self.cmb_mosaic_ref.setPlaceholderText("Select session/frame…")

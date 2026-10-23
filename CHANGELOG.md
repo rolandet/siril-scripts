@@ -63,6 +63,8 @@ All notable user-facing changes to this project should be documented here.
 
 ### Fixed
 
+- Fixed the Mosaic Processing Grid Layout row shrinking when switching processing tabs by laying out Rows, Columns, and Overlap directly in the mosaic grid without extra widget margins.
+
 - Fixed standard OSC non-mosaic calibration ignoring freshly stacked raw darks, biases, and dark-flats. Explicit master choices retain priority; generated masters are used before automatic Master Library variables.
 - Fixed calibration paths containing spaces in OSC, mosaic, narrowband, and broadband commands by quoting the entire `-dark=`, `-bias=`, or `-flat=` option.
 - Fixed exported low-disk workers missing the `shlex` import required to retry distortion plate-solving on alternate frames.
