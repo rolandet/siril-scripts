@@ -30,6 +30,7 @@ All notable user-facing changes to this project should be documented here.
 
 ### Changed
 
+- Updated the window title and About dialog to display version `3.0.2` in both the active development script and `Rolandet-OSC-Stacking.py`.
 - Synchronized `Rolandet-OSC-Stacking.py`, the upstream Siril distribution script, with the active v3.0.1 implementation and added an automated source-equivalence guard for future changes.
 - `Remove Data (All Sessions)` now offers a checked-by-default option to delete completed `.osc_low_disk` run bundles, reports their size, removes the empty managed container, and protects unfinished, invalid, or unsafe bundles.
 - Renamed the legacy compression checkbox to `Compress Intermediates (Siril settings)`: its existing behavior uses Siril preferences and does not itself guarantee lossless floating-point compression.

@@ -5,7 +5,7 @@
 # PARTICULAR PURPOSE. See the GNU General Public License for more details.
 # See <https://www.gnu.org/licenses/>.
 """
-Multi-Night Stacking for Siril 1.4 (PyQt6) - with Siril console integration (sirilpy) - version 3.0.1
+Multi-Night Stacking for Siril 1.4 (PyQt6) - with Siril console integration (sirilpy) - version 3.0.2
 
 What's inside:
 - JSON projects (persist drizzle options + 2-pass flag); new project starts with one session.
@@ -9177,7 +9177,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self._suppress_resize_dirty = True
-        self.setWindowTitle("OSC Multi-Night Stacking (Siril 1.4) Version 3.0.1")
+        self.setWindowTitle("OSC Multi-Night Stacking (Siril 1.4) Version 3.0.2")
 
         self.proj_widget = ProjectWidget()
         self.setCentralWidget(self.proj_widget)
@@ -9217,7 +9217,7 @@ class MainWindow(QtWidgets.QMainWindow):
         help_menu.addAction(about_action)
         about_action.triggered.connect(lambda: QtWidgets.QMessageBox.information(
             self, "About",
-            "OSC Multi-Night Stacking for Siril 1.4 (PyQt6) Version 3.0.1\n"
+            "OSC Multi-Night Stacking for Siril 1.4 (PyQt6) Version 3.0.2\n"
             "• Drizzle: Scaling, Pixel Fraction, Kernel\n"
             "• 2-pass registration toggle\n"
             "• Global stacking options (winsorized, sigma, or GESDT rejection; mean; median)\n"
