@@ -411,6 +411,9 @@ class StorageAdditionalSafetyTests(unittest.TestCase):
             self.assertEqual(runtime.iface.commands, [])
             self.assertFalse(runtime.receipt.exists())
             resumed = runtime_for(bundle)
+            # Windows clock ticks can cover both fake launches. Make this
+            # request explicitly older than the resumed invocation.
+            resumed.request_started_ns = int(runtime.cancel_path.read_text()) + 1
             resumed.run()
             self.assertEqual(resumed.state["status"], "complete")
 
@@ -548,9 +551,11 @@ class StorageUiTests(unittest.TestCase):
             widget._set_storage_busy(True)
             self.assertTrue(widget.btn_abort.isEnabled())
             self.assertFalse(widget.btn_build_script.isEnabled())
+            self.assertFalse(widget.btn_discard_low_disk.isEnabled())
             self.assertFalse(widget.action_open.isEnabled())
             widget._set_storage_busy(False)
             self.assertTrue(widget.btn_build_script.isEnabled())
+            self.assertTrue(widget.btn_discard_low_disk.isEnabled())
             self.assertFalse(widget.btn_abort.isEnabled())
         finally:
             widget.deleteLater()

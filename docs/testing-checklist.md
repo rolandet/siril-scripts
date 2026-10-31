@@ -87,6 +87,8 @@ Use this checklist before considering code changes complete. For documentation-o
 
 ## Managed storage validation
 
+`tests/test_low_disk_discard.py` covers explicit selection/confirmation, failed/cancelled cleanup, active project locks, status changes while confirming, malformed/foreign metadata, outside paths, OSC/NB input and retained-output protection, directory/metadata links, source file aliases, and retry after a locked scratch file. The storage UI test checks that discard is disabled during a managed run. No native Siril processing is needed for these cleanup checks.
+
 Run `python -B -m unittest discover -s tests -p "test_*.py" -v` using an environment with PyQt6, NumPy and Astropy (the Siril Python environment is suitable). Storage tests cover migration, scheduling, command options, flat-key identity, corrupted caches, changed inputs/settings, partial FITS, membership checks, unowned/replaced paths, symlinks, locked files, concurrent-run rejection, cancellation, recovery and UI state.
 
 For opt-in native comparisons use `tests/integration_storage.py --project <project.json> --output <new-test-directory> --siril <siril-cli.exe> --config <config.1.4.ini>`. It uses two nights, two panels, four lights and eight flats per unit by default, writes separate baseline/managed outputs and private config copies, and records image differences and sampled physical storage. `--background on --compression gzip2 --repeat-baseline` measures background-extraction repeatability as well. `--baseline-script` can point to an unchanged source snapshot. The output directory must be new. These are real processing runs, not part of ordinary unit tests.

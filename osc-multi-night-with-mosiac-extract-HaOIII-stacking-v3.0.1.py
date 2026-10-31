@@ -2385,6 +2385,8 @@ def _low_disk_tree_size(path):
             for entry in entries:
                 entry_stat = entry.stat(follow_symlinks=False)
                 if entry.is_symlink():
+                    if entry.is_dir():
+                        raise ValueError(f"Refusing a directory link in a run bundle: {entry.path}")
                     total += entry_stat.st_size
                 elif getattr(entry_stat, "st_file_attributes", 0) & 0x400:
                     raise ValueError(f"Refusing a reparse point in a run bundle: {entry.path}")
@@ -2424,6 +2426,114 @@ def _completed_low_disk_runs(work):
         except Exception:
             protected.append(run_dir.name)
     return low_disk_root, completed, protected
+
+
+def _failed_low_disk_run_info(work, run_dir, protected_paths=()):
+    """Validate one discardable bundle; never adopt arbitrary folders or inputs."""
+    work = Path(work).resolve()
+    root = work / ".osc_low_disk"
+    run_dir = Path(run_dir).absolute()
+    if run_dir.parent != root or not re.fullmatch(r"[0-9a-f]{16}", run_dir.name):
+        raise ValueError("Run is outside the project's managed directory")
+    for directory in (root, run_dir):
+        entry = directory.lstat()
+        if (not stat.S_ISDIR(entry.st_mode) or directory.is_symlink()
+                or getattr(entry, "st_file_attributes", 0) & 0x400):
+            raise ValueError(f"Unsafe run directory: {directory}")
+    for name in ("manifest.json", "state.json"):
+        path = run_dir / name
+        entry = path.lstat()
+        if (not stat.S_ISREG(entry.st_mode) or path.is_symlink()
+                or getattr(entry, "st_file_attributes", 0) & 0x400):
+            raise ValueError(f"Unsafe run metadata: {path}")
+    plan = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    if (plan.get("schema") != StorageRuntime.SCHEMA or state.get("schema") != StorageRuntime.SCHEMA
+            or plan.get("id") != run_dir.name or state.get("run_id") != run_dir.name
+            or Path(plan["work"]).resolve() != work
+            or Path(plan["scratch"]).absolute() != run_dir / "scratch"):
+        raise ValueError("Run metadata does not belong to this project and bundle")
+    if state.get("status") not in ("failed", "cancelled"):
+        raise ValueError("Only failed or cancelled runs can be discarded")
+
+    # Check original inputs, resolved library masters, retained products and the
+    # current project's selections, including paths into an older run bundle.
+    keep = list(protected_paths) + list(plan["protected"])
+    keep += [name for group in plan["inputs"] for name in group["files"]]
+    keep += [plan["final"]]
+    keep += [destination for stage in plan["stages"] for _source, destination in stage.get("promote", [])]
+    keep += list(state.get("dependencies", {})) + list(state.get("retained", {}))
+    keep += [name for panel in state.get("panels", {}).values() for name in panel]
+    for name in keep:
+        path = Path(name)
+        candidates = (path,) if path.is_absolute() else (work / path, Path.cwd() / path)
+        for candidate in candidates:
+            if candidate.absolute().is_relative_to(run_dir) or candidate.resolve().is_relative_to(run_dir):
+                raise ValueError(f"Run contains a configured input or retained output: {name}")
+    return state["status"], _low_disk_tree_size(run_dir)
+
+
+def _failed_low_disk_runs(work, protected_paths=()):
+    """List valid failed/cancelled bundles; invalid and running bundles stay hidden."""
+    root = Path(work).resolve() / ".osc_low_disk"
+    if not root.exists() or root.is_symlink() or getattr(root.lstat(), "st_file_attributes", 0) & 0x400:
+        return []
+    result = []
+    for run_dir in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if run_dir.name == "active.lock":
+            continue
+        try:
+            status, size = _failed_low_disk_run_info(work, run_dir, protected_paths)
+            result.append((run_dir, status, size))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return result
+
+
+def _discard_failed_low_disk_run(work, run_dir, protected_paths=()):
+    """Delete a confirmed bundle while holding the same lock used by all runners."""
+    _failed_low_disk_run_info(work, run_dir, protected_paths)
+    runtime = StorageRuntime(Path(run_dir) / "manifest.json", None)
+    runtime.lock()
+    try:
+        # Confirmation can remain open while another process changes the run.
+        _status, size = _failed_low_disk_run_info(work, run_dir, protected_paths)
+        run_dir = Path(run_dir)
+        # Leave eligibility metadata until last so a locked scratch file can be
+        # closed and cleanup retried, even after part of the bundle was removed.
+        for child in run_dir.iterdir():
+            if child.name in ("manifest.json", "state.json"):
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        (run_dir / "manifest.json").unlink()
+        (run_dir / "state.json").unlink()
+        run_dir.rmdir()
+        return size
+    finally:
+        # Keep active.lock: removing it would allow runners to lock different files.
+        runtime.lock_file.close()
+        runtime.lock_file = None
+
+
+def _low_disk_project_paths(project):
+    """Include unsaved OSC/NB source and master selections in discard protection."""
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in FRAME_TYPES or "master_" in key or key == "project_file":
+                    if isinstance(item, str) and item:
+                        yield item
+                    elif isinstance(item, list):
+                        yield from (name for name in item if isinstance(name, str))
+                else:
+                    yield from walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from walk(item)
+    return list(walk(project.to_dict()))
 
 
 class SirilCommandBuilder:
@@ -5826,6 +5936,12 @@ class ProjectWidget(QtWidgets.QWidget):
             "Keeps the project configuration and session definitions in the UI.\n"
             "Use when you want to re-run processing from scratch without losing setup."
         )
+        self.btn_discard_low_disk = QtWidgets.QPushButton("Discard Failed/Cancelled Run...")
+        self.btn_discard_low_disk.setToolTip(
+            "Choose a failed or cancelled low-disk run to permanently discard.\n"
+            "Removes its scratch data, logs and resume checkpoints after confirmation.\n"
+            "Preserves configured source frames, project settings and retained final images."
+        )
         self.session_editor      = SessionEditor()
 
         # NEW: Panels list + buttons (per-session)
@@ -6153,6 +6269,7 @@ class ProjectWidget(QtWidgets.QWidget):
         sbtns.addStretch(1)
         sbtns.addWidget(self.btn_remove_data_all)
         sv.addLayout(sbtns)
+        sv.addWidget(self.btn_discard_low_disk, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
 
         # Panels (new)
         panels_box = QtWidgets.QGroupBox("Panels (per session)")
@@ -6280,6 +6397,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.btn_remove_sess.clicked.connect(self.remove_session)
         self.btn_dup_sess.clicked.connect(self.duplicate_session)
         self.btn_remove_data_all.clicked.connect(self.remove_all_sessions_data)
+        self.btn_discard_low_disk.clicked.connect(self.discard_failed_low_disk_run)
 
         self.sessions_list.currentRowChanged.connect(self.load_selected_session)
         self.session_editor.changed.connect(self.update_current_session)
@@ -7844,6 +7962,54 @@ class ProjectWidget(QtWidgets.QWidget):
         self.mark_dirty()
         self._refresh_global_ref_choices(self.project.mosaic_global_reference)
 
+    def discard_failed_low_disk_run(self):
+        was_dirty = getattr(self, "_dirty", False)
+        was_suspended = getattr(self, "_suspend_dirty", False)
+        self._suspend_dirty = True
+        try:
+            if getattr(self, "_storage_busy", False):
+                QtWidgets.QMessageBox.warning(self, "Discard Run", "Wait for the active run to stop first.")
+                return
+            self.push_to_model()
+            if not self.project.working_dir:
+                QtWidgets.QMessageBox.warning(self, "Discard Run", "Please set a working directory first.")
+                return
+            work = Path(self.project.working_dir).resolve()
+            protected = _low_disk_project_paths(self.project)
+            runs = _failed_low_disk_runs(work, protected)
+            if not runs:
+                QtWidgets.QMessageBox.information(
+                    self, "Discard Run", "No failed or cancelled low-disk runs are available to discard.\n"
+                    "Running runs and bundles with invalid or unsafe paths are kept.")
+                return
+            labels = [f"{path.name} — {status} — {_format_storage_size(size)}" for path, status, size in runs]
+            selected, accepted = QtWidgets.QInputDialog.getItem(
+                self, "Discard Failed/Cancelled Run", "Choose one run to discard:", labels, 0, False)
+            if not accepted:
+                return
+            run_dir, _status, _size = runs[labels.index(selected)]
+            answer = QtWidgets.QMessageBox.warning(
+                self, "Discard Failed/Cancelled Run",
+                f"Permanently discard this low-disk run?\n{run_dir}\n\n"
+                "Its scratch data, cached masters, logs and checkpoints will be deleted. "
+                "You will lose the ability to resume this run.\n\n"
+                "Configured source frames, project settings and retained final images are preserved. "
+                "Build a new script before running again.",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No)
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            size = _discard_failed_low_disk_run(work, run_dir, protected)
+            QtWidgets.QMessageBox.information(
+                self, "Run Discarded", f"Removed run data ({_format_storage_size(size)}).\n"
+                "Build a new script before running again.")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Could Not Discard Run", str(exc))
+        finally:
+            self._suspend_dirty = was_suspended
+            self._dirty = was_dirty
+            self.status_message.emit("Project has unsaved changes." if was_dirty else "")
+
     def remove_all_sessions_data(self):
         # Operational cleanup: do not mark project dirty
         was_dirty = getattr(self, "_dirty", False)
@@ -7876,7 +8042,8 @@ class ProjectWidget(QtWidgets.QWidget):
                 protected_word = "bundle" if len(protected_runs) == 1 else "bundles"
                 details += (
                     f"\n\n{len(protected_runs)} unfinished, invalid, or unsafe low-disk "
-                    f"{protected_word} will be kept."
+                    f"{protected_word} will be kept. Use 'Discard Failed/Cancelled Run...' "
+                    "to explicitly discard eligible failed or cancelled runs."
                 )
             dialog.setInformativeText(details)
             dialog.setStandardButtons(
