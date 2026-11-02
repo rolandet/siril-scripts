@@ -1435,7 +1435,7 @@ class StorageRuntime:
 
     def capture_log(self):
         try:
-            current = self.iface.get_siril_log()
+            current = (self.iface.get_siril_log() or "").rstrip("\x00")
             if current and current != self.last_log:
                 addition = current[len(self.last_log):] if current.startswith(self.last_log) else current
                 with self.log_path.open("a", encoding="utf-8") as stream:
@@ -2490,7 +2490,17 @@ def _failed_low_disk_runs(work, protected_paths=()):
     return result
 
 
-def _discard_failed_low_disk_run(work, run_dir, protected_paths=()):
+def _release_low_disk_run(iface, work, run_dir):
+    """Release this run's Siril image/sequence and Windows CWD under the run lock."""
+    if iface is None:
+        return
+    cwd = Path(iface.get_siril_wd()).resolve()
+    if cwd.is_relative_to(Path(run_dir).resolve()):
+        iface.cmd("close")
+        iface.cmd("cd " + LowDiskMosaicPlan.quote(Path(work).resolve()))
+
+
+def _discard_failed_low_disk_run(work, run_dir, protected_paths=(), *, iface=None):
     """Delete a confirmed bundle while holding the same lock used by all runners."""
     _failed_low_disk_run_info(work, run_dir, protected_paths)
     runtime = StorageRuntime(Path(run_dir) / "manifest.json", None)
@@ -2498,6 +2508,9 @@ def _discard_failed_low_disk_run(work, run_dir, protected_paths=()):
     try:
         # Confirmation can remain open while another process changes the run.
         _status, size = _failed_low_disk_run_info(work, run_dir, protected_paths)
+        # Windows cannot remove Siril's current directory, even when empty.
+        # Do this under the runner lock, before deleting any recovery data.
+        _release_low_disk_run(iface, work, run_dir)
         run_dir = Path(run_dir)
         # Leave eligibility metadata until last so a locked scratch file can be
         # closed and cleanup retried, even after part of the bundle was removed.
@@ -2534,6 +2547,49 @@ def _low_disk_project_paths(project):
             for item in value:
                 yield from walk(item)
     return list(walk(project.to_dict()))
+
+
+def _session_cleanup_path(work, session):
+    """Return a strict project subdirectory without following directory links."""
+    root = Path(work).resolve()
+    folder = session.work_subdir or session.name
+    if not isinstance(folder, str) or not folder.strip():
+        raise ValueError("Session cleanup requires a non-empty folder name")
+    target = Path(os.path.abspath(root / folder))
+    managed = root / ".osc_low_disk"
+    if target == root or not target.is_relative_to(root) or target.is_relative_to(managed):
+        raise ValueError(f"Session cleanup must stay in a session subdirectory of {root}: {target}")
+    current = target
+    while current != root:
+        if current.exists() or current.is_symlink():
+            entry = current.lstat()
+            if current.is_symlink() or getattr(entry, "st_file_attributes", 0) & 0x400:
+                raise ValueError(f"Refusing a linked or reparse-point session directory: {current}")
+            if current == target and not stat.S_ISDIR(entry.st_mode):
+                raise ValueError(f"Session cleanup target is not a directory: {target}")
+        current = current.parent
+    resolved = target.resolve()
+    if resolved == root or not resolved.is_relative_to(root) or resolved.is_relative_to(managed):
+        raise ValueError(f"Session cleanup resolves outside a session subdirectory: {target}")
+    return resolved
+
+
+def _write_project_json(path, data):
+    """Flush a complete sibling file before atomically replacing the saved project."""
+    path = Path(path).resolve()
+    text = json.dumps(data, indent=2)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        StorageRuntime.atomic_replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass  # A locked temporary file must not mask the original save error.
 
 
 class SirilCommandBuilder:
@@ -7878,7 +7934,11 @@ class ProjectWidget(QtWidgets.QWidget):
 
         sess = self.project.sessions[row]
         work = self.project.working_dir
-        sess_root = Path(work) / (sess.work_subdir or sess.name) if work else None
+        try:
+            sess_root = _session_cleanup_path(work, sess) if work else None
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Unsafe Cleanup Path", str(exc))
+            return
 
         msg = "Remove this session from the project and delete its on-disk data?\n"
         if sess_root:
@@ -7892,9 +7952,16 @@ class ProjectWidget(QtWidgets.QWidget):
             return
 
         # Delete on-disk data for this session (if any)
-        if sess_root and sess_root.exists():
+        if sess_root:
             try:
-                shutil.rmtree(sess_root)
+                # Recheck after confirmation, including any replaced directory links.
+                if _session_cleanup_path(work, sess) != sess_root:
+                    raise ValueError("Session cleanup path changed during confirmation; please retry")
+                if sess_root.exists():
+                    shutil.rmtree(sess_root)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Unsafe Cleanup Path", str(exc))
+                return
             except Exception as e:
                 QtWidgets.QMessageBox.warning(
                     self,
@@ -7999,10 +8066,16 @@ class ProjectWidget(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.StandardButton.No)
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
-            size = _discard_failed_low_disk_run(work, run_dir, protected)
+            iface = getattr(getattr(self, "siril", None), "iface", None)
+            size = _discard_failed_low_disk_run(work, run_dir, protected, iface=iface)
             QtWidgets.QMessageBox.information(
                 self, "Run Discarded", f"Removed run data ({_format_storage_size(size)}).\n"
                 "Build a new script before running again.")
+        except PermissionError as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Could Not Discard Run",
+                f"Windows could not remove a file or folder in this run:\n{exc}\n\n"
+                "Close any other program using that file or folder, then retry discard.")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Could Not Discard Run", str(exc))
         finally:
@@ -8023,7 +8096,11 @@ class ProjectWidget(QtWidgets.QWidget):
                 return
 
             work = Path(p.working_dir).resolve()
-            targets = [work / (s.work_subdir or s.name) for s in p.sessions]
+            try:
+                targets = [_session_cleanup_path(work, session) for session in p.sessions]
+            except (OSError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(self, "Unsafe Cleanup Path", str(exc))
+                return
             low_disk_root, completed_runs, protected_runs = _completed_low_disk_runs(work)
             completed_bytes = sum(size for _path, size in completed_runs)
 
@@ -8061,9 +8138,19 @@ class ProjectWidget(QtWidgets.QWidget):
             if dialog.exec() != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
 
+            # Validate all sessions again before deleting even the first folder.
+            try:
+                rechecked = [_session_cleanup_path(work, session) for session in p.sessions]
+                if rechecked != targets:
+                    raise ValueError("Session cleanup paths changed during confirmation; please retry")
+            except (OSError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(self, "Unsafe Cleanup Path", str(exc))
+                return
             ok = fail = 0
-            for t in targets:
+            for session, t in zip(p.sessions, targets):
                 try:
+                    if _session_cleanup_path(work, session) != t:
+                        raise ValueError("Session cleanup path changed; please retry")
                     if t.exists():
                         shutil.rmtree(t)
                     ok += 1
@@ -8760,11 +8847,15 @@ class ProjectWidget(QtWidgets.QWidget):
                     f"Measured peak owned files: {state.get('peak_bytes', 0) / 2**30:.1f} GiB.\n\n"
                     f"Log: {manifest.parent / 'run.log'}")
             except Exception as exc:
-                if plan:
+                try:
+                    cleanup = StorageRuntime(manifest, None)
+                    cleanup.lock()
                     try:
-                        self.siril.iface.cmd("cd " + LowDiskMosaicPlan.quote(plan["work"]))
-                    except Exception:
-                        pass
+                        _release_low_disk_run(self.siril.iface, cleanup.work, cleanup.run_dir)
+                    finally:
+                        cleanup.lock_file.close()
+                except Exception as release_error:
+                    self.siril.log(f"[low-disk] Could not release run directory: {release_error}")
                 self.lbl_run_mode.setText("Low-disk run stopped")
                 QtWidgets.QMessageBox.critical(self, "Run stopped",
                     f"{exc}\n\nCompleted panels are retained. Run again to resume the same bundle.\nLog: {manifest.parent / 'run.log'}")
@@ -9070,6 +9161,7 @@ class ProjectWidget(QtWidgets.QWidget):
         if not self._proc:
             QtWidgets.QMessageBox.information(self, "Abort", "No siril-cli process is running.")
             return
+        proc = self._proc
         ans = QtWidgets.QMessageBox.question(
             self, "Abort Run",
             "Stop the current Siril job?",
@@ -9078,43 +9170,39 @@ class ProjectWidget(QtWidgets.QWidget):
         )
         if ans != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        if self._proc is not proc or proc.poll() is not None:
+            return
+        self.btn_abort.setEnabled(False)
+        self.lbl_run_mode.setText("Stop requested; waiting for siril-cli to exit...")
         try:
             if platform.system() == "Windows":
-                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
             else:
-                self._proc.send_signal(signal.SIGINT)
-            if hasattr(self, "_reader") and self._reader:
-                self._reader.stop()
+                proc.send_signal(signal.SIGINT)
         except Exception:
             pass
-        # Escalation remains the same as you already had…
+        # Keep draining stdout until EOF: stopping the reader can block the child
+        # on a full pipe while wait() waits for that same child to exit.
+        QtCore.QTimer.singleShot(1500, lambda: self._escalate_abort(proc))
 
 
-    def _escalate_abort(self):
-        if not self._proc: return
+    def _escalate_abort(self, proc):
+        if self._proc is not proc or proc.poll() is not None:
+            return
         try:
-            if self._proc.poll() is None:
-                self._proc.terminate()
-                QtCore.QTimer.singleShot(800, self._kill_abort)
+            proc.terminate()
+            QtCore.QTimer.singleShot(800, lambda: self._kill_abort(proc))
         except Exception:
-            self._kill_abort()
+            self._kill_abort(proc)
 
-    def _kill_abort(self):
-        if not self._proc: return
+    def _kill_abort(self, proc):
+        if self._proc is not proc or proc.poll() is not None:
+            return
         try:
-            if self._proc.poll() is None:
-                self._proc.kill()
+            proc.kill()
         except Exception: pass
-        self._proc = None
-        if self._run_timer: self._run_timer.stop()
-        if self.siril.connected:
-            self.siril.progress_reset()
-            self.siril.log("[abort] Process killed.")
-        self.btn_run_siril.setEnabled(True)
-        self.btn_abort.setEnabled(False)
-        self.btn_prepare.setEnabled(True)
-        self.btn_build_script.setEnabled(True)
-        QtWidgets.QMessageBox.information(self, "Abort", "Processing aborted.")
+        # The reader drains the remaining output and its existing finished
+        # handler restores controls and clears process/thread references.
 
 
     # ------------------------
@@ -9303,9 +9391,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.push_to_model()
         try:
             project_data = self.project.to_dict()
-            Path(self.project.project_file).write_text(
-                json.dumps(project_data, indent=2), encoding="utf-8"
-            )
+            _write_project_json(self.project.project_file, project_data)
             # Once saved, the resolved default becomes an explicit project choice.
             self.project.distortion_correction_enabled = bool(
                 project_data["distortion_correction_enabled"]

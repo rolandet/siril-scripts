@@ -65,6 +65,11 @@ All notable user-facing changes to this project should be documented here.
 
 ### Fixed
 
+- Restricted session removal and **Remove Data (All Sessions)** to validated subdirectories of the project working folder. Project-root/outside paths, the managed low-disk container, and directory links/junctions are refused; targets are rechecked after confirmation before deletion.
+- Fixed low-disk log capture repeatedly appending the full Siril console snapshot by stripping the shared-memory response's terminating NUL before comparing snapshots.
+- Fixed non-managed CLI abort hanging on unread stdout. Output continues draining while interrupt/terminate/kill escalation runs; delayed callbacks are tied to the original process, and normal reader completion performs teardown.
+- Made project JSON saves atomic: serialize and flush a unique sibling temporary file, then replace the saved project with bounded retry for transient Windows locks. Failed writes, flushes, or replacements preserve the previous project file and dirty state.
+- Fixed failed/cancelled low-disk discard stopping with Windows error 32 when Siril still uses a scratch directory. Discard now closes Siril's image/sequence and returns to the project folder under the run lock before deletion, when Siril's working directory belongs to that bundle. API failures also release the run directory even when completion-manifest loading was skipped. Other programs' file locks report retry guidance.
 - Fixed the Mosaic Processing Grid Layout row shrinking when switching processing tabs by laying out Rows, Columns, and Overlap directly in the mosaic grid without extra widget margins.
 
 - Fixed standard OSC non-mosaic calibration ignoring freshly stacked raw darks, biases, and dark-flats. Explicit master choices retain priority; generated masters are used before automatic Master Library variables.

@@ -12,8 +12,10 @@ Use this checklist before considering code changes complete. For documentation-o
 
 ## Python checks for code changes
 
-- [ ] Run Python syntax checks, for example `python -m py_compile osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py`.
-- [ ] Confirm `Rolandet-OSC-Stacking.py` remains source-equivalent to the active v3.0.1 script with `tests/test_script_sync.py`.
+`tests/test_review_safety.py` checks session cleanup boundaries (including a native Windows junction and confirmation-time changes), NUL-terminated console snapshots in both app and exported workers, atomic project save failures during writing/flushing/replacement, and CLI abort with stale-timer protection and a real verbose child that ignores stop requests. These checks use temporary data and do not run Siril image processing.
+
+- [ ] Run Python syntax checks, for example `python -m py_compile osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py`.
+- [ ] Confirm `Rolandet-OSC-Stacking.py` remains source-equivalent to the active v3.0.2 script with `tests/test_script_sync.py`.
 - [ ] Run `python -B -m unittest discover -s tests -p "test_*.py" -v`.
 - [ ] Confirm no hard-coded local-only paths were introduced.
 - [ ] Confirm Windows path handling still works.
@@ -88,6 +90,8 @@ Use this checklist before considering code changes complete. For documentation-o
 ## Managed storage validation
 
 `tests/test_low_disk_discard.py` covers explicit selection/confirmation, failed/cancelled cleanup, active project locks, status changes while confirming, malformed/foreign metadata, outside paths, OSC/NB input and retained-output protection, directory/metadata links, source file aliases, and retry after a locked scratch file. The storage UI test checks that discard is disabled during a managed run. No native Siril processing is needed for these cleanup checks.
+
+It also creates a real Windows child-process current-directory lock, verifies that removing the empty directory fails with WinError 32, then verifies that leaving the bundle permits discard. Tests cover release under the run lock before deletion, preservation of unrelated Siril state, refusal to delete when release fails, and API failure cleanup before completion-manifest loading.
 
 Run `python -B -m unittest discover -s tests -p "test_*.py" -v` using an environment with PyQt6, NumPy and Astropy (the Siril Python environment is suitable). Storage tests cover migration, scheduling, command options, flat-key identity, corrupted caches, changed inputs/settings, partial FITS, membership checks, unowned/replaced paths, symlinks, locked files, concurrent-run rejection, cancellation, recovery and UI state.
 

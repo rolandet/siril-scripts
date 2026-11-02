@@ -6,7 +6,7 @@
 
 ## Current active script
 
-The current active development script is `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.py`. Do not rename files or switch to another script unless the user explicitly asks.
+The current active development script is `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py`. Do not rename files or switch to another script unless the user explicitly asks.
 
 `osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
@@ -49,6 +49,10 @@ Normal multi-session projects solve the merged registration target once, immedia
 ## Windows-first path handling
 
 The user runs this workflow on Windows. Path handling should be checked with Windows-style paths, spaces, drive letters, and Siril's tolerance for POSIX-style slashes in generated scripts.
+
+Legacy session cleanup now requires strict subdirectories of the resolved working folder, rejects directory links/reparse points and the managed low-disk container, and revalidates targets after confirmation. This boundary guard does not change the legacy behavior of deleting an eligible session folder's entire contents.
+
+Project JSON saves serialize before opening a unique sibling temporary file, flush and fsync it, then use atomic replacement with the same bounded Windows-lock retry used by checkpoints. A failed save leaves the prior project file and dirty state intact.
 
 ## Documentation and changelog
 

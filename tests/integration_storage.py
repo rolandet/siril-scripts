@@ -87,7 +87,7 @@ def main():
                     help='Test only: disable background dithering in BOTH paths to isolate storage changes')
     args = ap.parse_args()
     root = Path(__file__).resolve().parents[1]
-    module = load_module(root / 'osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py', 'storage_native_current')
+    module = load_module(root / 'osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py', 'storage_native_current')
     baseline = load_module(args.baseline_script, 'storage_native_baseline') if args.baseline_script else module
     args.output = args.output.absolute()
     args.output.mkdir(parents=True, exist_ok=False)

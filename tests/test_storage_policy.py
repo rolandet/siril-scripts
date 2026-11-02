@@ -14,7 +14,7 @@ from unittest.mock import patch
 import numpy as np
 from astropy.io import fits
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py'
+SCRIPT = Path(__file__).resolve().parents[1] / 'osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py'
 SPEC = importlib.util.spec_from_file_location('siril_storage_tests', SCRIPT)
 M = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = M

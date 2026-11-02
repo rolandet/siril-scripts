@@ -7,7 +7,7 @@
 - `MainWindow.__init__` appears to contain duplicated initial window sizing/centering logic.
 - The stack-method combo currently has four visible items, while `_stack_method_map` includes five indices. Generated stack commands use `map_stack_method()` and current text, but the stale map is a cleanup candidate.
 - Geometry preflight runs during script generation and can move converted light files into `_mismatch_geometry` when `astropy` is available. This is useful but surprising for a "build script" action.
-- Session removal and "Remove Data (All Sessions)" delete on-disk working folders. Future changes should preserve prompts and consider path containment checks.
+- Session removal and "Remove Data (All Sessions)" now validate containment and reject the project root, outside paths, managed low-disk directories, and directory links/junctions. They still delete the entire contents of eligible session folders, including any configured originals or retained outputs stored there; source/output-aware cleanup remains unresolved.
 
 ## Historical problem areas
 

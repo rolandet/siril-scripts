@@ -1,12 +1,12 @@
-# Current Features - osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py
+# Current Features - osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py
 
-Source reviewed: `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py`
+Source reviewed: `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py`
 
 `osc-multi-night-stacking-v2.1.py` and `osc-multi-night-with-mosiac-stacking-v2.2.py` are locked historical versions. Do not edit them unless the user explicitly asks for changes to those locked versions.
 
 ## Summary
 
-`osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, experimental mosaic processing, and optional Ha/OIII and SII/OIII narrowband extraction. When narrowband extraction is enabled, it generates the narrowband final instead of the normal OSC RGB final.
+`osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py` is a single-file PyQt6 desktop application for building and running Siril 1.4 OSC multi-night stacking projects. It supports JSON projects, session-based and panel-based organization, Siril `.ssf` script generation, optional Siril Python API execution, `siril-cli` fallback execution, experimental mosaic processing, and optional Ha/OIII and SII/OIII narrowband extraction. When narrowband extraction is enabled, it generates the narrowband final instead of the normal OSC RGB final.
 
 ## Core project model
 
@@ -130,7 +130,7 @@ In v3.0 narrowband mode, the same background extraction controls are reused afte
 
 ## Narrowband extraction behavior in v3.0
 
-When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py`, generated scripts:
+When `Ha/SII and OIII Extraction` is enabled in `osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py`, generated scripts:
 
 - Calibrate narrowband lights as CFA and do not emit `-debayer`.
 - Run `seqextract_HaOIII pp_light -resample=ha` for Ha/OIII and SII/OIII filter groups.
@@ -274,6 +274,10 @@ Abort behavior is intended for CLI runs. On Windows it sends `CTRL_BREAK_EVENT`;
 
 ## Low disk usage for OSC mosaics
 
+Project saves use a flushed sibling temporary file and atomic replacement so interrupted writes do not truncate the previous JSON. Legacy session cleanup validates each target before and after confirmation, refusing the project root, outside paths, low-disk run directories, and directory links/junctions. It retains its existing behavior of deleting all contents of an eligible session folder.
+
+Non-managed CLI abort keeps draining stdout while interrupt, terminate, and kill escalation runs. Each delayed callback targets the original process; the reader's normal completion handler restores controls. Managed low-disk abort continues to request cancellation at a command boundary.
+
 The Mosaic Processing tab offers **Keep intermediates** (the default for existing projects) and **Low disk usage (OSC mosaic)**. Low disk usage requires Siril 1.4.4 and individual FITS inputs. Non-mosaic and narrowband projects must use Keep intermediates.
 
 Low disk usage finishes all nights for one panel before starting the next. It retains calibration, background extraction, both registration stages, distortion correction, drizzle, rejection, normalization and final orientation. Successful consumers release their temporary prerequisites. Raw files, supplied masters, generated master copies, completed panel stacks and final mosaic products are retained.
@@ -286,8 +290,12 @@ Use **Run / Resume in Siril** to retry the same bundle. Completed panels are reu
 
 Startup verification displays file counts, GiB checked, and elapsed time, updating about once a second while reading inputs and library masters, including within large files. Calibration-library resolution and completed-panel resume checks have their own status messages. Feedback appears in the application status label and Siril's progress display and is retained in `run.log`; it does not write to the exported worker's buffered stdout/stderr. Full-file checksum validation remains unchanged. Restart the application to load updated code and rebuild exported scripts to include it in their captured workers.
 
+Native console capture removes the API response's terminating NUL before comparing snapshots, appending only newly added messages and handling console clearing without repeatedly duplicating the full history.
+
 If the first frame of a night cannot be plate-solved for distortion correction, the managed runner tries up to eight well-spaced frames from that sequence. A successful alternate becomes the Siril registration reference. If none solves, the stage stops without deleting its prerequisites and reports the sequence-level failure.
 
 `state.json`, `run.log`, `python.log` and small sequence/WCS checkpoint records remain in each bundle. **Remove Data (All Sessions)** offers a checked-by-default option to remove completed bundles and reports their total size; unfinished, invalid, and unsafe bundles are retained. Abort requests stop at a command boundary; Siril's Stop button can interrupt an active API command. A failure never triggers an automatic retry through another execution mode.
 
 **Discard Failed/Cancelled Run...**, below the session cleanup controls, lets you select one failed or cancelled low-disk bundle and explicitly discard it. The confirmation warns that scratch files, cached masters, logs and resume checkpoints will be lost. Session folders, project settings, configured source/master files and retained outputs are preserved. The action validates project/run metadata and paths, rejects directory links/reparse points, and holds the same project lock as the processing controller while rechecking status and deleting. Active and invalid bundles cannot be discarded. If a locked scratch file prevents cleanup, run metadata is kept so cleanup can be retried after closing the file. Build a new script after discarding; the old launcher no longer has a run bundle.
+
+Before discard, if connected Siril is still working inside the selected bundle, the app sends `close` and changes Siril's working directory back to the project folder while holding the run lock. This releases Windows directory locks before any recovery data is deleted. A release failure stops deletion; an unrelated Siril working directory is left alone. API failure handling also leaves the failed bundle before showing the error. If another program still holds a file or folder open, discard reports that it must be closed before retrying.

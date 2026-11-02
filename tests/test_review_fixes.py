@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.1.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "osc-multi-night-with-mosiac-extract-HaOIII-stacking-v3.0.2.py"
 
 
 def load_module(name):

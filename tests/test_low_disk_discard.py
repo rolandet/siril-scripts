@@ -1,4 +1,8 @@
 import json
+import os
+import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,9 +46,12 @@ class DiscardRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project, bundle, runtime = self.failed_bundle(Path(tmp))
             runtime.lock()
+            iface = Mock()
             try:
                 with self.assertRaisesRegex(RuntimeError, 'Another managed run'):
-                    M._discard_failed_low_disk_run(project.working_dir, bundle.folder)
+                    M._discard_failed_low_disk_run(project.working_dir, bundle.folder, iface=iface)
+                iface.get_siril_wd.assert_not_called()
+                iface.cmd.assert_not_called()
                 self.assertTrue(bundle.manifest_path.exists())
                 self.assertTrue(list(bundle.root.rglob('pp_light_*.fit')))
             finally:
@@ -160,6 +167,132 @@ class DiscardRunTests(unittest.TestCase):
             self.assertEqual(len(M._failed_low_disk_runs(project.working_dir)), 1)
             M._discard_failed_low_disk_run(project.working_dir, bundle.folder)
             self.assertFalse(bundle.folder.exists())
+
+    def test_siril_release_happens_under_lock_before_any_deletion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, bundle, runtime = self.failed_bundle(Path(tmp))
+            iface = Mock()
+            iface.get_siril_wd.return_value = str(bundle.root)
+
+            def command(line):
+                self.assertTrue(bundle.manifest_path.exists())
+                self.assertTrue(list(bundle.root.rglob('pp_light_*.fit')))
+                with self.assertRaisesRegex(RuntimeError, 'Another managed run'):
+                    runtime.lock()
+
+            iface.cmd.side_effect = command
+            M._discard_failed_low_disk_run(project.working_dir, bundle.folder, iface=iface)
+            self.assertEqual([c.args[0] for c in iface.cmd.call_args_list],
+                             ['close', 'cd ' + M.LowDiskMosaicPlan.quote(Path(project.working_dir).resolve())])
+            self.assertFalse(bundle.folder.exists())
+
+    def test_unrelated_siril_working_directory_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, bundle, _ = self.failed_bundle(Path(tmp))
+            iface = Mock()
+            iface.get_siril_wd.return_value = tmp
+            M._discard_failed_low_disk_run(project.working_dir, bundle.folder, iface=iface)
+            iface.cmd.assert_not_called()
+
+    def test_release_failure_does_not_delete_recovery_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, bundle, _ = self.failed_bundle(Path(tmp))
+            iface = Mock()
+            iface.get_siril_wd.return_value = str(bundle.root)
+            iface.cmd.side_effect = RuntimeError('Siril could not release the sequence')
+            with patch.object(M.shutil, 'rmtree') as remove:
+                with self.assertRaisesRegex(RuntimeError, 'could not release'):
+                    M._discard_failed_low_disk_run(project.working_dir, bundle.folder, iface=iface)
+            remove.assert_not_called()
+            self.assertTrue(bundle.manifest_path.exists())
+            self.assertTrue(list(bundle.root.rglob('pp_light_*.fit')))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows current-directory locking')
+    def test_native_windows_current_directory_lock_is_released_before_discard(self):
+        with tempfile.TemporaryDirectory(prefix='OSC locked directory ') as tmp:
+            project, bundle, _ = self.failed_bundle(Path(tmp))
+            locked = bundle.root / 'locked process'
+            locked.mkdir()
+            child_code = (
+                "import json,os,sys\n"
+                "print(json.dumps(os.getcwd()),flush=True)\n"
+                "for line in sys.stdin:\n"
+                "    request=json.loads(line)\n"
+                "    if request.get('cd'): os.chdir(request['cd'])\n"
+                "    print(json.dumps(os.getcwd()),flush=True)\n")
+            child = subprocess.Popen([sys.executable, '-u', '-c', child_code], cwd=project.working_dir,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                self.assertEqual(Path(json.loads(child.stdout.readline())).resolve(), Path(project.working_dir).resolve())
+
+                class Interface:
+                    def request(self, data):
+                        child.stdin.write(json.dumps(data) + '\n')
+                        child.stdin.flush()
+                        return json.loads(child.stdout.readline())
+
+                    def get_siril_wd(self):
+                        return self.request({})
+
+                    def cmd(self, command):
+                        args = shlex.split(command)
+                        self.request({'cd': args[1]} if args[0] == 'cd' else {})
+
+                iface = Interface()
+                # Siril starts outside the bundle, then enters it while running.
+                iface.request({'cd': str(locked)})
+                self.assertEqual(Path(iface.get_siril_wd()).resolve(), locked.resolve())
+                with self.assertRaises(PermissionError) as error:
+                    locked.rmdir()
+                self.assertEqual(error.exception.winerror, 32)
+                M._discard_failed_low_disk_run(project.working_dir, bundle.folder, iface=iface)
+                self.assertFalse(bundle.folder.exists())
+                self.assertEqual(Path(iface.get_siril_wd()).resolve(), Path(project.working_dir).resolve())
+            finally:
+                child.stdin.close()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=5)
+                child.stdout.close()
+                child.stderr.close()
+
+    def test_api_failure_releases_run_even_before_manifest_is_loaded_by_finished_handler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, bundle, _ = self.failed_bundle(Path(tmp))
+            iface = Mock()
+            iface.get_siril_wd.return_value = str(bundle.root)
+            worker = Mock(error='Injected processing failure')
+            widget = SimpleNamespace(_set_storage_busy=Mock(), lbl_run_mode=Mock(),
+                                     _on_storage_status=Mock(), siril=SimpleNamespace(iface=iface, log=Mock()))
+            with patch.object(M, '_StorageThread', return_value=worker), \
+                 patch.object(M.QtWidgets.QMessageBox, 'critical') as critical:
+                M.ProjectWidget._run_storage_api(widget, bundle.manifest_path)
+                worker.finished.connect.call_args.args[0]()
+            self.assertEqual([c.args[0] for c in iface.cmd.call_args_list],
+                             ['close', 'cd ' + M.LowDiskMosaicPlan.quote(Path(project.working_dir).resolve())])
+            self.assertIn('Injected processing failure', critical.call_args.args[2])
+            self.assertTrue(bundle.folder.exists())
+
+    def test_api_failure_does_not_release_another_active_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _project, bundle, runtime = self.failed_bundle(Path(tmp))
+            iface = Mock()
+            worker = Mock(error='Another managed run is using this project')
+            widget = SimpleNamespace(_set_storage_busy=Mock(), lbl_run_mode=Mock(),
+                                     _on_storage_status=Mock(), siril=SimpleNamespace(iface=iface, log=Mock()))
+            runtime.lock()
+            try:
+                with patch.object(M, '_StorageThread', return_value=worker), \
+                     patch.object(M.QtWidgets.QMessageBox, 'critical'):
+                    M.ProjectWidget._run_storage_api(widget, bundle.manifest_path)
+                    worker.finished.connect.call_args.args[0]()
+                iface.get_siril_wd.assert_not_called()
+                iface.cmd.assert_not_called()
+            finally:
+                runtime.lock_file.close()
 
     def test_ui_requires_selection_and_explicit_confirmation_and_preserves_dirty_state(self):
         for accepted, confirmed in ((False, False), (True, False), (True, True)):
