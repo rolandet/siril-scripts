@@ -30,6 +30,7 @@ All notable user-facing changes to this project should be documented here.
 - Added generated-script coverage for enabled/disabled single-session, multi-session, and mosaic distortion-correction workflows, including legacy project migration and packed-sequence compatibility.
 
 ### Changed
+- Low-disk GZIP2 background-extraction and registration checks now estimate output sizes from up to 24 existing compressed RGB32 frames, using the least compressible sample plus growth and stage margins. The configured free-space reserve remains unchanged; unsuitable samples, input copies and uncompressed final products retain uncompressed budgets. Disk-space messages distinguish estimated additional free space from the conservative total footprint. Rebuild exported scripts to update their captured workers.
 
 - Updated the window title and About dialog to display version `3.0.2` in both the active development script and `Rolandet-OSC-Stacking.py`.
 - Synchronized `Rolandet-OSC-Stacking.py`, the upstream Siril distribution script, with the active v3.0.1 implementation and added an automated source-equivalence guard for future changes.

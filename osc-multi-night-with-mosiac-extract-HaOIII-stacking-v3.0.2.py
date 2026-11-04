@@ -1726,8 +1726,48 @@ class StorageRuntime:
         except (OSError, ValueError):
             return False
 
+    def stage_compression_factor(self, stage):
+        """Budget similar RGB32 outputs from current inputs, not raw/flat ratios."""
+        if self.plan.get("compression") != "gzip2" or not stage.get("compressed_output_bytes"):
+            return 1.0
+        sources = stage.get("compression_sources", [])
+        if not sources:
+            return 1.0
+        try:
+            frames = []
+            for source in sources:
+                members = self.inventory({"path": source, "kind": "sequence"})
+                if not members:
+                    return 1.0
+                frames.extend(members)
+            count = min(24, len(frames))
+            indices = {i * (len(frames) - 1) // max(1, count - 1) for i in range(count)}
+            ratios = []
+            for index in sorted(indices):
+                path = frames[index]
+                with self.fits.open(path, memmap=True) as hdus:
+                    hdu = next(h for h in hdus if h.header.get("NAXIS", 0) >= 2)
+                    h = hdu.header
+                    if (not isinstance(hdu, self.fits.CompImageHDU)
+                            or h.get("BITPIX") != -32 or h.get("NAXIS3", 1) != 3):
+                        return 1.0
+                    raw = int(h["NAXIS1"]) * int(h["NAXIS2"]) * 3 * 4 + 28800
+                    ratios.append(path.stat().st_size / raw)
+            # Use the least compressible sample, plus 15% growth allowance and
+            # the stage's existing 10% margin. Never assume better than 2:1.
+            factor = min(1.0, max(0.5, max(ratios) * 1.15))
+            self.log(f"COMPRESSION samples={len(ratios)} max_ratio={max(ratios):.4f} "
+                     f"budget_factor={factor:.4f}")
+            return factor
+        except (OSError, ValueError, KeyError, StopIteration) as exc:
+            self.log(f"COMPRESSION using uncompressed budget: {exc}")
+            return 1.0
+
     def space_check(self, stage):
         estimate = int(stage.get("bytes_needed", 0))
+        factor = self.stage_compression_factor(stage)
+        compressible = min(estimate, int(stage.get("compressed_output_bytes", 0) * 1.10))
+        estimate -= int(compressible * (1.0 - factor))
         if stage.get("merge_copy_bytes") and not getattr(self, "symlinks_available", False):
             estimate += int(stage["merge_copy_bytes"])
         if stage.get("mosaic_geometry"):
@@ -1737,10 +1777,13 @@ class StorageRuntime:
             estimate = max(estimate, max((self.image_bytes(p) for p in frames), default=0) * 4)
         need = estimate + self.reserve
         free = shutil.disk_usage(self.root).free
-        self.log(f"SPACE free={free} next_stage={need - self.reserve} reserve={self.reserve}")
+        self.log(f"SPACE free={free} next_stage={need - self.reserve} reserve={self.reserve} "
+                 f"uncompressed_stage={stage.get('bytes_needed', 0)} compression_factor={factor:.4f}")
         if free < need:
             raise OSError(f"Not enough disk space for {stage['label']}: "
-                          f"need {need / 2**30:.1f} GiB including reserve; "
+                          f"estimated additional free space needed: {need / 2**30:.1f} GiB "
+                          f"({estimate / 2**30:.1f} GiB for the next stage + "
+                          f"{self.reserve / 2**30:.1f} GiB reserve); "
                           f"{free / 2**30:.1f} GiB available")
 
     def promote(self, stage):
@@ -2158,6 +2201,8 @@ class LowDiskMosaicPlan:
                 outputs = [self.artifact(cwd / "bkg_pp_light", count=unit["n"], estimated_bytes=unit["n"] * unit["rgb_frame"])]
                 retire = [str(cwd / "pp_light")]
                 size = unit["n"] * unit["rgb_frame"]
+                kwargs = {"compressed_output_bytes": size,
+                          "compression_sources": [str(cwd / "pp_light")]}
                 label = "background extraction"
             elif cmd == "merge":
                 merged = self.artifact(cwd / args[-1])
@@ -2175,7 +2220,10 @@ class LowDiskMosaicPlan:
                 size = n * (max_rgb if cross_night else unit["rgb_frame"])
                 if cross_night:
                     kwargs["merge_copy_bytes"] = size
-                else:
+                kwargs["compressed_output_bytes"] = size
+                kwargs["compression_sources"] = ([a["path"] for a in registered]
+                                                 if cross_night else [str(source)])
+                if not cross_night:
                     registered += outputs
                 label = "cross-night registration" if cross_night else "night registration"
             elif cmd == "stack" and args[1].startswith("r_"):
@@ -6263,7 +6311,7 @@ class ProjectWidget(QtWidgets.QWidget):
         self.sp_storage_reserve = QtWidgets.QSpinBox()
         self.sp_storage_reserve.setRange(1, 1024)
         self.sp_storage_reserve.setSuffix(" GiB")
-        self.sp_storage_reserve.setToolTip("Free space retained in addition to the next stage's uncompressed output budget. Default: 20 GiB for Windows, swap and uncertainty.")
+        self.sp_storage_reserve.setToolTip("Free space retained in addition to the next stage's estimated output budget. Similar compressed RGB frames are measured when available. Default: 20 GiB for Windows, swap and uncertainty.")
         mosaic_form.addWidget(QtWidgets.QLabel("Free-space reserve:"), 14, 0)
         mosaic_form.addWidget(self.sp_storage_reserve, 14, 1)
 
@@ -8753,9 +8801,9 @@ class ProjectWidget(QtWidgets.QWidget):
                 self.siril.log(f"[script] Wrote {out} ({len(script_text.splitlines())} lines)")
             QtWidgets.QMessageBox.information(
                 self, "Build Siril Script", f"Script written to:\n{out}" +
-                (f"\n\nEstimated peak image footprint: {bundle.plan['estimated_peak_bytes'] / 2**30:.1f} GiB (provisional)."
+                (f"\n\nConservative uncompressed peak image footprint: {bundle.plan['estimated_peak_bytes'] / 2**30:.1f} GiB (provisional; excludes reserve)."
                  f"\nFree-space reserve: {p.storage_reserve_gib} GiB."
-                 "\nStage budgets are checked again while running. Use Run / Resume to retry this bundle; Build creates a new run."
+                 "\nThis footprint is not an additional-free-space requirement. Runtime checks use measured compression where available, plus the reserve. Use Run / Resume to retry this bundle; Build creates a new run."
                  if bundle else "")
             )
         except Exception as e:

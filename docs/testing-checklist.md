@@ -89,6 +89,8 @@ Use this checklist before considering code changes complete. For documentation-o
 
 ## Managed storage validation
 
+`tests/test_compression_budget.py` checks real GZIP2 RGB32 size measurements, conservative sample selection and growth margins, the 2:1 estimate limit, refreshed measurements, fallback for missing/corrupt/incompatible inputs, unchanged uncompressed/copy/geometry budgets, reserve enforcement, per-night source metadata and exported-worker parity. It includes a stage that passes with measured compression but would fail the previous uncompressed free-space guard.
+
 `tests/test_low_disk_discard.py` covers explicit selection/confirmation, failed/cancelled cleanup, active project locks, status changes while confirming, malformed/foreign metadata, outside paths, OSC/NB input and retained-output protection, directory/metadata links, source file aliases, and retry after a locked scratch file. The storage UI test checks that discard is disabled during a managed run. No native Siril processing is needed for these cleanup checks.
 
 It also creates a real Windows child-process current-directory lock, verifies that removing the empty directory fails with WinError 32, then verifies that leaving the bundle permits discard. Tests cover release under the run lock before deletion, preservation of unrelated Siril state, refusal to delete when release fails, and API failure cleanup before completion-manifest loading.
